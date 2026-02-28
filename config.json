@@ -1,0 +1,40 @@
+{
+  "credentials": {
+    "private_key": "0x3eea5d7836eb5a7f38b1b6ebeefd1e3afc0bc9217a523681e358a4835d689893",
+    "wallet_address": "0xa131947e8f1404806b278765c314590c7ce51d0e",
+    "api_key": "560b86bb-cae7-52b5-d400-e4542b88f288",
+    "api_secret": "xAh_Bb_re_P0jxS5OuyMuYwdOzOHWqjU728WBb9x-VU=",
+    "api_passphrase": "5d75a8cd9a291c1bbaa8168c0387312389007cb562d918e732b1984302830030"
+  },
+  "network": {
+    "clob_url": "https://clob.polymarket.com",
+    "gamma_url": "https://gamma-api.polymarket.com",
+    "chain_id": 137,
+    "binance_symbol": "BTCUSDT"
+  },
+  "risk": {
+    "stake_usd": 4.0,
+    "max_daily_loss_usd": 8.0,
+    "max_open_positions": 2
+  },
+  "strategy": {
+    "min_entry_price": 0.52,
+    "max_entry_price": 0.76,
+    "max_spread": 0.04,
+    "tp_gain": 0.07,
+    "tp_min_price": 0.68,
+    "sl_loss": 0.06,
+    "sl_max_price": 0.10,
+    "zscore_threshold": 1.1,
+    "momentum_threshold": 0.20,
+    "latency_window": 180,
+    "momentum_window": 20,
+    "obi_threshold": 0.62,
+    "fee_slippage": 0.015,
+    "time_exit_secs": 45,
+    "max_exit_retries": 3,
+    "btc_delta_tolerance": 50.0,
+    "fok_cooldown": 20
+  },
+  "memory_file": "trades_live.jsonl"
+}
