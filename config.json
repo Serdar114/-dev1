@@ -32,7 +32,7 @@
     "obi_threshold": 0.62,
     "fee_slippage": 0.015,
     "time_exit_secs": 45,
-    "max_exit_retries": 3,
+    "exit_retry_interval": 15,
     "btc_delta_tolerance": 50.0,
     "fok_cooldown": 20
   },

@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """
-Polymarket BTC Sniper V10.32 (Allowance Fix)
-=============================================
-  V10.32 FIX LIST (uzerinde V10.31):
-  1. [CRITICAL] update_allowances() ClobClient'ta mevcut degil hatasi giderildi.
-     Simdi allowance hatasi alinca direkt retry yapiliyor (method cagrisi yok).
+Polymarket BTC Sniper V10.33 (Persistent Sell Retry)
+=====================================================
+  V10.33 FIX LIST (uzerinde V10.32):
+  1. [CRITICAL] Satış "max deneme aşıldı" ile tamamen durmuyor artık.
+     Eski: 3 başarısız deneme -> dur, pazarın kapanmasını bekle.
+     Yeni: Her exit_retry_interval saniyede bir tekrar dener, pazar kapanana kadar.
+     TP/SL çıkışları hâlâ anlık denenir (fiyat hızlı değişir).
+  2. place_sell retry delay: 1.5s -> 5.0s (Polygon blok süresi için güvenli).
+
+  V10.32 FIX LIST (korunuyor):
+  3. update_allowances() ClobClient'ta mevcut degil hatasi giderildi.
 
   V10.31 FIX LIST (korunuyor):
-  2. [CRITICAL] _safe_amounts(): TAM SAYI HISSE stratejisi.
-     Onceki 4-decimal shares yaklasimi cift cagri sebebiyle kayiyordu:
-       _analyze(entry=0.53, stake=4.0) -> shares=7.5472
-       place_buy -> _safe_amounts(0.53, 7.5472*0.53=3.999016) -> shares=7.5283
-       Polymarket: 7.5283 * 0.53 = 3.989... (2-decimal DEGIL!) -> red
-     Cozum: floor(stake/price) = 7 -> 7 * 0.53 = 3.71 (her zaman 2-decimal)
-  3. debug.log: encoding='utf-8' + try/except + tam tarih formati.
+  4. [CRITICAL] _safe_amounts(): TAM SAYI HISSE stratejisi.
+  5. debug.log: encoding='utf-8' + try/except + tam tarih formati.
 
   V10.30 FIX LIST (korunuyor):
-  4. [BUG FIX] shares < 5.0 gizli kill: Stake $4 ile fix edildi.
-  5. fok_cooldown: 60s -> 20s.
+  6. [BUG FIX] shares < 5.0 gizli kill: Stake $4 ile fix edildi.
+  7. fok_cooldown: 60s -> 20s.
 """
 import sys
 import asyncio
@@ -131,8 +132,9 @@ class MarketState:
         self.active_trade: Optional[LiveTrade] = None
         self.ref_btc_price: float = 0.0
         self.has_traded:    bool  = False
-        self.exit_retries:  int   = 0
+        self.exit_retries:     int   = 0
         self.last_buy_attempt: float = 0.0
+        self.last_exit_attempt: float = 0.0
 
     @property
     def secs_left(self) -> float:
@@ -204,10 +206,24 @@ class OrderManager:
             import time as _time
             client = self._client_or_raise()
             last_err = None
-            for attempt in range(2):
+            for attempt in range(3):
                 try:
-                    if attempt > 0:
-                        _time.sleep(5.0)  # allowance'in chain'e islenmesi icin bekle
+                    if attempt == 1:
+                        # Conditional token (ERC1155) operator approval eksik —
+                        # CTF Exchange'e setApprovalForAll gonder, Polygon bloğunu bekle
+                        try:
+                            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                            client.update_balance_allowance(
+                                params=BalanceAllowanceParams(
+                                    asset_type=AssetType.CONDITIONAL,
+                                    token_id=token_id,
+                                )
+                            )
+                        except Exception:
+                            pass
+                        _time.sleep(15.0)  # Polygon: ~5s blok, 15s = 3 blok güvenli
+                    elif attempt == 2:
+                        _time.sleep(5.0)
                     price_r, shares_r = _safe_amounts(price, shares * price)
                     args = OrderArgs(
                         price=price_r,
@@ -222,7 +238,7 @@ class OrderManager:
                     last_err = e
                     err_str = str(e).lower()
                     if "not enough balance" in err_str or "allowance" in err_str:
-                        continue  # retry once with delay
+                        continue
                     return f"ERR:{e}"
             return f"ERR:{last_err}"
 
@@ -246,6 +262,41 @@ class OrderManager:
                 return float(raw) / 1e6
             except Exception:
                 return 0.0
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._executor, _do)
+
+    async def ensure_approvals(self) -> str:
+        """Startup'ta USDC (COLLATERAL) ve conditional token (ERC1155) approval'larini ayarla.
+        Bir kez yapilir; sonraki satimlarda 15s bekleme olmaz."""
+        if not self.live_mode:
+            return "PAPER"
+
+        def _do():
+            import time as _time
+            client = self._client_or_raise()
+            results = []
+            try:
+                from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                for label, at in [("COLLATERAL", AssetType.COLLATERAL),
+                                   ("CONDITIONAL", AssetType.CONDITIONAL)]:
+                    try:
+                        resp      = client.get_balance_allowance(
+                            params=BalanceAllowanceParams(asset_type=at))
+                        allowance = int(resp.get("allowance", "0") or "0") \
+                            if isinstance(resp, dict) else 0
+                        if allowance == 0:
+                            client.update_balance_allowance(
+                                params=BalanceAllowanceParams(asset_type=at))
+                            _time.sleep(5.0)
+                            results.append(f"{label}:SET")
+                        else:
+                            results.append(f"{label}:OK")
+                    except Exception as e:
+                        results.append(f"{label}:ERR:{e}")
+            except ImportError:
+                return "IMPORT_ERR"
+            return ",".join(results)
 
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._executor, _do)
@@ -607,22 +658,42 @@ class LiveSniperBot:
             return
 
         if ms.active_trade:
-            t              = ms.active_trade
-            time_exit_secs = float(self.strat.get("time_exit_secs", 45))
-            max_retries    = int(self.strat.get("max_exit_retries", 3))
+            t                   = ms.active_trade
+            time_exit_secs      = float(self.strat.get("time_exit_secs", 45))
+            exit_retry_interval = float(self.strat.get("exit_retry_interval", 15))
+            now_ts              = datetime.now(timezone.utc).timestamp()
 
-            if ms.exit_retries >= max_retries:
-                if not ms.has_traded:
-                    self._log("Max deneme asildi! Mac Sonu bekleniyor.", "WARNING")
-                    ms.has_traded = True
+            # TP/SL: her döngüde dene (fiyat hızlı değişir, interval yok)
+            ok, reason, pnl, exit_px = self._check_exit(ms)
+            if ok:
+                oid = await self.order_mgr.place_sell(t.token_id, exit_px, t.shares)
+                if not oid or oid.startswith("ERR:"):
+                    ms.exit_retries += 1
+                    self._log(f"SATIS HATASI (deneme {ms.exit_retries}): {oid}", "ERROR")
+                else:
+                    self._record(ms, pnl, reason, exit_px)
+                    ms.has_traded, ms.exit_retries = True, 0
+                    self._log(
+                        f"{'WIN' if pnl > 0 else 'LOSS'} {reason} | {t.side} "
+                        f"{t.entry_price:.3f}->{exit_px:.3f} | PnL:${pnl:+.3f}",
+                        "TRADE"
+                    )
                 return
 
+            # Zaman çıkışı: her exit_retry_interval saniyede bir dene, pazar kapanana kadar
             if ms.secs_left <= time_exit_secs:
+                if now_ts - ms.last_exit_attempt < exit_retry_interval:
+                    return
+                ms.last_exit_attempt = now_ts
                 cur = _safe_price(ms.best_bid if t.side == "YES" else 1.0 - ms.best_ask)
                 oid = await self.order_mgr.place_sell(t.token_id, cur, t.shares)
                 if not oid or oid.startswith("ERR:"):
                     ms.exit_retries += 1
-                    self._log(f"SATIS HATASI ({ms.exit_retries}/{max_retries}): {oid}", "ERROR")
+                    secs = int(ms.secs_left)
+                    self._log(
+                        f"SATIS HATASI (deneme {ms.exit_retries}, {secs}s kaldi): {oid}",
+                        "ERROR"
+                    )
                 else:
                     gross = t.shares * cur
                     fee   = t.stake  * float(self.strat["fee_slippage"])
@@ -632,22 +703,6 @@ class LiveSniperBot:
                     self._log(
                         f"TIME_EXIT | {t.side} {t.entry_price:.3f}->{cur:.3f} | PnL:${pnl:+.3f}",
                         "EXIT"
-                    )
-                return
-
-            ok, reason, pnl, exit_px = self._check_exit(ms)
-            if ok:
-                oid = await self.order_mgr.place_sell(t.token_id, exit_px, t.shares)
-                if not oid or oid.startswith("ERR:"):
-                    ms.exit_retries += 1
-                    self._log(f"SATIS HATASI ({ms.exit_retries}/{max_retries}): {oid}", "ERROR")
-                else:
-                    self._record(ms, pnl, reason, exit_px)
-                    ms.has_traded, ms.exit_retries = True, 0
-                    self._log(
-                        f"{'WIN' if pnl > 0 else 'LOSS'} {reason} | {t.side} "
-                        f"{t.entry_price:.3f}->{exit_px:.3f} | PnL:${pnl:+.3f}",
-                        "TRADE"
                     )
             return
 
@@ -761,7 +816,7 @@ class LiveSniperBot:
         stake    = float(self.risk["stake_usd"])
 
         hdr = (
-            f"[bold white]BTC SNIPER V10.31 (Integer Shares Fix)[/bold white] "
+            f"[bold white]BTC SNIPER V10.33 (Persistent Sell + Approval Fix)[/bold white] "
             f"{'[bold red]CANLI[/bold red]' if self.live_mode else '[dim]KAGIT[/dim]'} | "
             f"BTC:[cyan]${self.btc_price:,.0f}[/cyan] | "
             f"PnL:[{'green' if self.session_pnl >= 0 else 'red'}]${self.session_pnl:+.3f}[/] | "
@@ -830,7 +885,7 @@ class LiveSniperBot:
         lay["s"].update(Panel(Text.from_markup(stat), title="Durum", border_style="yellow"))
         lay["l"].update(Panel(
             Text.from_markup("\n".join(list(self.logs))),
-            title="Log [V10.31]",
+            title="Log [V10.33]",
             border_style="red" if self.live_mode else "dim"
         ))
         return lay
@@ -855,8 +910,12 @@ class LiveSniperBot:
             except Exception:
                 pass
 
+            if self.live_mode:
+                appr_result = await self.order_mgr.ensure_approvals()
+                self._log(f"Approval kontrol: {appr_result}", "INFO")
+
             self._log(
-                "V10.31 BASLADI | Integer Shares fix + utf-8 log + allowance retry aktif",
+                "V10.33 BASLADI | Persistent sell retry + startup approval check aktif",
                 "LIVE" if self.live_mode else "PAPER"
             )
 
