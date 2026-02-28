@@ -72,21 +72,22 @@ def _safe_price(p: float) -> float:
 
 def _safe_amounts(price: float, stake: float) -> Tuple[float, float]:
     """
-    FIX #1 - invalid amounts hatasi cozumu:
-    Polymarket FOK/market emirleri:
-      - maker amount (USDC = shares * price): max 2 ondalik basamak
-      - taker amount (shares/token): max 4 ondalik basamak
+    V10.31 FIX - TAM SAYI HISSE (INTEGER SHARES) STRATEJISI:
+    Polymarket maker amount (price * shares USDC) kesinlikle 2 ondalikli olmali.
 
-    Strateji: once shares'i hesapla, sonra USDC tutarini 2 basamaga yuvarla,
-    ardindan shares'i bu USDC'ye gore yeniden hesapla.
+    Onceki yaklasim (4-decimal shares) cift _safe_amounts cagrisi sebebiyle
+    shares kayiyordu: _analyze -> place_buy arasindaki geri donusum
+    7.5472 * 0.53 = 3.999016 (2-decimal DEGIL) -> red.
+
+    Cozum: Tam sayi hisse. n (integer) * 0.XX (2-decimal) = her zaman 2-decimal USDC.
+    Matematiksel garanti: n*a, n integer & a 2-decimal => sonuc max 2-decimal.
     """
-    price_r = _safe_price(price)
+    # Fiyati 2 ondaliga sabitle (cent hassasiyeti)
+    price_r = round(max(0.01, min(0.99, float(price))), 2)
     raw_shares = stake / price_r
-    # Maker amount (USDC) 2 basamakta sabitle
-    maker_usdc = round(raw_shares * price_r, 2)
-    # Shares (taker) 4 basamakta yeniden hesapla
-    shares_final = round(maker_usdc / price_r, 4)
-    return price_r, shares_final
+    # Tam sayiya indir (floor): 7.9999 -> 7, 8.0001 -> 8
+    shares_int = float(int(round(raw_shares, 4)))
+    return price_r, shares_int
 
 
 @dataclass
