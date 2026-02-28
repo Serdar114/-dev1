@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """
-Polymarket BTC Sniper V10.30 (Aggressive Compounding + Critical Fixes)
-=======================================================================
-  V10.30 FIX LIST:
-  1. [CRITICAL] _safe_amounts(): maker amount (shares*price USDC) artik 2
-     ondalik basamakla sinirlandirildi. "invalid amounts" hatasi tamamen cozuldu.
-  2. [CRITICAL] SELL Allowance Retry: 'not enough balance/allowance' hatasinda
-     update_allowances() + 1s bekle + otomatik retry ile hayalet islem engeli.
-  3. [BUG FIX] shares < 5.0 gizli kill: Stake $3 ile entry > 0.60 tum
-     sinyaller sessizce iptal oluyordu. Stake $4'e cikarilarak fix edildi.
-  4. fok_cooldown: 60s -> 20s (daha cok firsat kovalama)
-  5. Agresif Compounding config destegi.
+Polymarket BTC Sniper V10.31 (Aggressive Compounding + Integer Shares Fix)
+===========================================================================
+  V10.31 FIX LIST (uzerinde V10.30):
+  1. [CRITICAL] _safe_amounts(): TAM SAYI HISSE stratejisi.
+     Onceki 4-decimal shares yaklasimi cift cagri sebebiyle kayiyordu:
+       _analyze(entry=0.53, stake=4.0) -> shares=7.5472
+       place_buy -> _safe_amounts(0.53, 7.5472*0.53=3.999016) -> shares=7.5283
+       Polymarket: 7.5283 * 0.53 = 3.989... (2-decimal DEGIL!) -> red
+     Cozum: floor(stake/price) = 7 -> 7 * 0.53 = 3.71 (her zaman 2-decimal)
+  2. debug.log: encoding='utf-8' + try/except + tam tarih formati.
+
+  V10.30 FIX LIST (korunuyor):
+  3. [CRITICAL] SELL Allowance Retry: 'not enough balance/allowance' hatasinda
+     update_allowances() + 1.5s bekle + otomatik retry.
+  4. [BUG FIX] shares < 5.0 gizli kill: Stake $4 ile fix edildi.
+  5. fok_cooldown: 60s -> 20s.
 """
 import sys
 import asyncio
@@ -758,7 +763,7 @@ class LiveSniperBot:
         stake    = float(self.risk["stake_usd"])
 
         hdr = (
-            f"[bold white]BTC SNIPER V10.30 (Agresif Compounding)[/bold white] "
+            f"[bold white]BTC SNIPER V10.31 (Integer Shares Fix)[/bold white] "
             f"{'[bold red]CANLI[/bold red]' if self.live_mode else '[dim]KAGIT[/dim]'} | "
             f"BTC:[cyan]${self.btc_price:,.0f}[/cyan] | "
             f"PnL:[{'green' if self.session_pnl >= 0 else 'red'}]${self.session_pnl:+.3f}[/] | "
@@ -827,7 +832,7 @@ class LiveSniperBot:
         lay["s"].update(Panel(Text.from_markup(stat), title="Durum", border_style="yellow"))
         lay["l"].update(Panel(
             Text.from_markup("\n".join(list(self.logs))),
-            title="Log [V10.30]",
+            title="Log [V10.31]",
             border_style="red" if self.live_mode else "dim"
         ))
         return lay
@@ -853,7 +858,7 @@ class LiveSniperBot:
                 pass
 
             self._log(
-                "V10.30 BASLADI | Agresif Compounding + invalid_amounts fix + allowance retry aktif",
+                "V10.31 BASLADI | Integer Shares fix + utf-8 log + allowance retry aktif",
                 "LIVE" if self.live_mode else "PAPER"
             )
 
