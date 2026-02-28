@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
 """
-Polymarket BTC Sniper V10.33 (Persistent Sell Retry)
+Polymarket BTC Sniper V10.34 (Post-Buy Approval Fix)
 =====================================================
-  V10.33 FIX LIST (uzerinde V10.32):
-  1. [CRITICAL] Satış "max deneme aşıldı" ile tamamen durmuyor artık.
-     Eski: 3 başarısız deneme -> dur, pazarın kapanmasını bekle.
-     Yeni: Her exit_retry_interval saniyede bir tekrar dener, pazar kapanana kadar.
-     TP/SL çıkışları hâlâ anlık denenir (fiyat hızlı değişir).
-  2. place_sell retry delay: 1.5s -> 5.0s (Polygon blok süresi için güvenli).
+  V10.34 FIX LIST (uzerinde V10.33):
+  1. [CRITICAL] approve_token(): Alim basarili olunca HEMEN o token icin
+     CONDITIONAL approval set edilir. Polygon'a ~2-3 dakika onay suresi
+     verir; satista artik 15s bekleme / approval hatasi olmaz.
+  2. place_sell: approval hatasi artik sessizce gecmiyor, ERR:APPROVAL:...
+     olarak log'a yaziliyor — gercek sebep gorulebilir.
+
+  V10.33 FIX LIST (korunuyor):
+  3. Satisi "max deneme asildi" ile durdurmak kaldirildi.
+     Her exit_retry_interval (15s) saniyede bir tekrar dener, pazar kapanana kadar.
+  4. ensure_approvals(): Startup'ta COLLATERAL + CONDITIONAL approval kontrol/set.
+  5. TP/SL cikislari hala anlik denenir (interval yok).
 
   V10.32 FIX LIST (korunuyor):
-  3. update_allowances() ClobClient'ta mevcut degil hatasi giderildi.
+  6. update_allowances() ClobClient'ta mevcut degil hatasi giderildi.
 
   V10.31 FIX LIST (korunuyor):
-  4. [CRITICAL] _safe_amounts(): TAM SAYI HISSE stratejisi.
-  5. debug.log: encoding='utf-8' + try/except + tam tarih formati.
+  7. [CRITICAL] _safe_amounts(): TAM SAYI HISSE stratejisi.
+  8. debug.log: encoding='utf-8' + try/except + tam tarih formati.
 
   V10.30 FIX LIST (korunuyor):
-  6. [BUG FIX] shares < 5.0 gizli kill: Stake $4 ile fix edildi.
-  7. fok_cooldown: 60s -> 20s.
+  9. [BUG FIX] shares < 5.0 gizli kill: Stake $4 ile fix edildi.
+  10. fok_cooldown: 60s -> 20s.
 """
 import sys
 import asyncio
@@ -90,10 +96,8 @@ def _safe_amounts(price: float, stake: float) -> Tuple[float, float]:
     Cozum: Tam sayi hisse. n (integer) * 0.XX (2-decimal) = her zaman 2-decimal USDC.
     Matematiksel garanti: n*a, n integer & a 2-decimal => sonuc max 2-decimal.
     """
-    # Fiyati 2 ondaliga sabitle (cent hassasiyeti)
     price_r = round(max(0.01, min(0.99, float(price))), 2)
     raw_shares = stake / price_r
-    # Tam sayiya indir (floor): 7.9999 -> 7, 8.0001 -> 8
     shares_int = float(int(round(raw_shares, 4)))
     return price_r, shares_int
 
@@ -132,8 +136,8 @@ class MarketState:
         self.active_trade: Optional[LiveTrade] = None
         self.ref_btc_price: float = 0.0
         self.has_traded:    bool  = False
-        self.exit_retries:     int   = 0
-        self.last_buy_attempt: float = 0.0
+        self.exit_retries:      int   = 0
+        self.last_buy_attempt:  float = 0.0
         self.last_exit_attempt: float = 0.0
 
     @property
@@ -169,7 +173,6 @@ class OrderManager:
                 funder=funder_addr if funder_addr else None,
                 signature_type=1 if funder_addr else 0,
             )
-            pass  # allowance ayari gerekirse place_sell retry ile halledilir
         return self._client
 
     async def place_buy(self, token_id: str, price: float, shares: float) -> str:
@@ -180,7 +183,6 @@ class OrderManager:
         def _do():
             try:
                 client = self._client_or_raise()
-                # FIX #1: _safe_amounts ile maker/taker precision garanti altinda
                 price_r, shares_r = _safe_amounts(price, shares * price)
                 args = OrderArgs(
                     price=price_r,
@@ -209,8 +211,8 @@ class OrderManager:
             for attempt in range(3):
                 try:
                     if attempt == 1:
-                        # Conditional token approval tekrar dene (approve_token zaten
-                        # alimda cagirildi; bu son care fallback)
+                        # approve_token() alimda zaten cagirildi; bu son care fallback.
+                        # Hata artik sessizce gecmiyor, log'da gorunur.
                         try:
                             from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
                             client.update_balance_allowance(
@@ -221,7 +223,7 @@ class OrderManager:
                             )
                         except Exception as appr_e:
                             return f"ERR:APPROVAL:{appr_e}"
-                        _time.sleep(15.0)  # Polygon: ~5s blok, 15s = 3 blok güvenli
+                        _time.sleep(15.0)  # Polygon: ~5s blok, 15s = 3 blok guvenli
                     elif attempt == 2:
                         _time.sleep(5.0)
                     price_r, shares_r = _safe_amounts(price, shares * price)
@@ -247,12 +249,11 @@ class OrderManager:
 
     async def approve_token(self, token_id: str) -> str:
         """Alimdan hemen sonra o token icin CONDITIONAL approval set et.
-        Polygon onayina 2-3 dakika verir; satista bekleme gerekmez."""
+        Polygon onayina satisa kadar ~2-3 dakika verir; satista bekleme gerekmez."""
         if not self.live_mode:
             return "PAPER"
 
         def _do():
-            import time as _time
             try:
                 from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
                 client = self._client_or_raise()
@@ -291,8 +292,7 @@ class OrderManager:
         return await loop.run_in_executor(self._executor, _do)
 
     async def ensure_approvals(self) -> str:
-        """Startup'ta USDC (COLLATERAL) ve conditional token (ERC1155) approval'larini ayarla.
-        Bir kez yapilir; sonraki satimlarda 15s bekleme olmaz."""
+        """Startup'ta USDC (COLLATERAL) ve conditional token (ERC1155) approval'larini ayarla."""
         if not self.live_mode:
             return "PAPER"
 
@@ -450,7 +450,6 @@ class LiveSniperBot:
             except Exception:
                 pass
 
-        # SLUG GUESSING FALLBACK
         if found == 0:
             now  = int(datetime.now(timezone.utc).timestamp())
             base = (now // 300) * 300
@@ -687,7 +686,7 @@ class LiveSniperBot:
             exit_retry_interval = float(self.strat.get("exit_retry_interval", 15))
             now_ts              = datetime.now(timezone.utc).timestamp()
 
-            # TP/SL: her döngüde dene (fiyat hızlı değişir, interval yok)
+            # TP/SL: her dongude dene (fiyat hizli degisir, interval yok)
             ok, reason, pnl, exit_px = self._check_exit(ms)
             if ok:
                 oid = await self.order_mgr.place_sell(t.token_id, exit_px, t.shares)
@@ -704,7 +703,7 @@ class LiveSniperBot:
                     )
                 return
 
-            # Zaman çıkışı: her exit_retry_interval saniyede bir dene, pazar kapanana kadar
+            # Zaman cikisi: her exit_retry_interval saniyede bir dene, pazar kapanana kadar
             if ms.secs_left <= time_exit_secs:
                 if now_ts - ms.last_exit_attempt < exit_retry_interval:
                     return
@@ -758,12 +757,8 @@ class LiveSniperBot:
 
         stake = float(self.risk["stake_usd"])
 
-        # FIX #3: shares < 5.0 gizli kill sorunu
-        # Polymarket minimum 5 token gerektirir.
-        # _safe_amounts ile dogru yuvarlanmis degerler kullan.
         _, shares = _safe_amounts(entry, stake)
         if shares < 5.0:
-            # Bu piyasada bu fiyatta minimum emirden az -- sessizce gecme yerine logla
             self._log(
                 f"MIN SIZE ({shares:.2f}<5.0) | entry={entry:.3f} stake=${stake} | "
                 f"Stake artirimi gerekiyor.",
@@ -784,13 +779,13 @@ class LiveSniperBot:
         )
         self._log(
             f"[{'LIVE' if self.live_mode else 'PAPER'}] {ms.signal} | "
-            f"{side}@{entry:.3f} | ${stake:.2f}->{shares:.4f}hisse",
+            f"{side}@{entry:.3f} | ${stake:.2f}->{shares:.0f}hisse",
             "LIVE" if self.live_mode else "PAPER"
         )
         # Alimdan hemen sonra bu token icin sell approval set et.
         # Polygon onayina satisa kadar ~2-3 dakika vakit verir.
         appr = await self.order_mgr.approve_token(token_id)
-        self._log(f"Token approval: {appr[:60]}", "INFO")
+        self._log(f"Token approval: {appr[:80]}", "INFO")
 
     async def _settle(self, mid: str) -> None:
         ms = self.markets.get(mid)
@@ -844,7 +839,7 @@ class LiveSniperBot:
         stake    = float(self.risk["stake_usd"])
 
         hdr = (
-            f"[bold white]BTC SNIPER V10.33 (Persistent Sell + Approval Fix)[/bold white] "
+            f"[bold white]BTC SNIPER V10.34 (Post-Buy Approval)[/bold white] "
             f"{'[bold red]CANLI[/bold red]' if self.live_mode else '[dim]KAGIT[/dim]'} | "
             f"BTC:[cyan]${self.btc_price:,.0f}[/cyan] | "
             f"PnL:[{'green' if self.session_pnl >= 0 else 'red'}]${self.session_pnl:+.3f}[/] | "
@@ -913,7 +908,7 @@ class LiveSniperBot:
         lay["s"].update(Panel(Text.from_markup(stat), title="Durum", border_style="yellow"))
         lay["l"].update(Panel(
             Text.from_markup("\n".join(list(self.logs))),
-            title="Log [V10.33]",
+            title="Log [V10.34]",
             border_style="red" if self.live_mode else "dim"
         ))
         return lay
@@ -943,7 +938,7 @@ class LiveSniperBot:
                 self._log(f"Approval kontrol: {appr_result}", "INFO")
 
             self._log(
-                "V10.33 BASLADI | Persistent sell retry + startup approval check aktif",
+                "V10.34 BASLADI | Post-buy approval + persistent sell retry aktif",
                 "LIVE" if self.live_mode else "PAPER"
             )
 
