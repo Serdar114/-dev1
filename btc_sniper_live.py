@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
-Polymarket BTC Sniper V10.31 (Aggressive Compounding + Integer Shares Fix)
-===========================================================================
-  V10.31 FIX LIST (uzerinde V10.30):
-  1. [CRITICAL] _safe_amounts(): TAM SAYI HISSE stratejisi.
+Polymarket BTC Sniper V10.32 (Allowance Fix)
+=============================================
+  V10.32 FIX LIST (uzerinde V10.31):
+  1. [CRITICAL] update_allowances() ClobClient'ta mevcut degil hatasi giderildi.
+     Simdi allowance hatasi alinca direkt retry yapiliyor (method cagrisi yok).
+
+  V10.31 FIX LIST (korunuyor):
+  2. [CRITICAL] _safe_amounts(): TAM SAYI HISSE stratejisi.
      Onceki 4-decimal shares yaklasimi cift cagri sebebiyle kayiyordu:
        _analyze(entry=0.53, stake=4.0) -> shares=7.5472
        place_buy -> _safe_amounts(0.53, 7.5472*0.53=3.999016) -> shares=7.5283
        Polymarket: 7.5283 * 0.53 = 3.989... (2-decimal DEGIL!) -> red
      Cozum: floor(stake/price) = 7 -> 7 * 0.53 = 3.71 (her zaman 2-decimal)
-  2. debug.log: encoding='utf-8' + try/except + tam tarih formati.
+  3. debug.log: encoding='utf-8' + try/except + tam tarih formati.
 
   V10.30 FIX LIST (korunuyor):
-  3. [CRITICAL] SELL Allowance Retry: 'not enough balance/allowance' hatasinda
-     update_allowances() + 1.5s bekle + otomatik retry.
   4. [BUG FIX] shares < 5.0 gizli kill: Stake $4 ile fix edildi.
   5. fok_cooldown: 60s -> 20s.
 """
@@ -165,10 +167,7 @@ class OrderManager:
                 funder=funder_addr if funder_addr else None,
                 signature_type=1 if funder_addr else 0,
             )
-            try:
-                self._client.update_allowances()
-            except Exception:
-                pass
+            pass  # allowance ayari gerekirse place_sell retry ile halledilir
         return self._client
 
     async def place_buy(self, token_id: str, price: float, shares: float) -> str:
@@ -204,10 +203,9 @@ class OrderManager:
         def _do():
             import time as _time
             client = self._client_or_raise()
-            # FIX #2: allowance hatasi icin retry mekanizmasi
+            last_err = None
             for attempt in range(2):
                 try:
-                    client.update_allowances()
                     if attempt > 0:
                         _time.sleep(1.5)  # allowance'in chain'e islenmesi icin bekle
                     price_r, shares_r = _safe_amounts(price, shares * price)
@@ -221,12 +219,12 @@ class OrderManager:
                     resp   = client.post_order(signed, OrderType.GTC)
                     return (resp.get("orderID") or resp.get("order_id") or resp.get("id", ""))
                 except Exception as e:
+                    last_err = e
                     err_str = str(e).lower()
                     if "not enough balance" in err_str or "allowance" in err_str:
-                        if attempt == 0:
-                            continue  # retry once
+                        continue  # retry once with delay
                     return f"ERR:{e}"
-            return "ERR:allowance retry exhausted"
+            return f"ERR:{last_err}"
 
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._executor, _do)
