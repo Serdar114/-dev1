@@ -299,6 +299,8 @@ class LiveSniperBot:
         }
         c = colors.get(level, "white")
         self.logs.append(f"[{c}][{ts}] {level}[/] {msg}")
+        with open("debug.log", "a") as f:
+            f.write(f"[{ts}] {level} {msg}\n")
 
     def _check_daily_reset(self) -> None:
         if datetime.now(timezone.utc) >= self._daily_reset:
