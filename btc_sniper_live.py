@@ -209,8 +209,8 @@ class OrderManager:
             for attempt in range(3):
                 try:
                     if attempt == 1:
-                        # Conditional token (ERC1155) operator approval eksik —
-                        # CTF Exchange'e setApprovalForAll gonder, Polygon bloğunu bekle
+                        # Conditional token approval tekrar dene (approve_token zaten
+                        # alimda cagirildi; bu son care fallback)
                         try:
                             from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
                             client.update_balance_allowance(
@@ -219,8 +219,8 @@ class OrderManager:
                                     token_id=token_id,
                                 )
                             )
-                        except Exception:
-                            pass
+                        except Exception as appr_e:
+                            return f"ERR:APPROVAL:{appr_e}"
                         _time.sleep(15.0)  # Polygon: ~5s blok, 15s = 3 blok güvenli
                     elif attempt == 2:
                         _time.sleep(5.0)
@@ -241,6 +241,30 @@ class OrderManager:
                         continue
                     return f"ERR:{e}"
             return f"ERR:{last_err}"
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._executor, _do)
+
+    async def approve_token(self, token_id: str) -> str:
+        """Alimdan hemen sonra o token icin CONDITIONAL approval set et.
+        Polygon onayina 2-3 dakika verir; satista bekleme gerekmez."""
+        if not self.live_mode:
+            return "PAPER"
+
+        def _do():
+            import time as _time
+            try:
+                from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                client = self._client_or_raise()
+                resp = client.update_balance_allowance(
+                    params=BalanceAllowanceParams(
+                        asset_type=AssetType.CONDITIONAL,
+                        token_id=token_id,
+                    )
+                )
+                return f"OK:{resp}"
+            except Exception as e:
+                return f"ERR:{e}"
 
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._executor, _do)
@@ -763,6 +787,10 @@ class LiveSniperBot:
             f"{side}@{entry:.3f} | ${stake:.2f}->{shares:.4f}hisse",
             "LIVE" if self.live_mode else "PAPER"
         )
+        # Alimdan hemen sonra bu token icin sell approval set et.
+        # Polygon onayina satisa kadar ~2-3 dakika vakit verir.
+        appr = await self.order_mgr.approve_token(token_id)
+        self._log(f"Token approval: {appr[:60]}", "INFO")
 
     async def _settle(self, mid: str) -> None:
         ms = self.markets.get(mid)
