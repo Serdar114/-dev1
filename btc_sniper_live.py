@@ -207,7 +207,7 @@ class OrderManager:
             for attempt in range(2):
                 try:
                     if attempt > 0:
-                        _time.sleep(1.5)  # allowance'in chain'e islenmesi icin bekle
+                        _time.sleep(5.0)  # allowance'in chain'e islenmesi icin bekle
                     price_r, shares_r = _safe_amounts(price, shares * price)
                     args = OrderArgs(
                         price=price_r,
