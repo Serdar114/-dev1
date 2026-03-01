@@ -275,6 +275,35 @@ class OrderManager:
             return 0.0
 
         def _do():
+            import urllib.request as _req
+
+            # Native USDC (Polygon) - 0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359
+            NATIVE_USDC = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
+            wallet = self.cfg["credentials"].get("wallet_address", "")
+
+            # 1. Doğrudan Polygon RPC'den Native USDC bakiyesini oku
+            if wallet:
+                try:
+                    padded = wallet.lower().replace("0x", "").zfill(64)
+                    data    = "0x70a08231" + padded  # balanceOf(address)
+                    payload = json.dumps({
+                        "jsonrpc": "2.0", "method": "eth_call",
+                        "params": [{"to": NATIVE_USDC, "data": data}, "latest"],
+                        "id": 1
+                    }).encode()
+                    req = _req.Request(
+                        "https://polygon-rpc.com", data=payload,
+                        headers={"Content-Type": "application/json"}, method="POST"
+                    )
+                    with _req.urlopen(req, timeout=5) as resp:
+                        result  = json.loads(resp.read())
+                        hex_val = result.get("result", "0x0") or "0x0"
+                        raw     = int(hex_val, 16) if hex_val not in ("0x", "") else 0
+                        return float(raw) / 1e6
+                except Exception:
+                    pass
+
+            # 2. Fallback: Polymarket CLOB API (Bridged USDC veya API bakiyesi)
             try:
                 client = self._client_or_raise()
                 try:
