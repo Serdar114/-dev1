@@ -30,10 +30,14 @@ NEG_RISK_ADAPTER  = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"  # Neg risk ada
 
 # Yedek RPC'ler (ilki basarisiz olursa siradakini dene)
 RPC_URLS = [
-    "https://polygon-rpc.com",
-    "https://rpc-mainnet.maticvigil.com",
-    "https://polygon.llamarpc.com",
+    "https://polygon-bor-rpc.publicnode.com",
     "https://rpc.ankr.com/polygon",
+    "https://polygon.meowrpc.com",
+    "https://1rpc.io/matic",
+    "https://polygon-rpc.com",
+    "https://polygon.llamarpc.com",
+    "https://rpc-mainnet.maticvigil.com",
+    "https://polygon.drpc.org",
 ]
 
 ERC1155_ABI = [
@@ -63,12 +67,17 @@ ERC1155_ABI = [
 def connect(rpc_urls: list) -> Web3:
     for url in rpc_urls:
         try:
-            w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 10}))
-            if w3.is_connected():
-                print(f"  RPC baglandi: {url}")
+            print(f"  Deneniyor: {url}")
+            w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 15}))
+            # is_connected() yerine direkt chain_id sor — daha guvenilir
+            cid = w3.eth.chain_id
+            if cid == 137:
+                print(f"  RPC baglandi (chain_id={cid}): {url}")
                 return w3
-        except Exception:
-            pass
+            else:
+                print(f"  Yanlis chain ({cid}), atlaniyor.")
+        except Exception as e:
+            print(f"  Basarisiz: {e}")
     raise ConnectionError("Hicbir RPC'ye baglanamadi. Internet veya RPC listesini kontrol edin.")
 
 
