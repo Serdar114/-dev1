@@ -1,10 +1,10 @@
 {
   "credentials": {
-    "private_key": "0xb8a85e1495be8e9a850825b832c9fc23815a32896b1b01321d19381596795869",
-    "wallet_address": "0x183B59f1e72bbbdBcD183D02fd809095453874b6",
-    "api_key": "0a6192a2-58c8-c9e0-ddf7-4235676ef748",
-    "api_secret": "nY_IKYq5RWZscT-gc9rdLTMJbSA9Abfmp7ROtULxtG4=",
-    "api_passphrase": "660556969e1a0e34217e4c43937fa6e2fec4d4d98710d0cc5962a4444e88a5ae"
+    "private_key": "0x3eea5d7836eb5a7f38b1b6ebeefd1e3afc0bc9217a523681e358a4835d689893",
+    "wallet_address": "0xa131947e8F1404806b278765C314590c7cE51D0E",
+    "api_key": "560b86bb-cae7-52b5-d400-e4542b88f288",
+    "api_secret": "xAh_Bb_re_P0jxS5OuyMuYwdOzOHWqjU728WBb9x-VU=",
+    "api_passphrase": "5d75a8cd9a291c1bbaa8168c0387312389007cb562d918e732b1984302830030"
   },
   "network": {
     "clob_url": "https://clob.polymarket.com",
