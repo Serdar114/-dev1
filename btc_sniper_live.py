@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
 """
-Polymarket BTC Sniper V10.34 (Post-Buy Approval Fix)
-=====================================================
-  V10.34 FIX LIST (uzerinde V10.33):
-  1. [CRITICAL] approve_token(): Alim basarili olunca HEMEN o token icin
+Polymarket BTC Sniper V10.35 (Signal Quality + SL Guard)
+=========================================================
+  V10.35 FIX LIST (uzerinde V10.34):
+  1. [SIGNAL] MR sinyali momentum filtresi: "AL YES (MR)" artik
+     BTC momentum DOWN iken tetiklenmez; "AL NO (MR)" UP iken tetiklenmez.
+     Trendle savasmayi engeller.
+  2. [BUG] _check_exit(): tp_min_price TP sadece gain > 0 iken tetiklenir.
+     entry >= tp_min_price durumunda negatif PnL ile TP kapanmasi duzeltildi.
+  3. [RISK] Ardisik SL koruması: 3 art arda kayiptan sonra 5 dakika
+     yeni pozisyon acilmaz. Ekranda "SL SOGUMA" gosterilir.
+  4. [CONFIG] time_exit_secs: 45 -> 90 (SETTL_LOSS riskini azaltir).
+  5. [CONFIG] max_entry_price: 0.76 -> 0.65 (yuksek entry W/L matematigi bozuyor).
+
+  V10.34 FIX LIST (korunuyor):
+  6. [CRITICAL] approve_token(): Alim basarili olunca HEMEN o token icin
      CONDITIONAL approval set edilir. Polygon'a ~2-3 dakika onay suresi
      verir; satista artik 15s bekleme / approval hatasi olmaz.
-  2. place_sell: approval hatasi artik sessizce gecmiyor, ERR:APPROVAL:...
+  7. place_sell: approval hatasi artik sessizce gecmiyor, ERR:APPROVAL:...
      olarak log'a yaziliyor — gercek sebep gorulebilir.
 
   V10.33 FIX LIST (korunuyor):
@@ -393,6 +404,8 @@ class LiveSniperBot:
             + timedelta(days=1)
         )
         self._running: bool = True
+        self._consec_losses: int   = 0
+        self._sl_cooldown_until: float = 0.0
 
     def _log(self, msg: str, level: str = "INFO") -> None:
         ts = datetime.now().strftime("%H:%M:%S")
@@ -652,9 +665,10 @@ class LiveSniperBot:
             if std > 1e-9:
                 ms.zscore = (ms.mid_px - np.mean(arr)) / std
             z = float(self.strat["zscore_threshold"])
-            if ms.zscore < -z and ms.best_ask < max_e:
+            # MR: momentum zit yonde akiyorsa girme (trendle savasma)
+            if ms.zscore < -z and ms.best_ask < max_e and direction != "DOWN":
                 return "AL YES (MR)"
-            if ms.zscore > z and (1.0 - ms.best_bid) < max_e:
+            if ms.zscore > z and (1.0 - ms.best_bid) < max_e and direction != "UP":
                 return "AL NO (MR)"
 
         if 0 < ms.secs_left < float(self.strat["latency_window"]):
@@ -690,7 +704,9 @@ class LiveSniperBot:
         cur  = _safe_price(ms.best_bid if t.side == "YES" else 1.0 - ms.best_ask)
         gain = cur - t.entry_price
 
-        tp = (cur >= float(self.strat["tp_min_price"]) or gain >= float(self.strat["tp_gain"]))
+        # tp_min_price: sadece kar varsa tetikle (entry >= tp_min_price durumunda yanlis TP'yi onler)
+        tp = gain >= float(self.strat["tp_gain"]) or \
+             (cur >= float(self.strat["tp_min_price"]) and gain > 0)
         sl = (cur <= float(self.strat["sl_max_price"]) or gain <= -float(self.strat["sl_loss"]))
 
         if tp or sl:
@@ -704,6 +720,9 @@ class LiveSniperBot:
     async def _analyze(self, ms: MarketState) -> None:
         if self._daily_limit_hit:
             ms.signal = "GUNLUK LIMIT"
+            return
+        if datetime.now(timezone.utc).timestamp() < self._sl_cooldown_until:
+            ms.signal = "SL SOGUMA"
             return
         if ms.has_traded and not ms.active_trade:
             ms.signal = "TEK KURSUN"
@@ -841,6 +860,13 @@ class LiveSniperBot:
         self.trades    += 1
         self.session_pnl += pnl
         self.daily_pnl   += pnl
+        if pnl <= 0:
+            self._consec_losses += 1
+            if self._consec_losses >= 3:
+                self._sl_cooldown_until = datetime.now(timezone.utc).timestamp() + 300
+                self._log(f"{self._consec_losses} ardisik kayip — 5 dk bekleniyor", "WARNING")
+        else:
+            self._consec_losses = 0
         try:
             with open(self.cfg.get("memory_file", "trades_live.jsonl"), "a") as f:
                 f.write(json.dumps({
@@ -868,7 +894,7 @@ class LiveSniperBot:
         stake    = float(self.risk["stake_usd"])
 
         hdr = (
-            f"[bold white]BTC SNIPER V10.34 (Post-Buy Approval)[/bold white] "
+            f"[bold white]BTC SNIPER V10.35 (Signal Quality + SL Guard)[/bold white] "
             f"{'[bold red]CANLI[/bold red]' if self.live_mode else '[dim]KAGIT[/dim]'} | "
             f"BTC:[cyan]${self.btc_price:,.0f}[/cyan] | "
             f"PnL:[{'green' if self.session_pnl >= 0 else 'red'}]${self.session_pnl:+.3f}[/] | "
@@ -937,7 +963,7 @@ class LiveSniperBot:
         lay["s"].update(Panel(Text.from_markup(stat), title="Durum", border_style="yellow"))
         lay["l"].update(Panel(
             Text.from_markup("\n".join(list(self.logs))),
-            title="Log [V10.34]",
+            title="Log [V10.35]",
             border_style="red" if self.live_mode else "dim"
         ))
         return lay
@@ -967,7 +993,7 @@ class LiveSniperBot:
                 self._log(f"Approval kontrol: {appr_result}", "INFO")
 
             self._log(
-                "V10.34 BASLADI | Post-buy approval + persistent sell retry aktif",
+                "V10.35 BASLADI | MR filtresi + SL soguma + erken cikis aktif",
                 "LIVE" if self.live_mode else "PAPER"
             )
 
