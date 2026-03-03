@@ -13,8 +13,8 @@
     "binance_symbol": "BTCUSDT"
   },
   "risk": {
-    "stake_usd": 4.0,
-    "max_daily_loss_usd": 8.0,
+    "stake_usd": 5.0,
+    "max_daily_loss_usd": 10.0,
     "max_open_positions": 1
   },
   "strategy": {
