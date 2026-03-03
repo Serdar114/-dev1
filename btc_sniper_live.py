@@ -759,20 +759,20 @@ class LiveSniperBot:
 
         ms.signal = self._signal(ms)
 
-        if not ("AL" in ms.signal or "Sniper" in ms.signal or "Mom" in ms.signal or "OBI" in ms.signal):
+        # V11.0: Sadece CONV sinyalini kabul et
+        if "CONV" not in ms.signal:
             return
 
         side     = "YES" if "YES" in ms.signal else "NO"
         token_id = ms.yes_id if side == "YES" else ms.no_id
         entry    = ms.best_ask if side == "YES" else 1.0 - ms.best_bid
 
-        min_e = float(self.strat.get("min_entry_price", 0.52))
-        max_e = float(self.strat.get("max_entry_price", 0.76))
+        min_e = float(self.strat.get("min_entry_price", 0.83))
+        max_e = float(self.strat.get("max_entry_price", 0.93))
         if entry < min_e or entry > max_e or not token_id:
             return
 
-        if ms.secs_left <= float(self.strat.get("time_exit_secs", 45)):
-            return
+        # time_exit_secs yok — convergence_secs_min zaten _signal() icinde kontrol edildi
 
         if sum(1 for m in self.markets.values() if m.active_trade) >= int(self.risk.get("max_open_positions", 2)):
             ms.signal = "POS DOLU"
