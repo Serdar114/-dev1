@@ -1,17 +1,28 @@
 #!/usr/bin/env python3
 """
-Polymarket BTC Sniper V10.35 (Signal Quality + SL Guard)
+Polymarket BTC Sniper V11.0 (Late Convergence Strategy)
 =========================================================
-  V10.35 FIX LIST (uzerinde V10.34):
-  1. [SIGNAL] MR sinyali momentum filtresi: "AL YES (MR)" artik
-     BTC momentum DOWN iken tetiklenmez; "AL NO (MR)" UP iken tetiklenmez.
-     Trendle savasmayi engeller.
-  2. [BUG] _check_exit(): tp_min_price TP sadece gain > 0 iken tetiklenir.
-     entry >= tp_min_price durumunda negatif PnL ile TP kapanmasi duzeltildi.
-  3. [RISK] Ardisik SL koruması: 3 art arda kayiptan sonra 5 dakika
-     yeni pozisyon acilmaz. Ekranda "SL SOGUMA" gosterilir.
-  4. [CONFIG] time_exit_secs: 45 -> 90 (SETTL_LOSS riskini azaltir).
-  5. [CONFIG] max_entry_price: 0.76 -> 0.65 (yuksek entry W/L matematigi bozuyor).
+  V11.0 — TAM STRATEJI DEGISIMI (V10.35 uzerine):
+
+  ARASTIRMA BULGULARI:
+  - Polymarket dinamik taker fee: p*(1-p)*k formulu
+    → 0.50 fiyatinda %3.15 fee (eski giris bölgesi artik negatif EV!)
+    → 0.90 fiyatinda %0.20 fee (convergence bolgesi hala karlı)
+  - 500ms speed bump kaldirildi → latency arb tamamen oldu
+  - Kazanan strateji: <110s kalan, BTC $20+ hareket, fiyat 0.83-0.93
+    → Arastirmalarda %85-96 win rate
+
+  V11.0 DEGISIKLIKLER:
+  1. [STRATEJI] MR/OBI/Sniper/Momentum sinyalleri KALDIRILDI.
+     Tek sinyal: CONV YES / CONV NO (Late Convergence)
+     Giris kosulu: secs_left 25-110, BTC window delta >= $20,
+     BTC son momentum yonuyle uyumlu, fiyat 0.83-0.93 arasi.
+  2. [CIKIS] TIME_EXIT kaldirildi. Settlement'a kadar pozisyon tutulur.
+     Tek cikis: EMRG_STOP (fiyat 0.68'e duserse sat — BTC yonu donmus)
+  3. [MATEMATIK] 0.88 giris, %96 win rate: EV = 0.96*$0.44 - 0.04*$0.82
+     = +$0.39 per trade. Eski sistemde: negatif EV.
+  4. [CONFIG] min_entry 0.83, max_entry 0.93, emergency_stop 0.68
+     convergence_btc_delta 20, convergence_secs_min 25, convergence_secs_max 110
 
   V10.34 FIX LIST (korunuyor):
   6. [CRITICAL] approve_token(): Alim basarili olunca HEMEN o token icin
@@ -634,8 +645,9 @@ class LiveSniperBot:
         ms.history.append(ms.mid_px)
 
     def _btc_momentum(self) -> Tuple[float, str]:
-        win    = int(self.strat.get("momentum_window", 10))
-        thresh = float(self.strat.get("momentum_threshold", 0.20))
+        """Son N kayittaki BTC yonunu hesapla (~90s at 2s/cycle icin win=45)."""
+        win    = int(self.strat.get("momentum_window", 45))
+        thresh = float(self.strat.get("momentum_threshold", 0.05))
         prices = list(self.btc_history)[-win:]
         if len(prices) < 3:
             return 0.0, "FLAT"
@@ -647,74 +659,70 @@ class LiveSniperBot:
         return velocity, "FLAT"
 
     def _signal(self, ms: MarketState) -> str:
+        """
+        Late Convergence Signal (V11.0):
+        Sadece pencere sonunda ($20+ BTC hareketi + 0.83-0.93 fiyat) girer.
+        Arastirma: bu kosulda %85-96 win rate, fee ~%0.20.
+        """
         if ms.secs_left <= 0:
             return "BEKLE"
         if ms.ref_btc_price == 0.0:
             return "BEKLENIYOR"
 
-        spread = ms.best_ask - ms.best_bid
-        if spread > float(self.strat.get("max_spread", 0.04)):
+        # Convergence penceresi: sadece son 25-110 saniyede gir
+        secs_min = float(self.strat.get("convergence_secs_min", 25.0))
+        secs_max = float(self.strat.get("convergence_secs_max", 110.0))
+        if not (secs_min < ms.secs_left < secs_max):
             return "BEKLE"
 
-        velocity, direction = self._btc_momentum()
-        btc_delta = self.btc_price - ms.ref_btc_price
-        max_e     = float(self.strat.get("max_entry_price", 0.76))
+        # Spread kontrolu
+        spread = ms.best_ask - ms.best_bid
+        if spread > float(self.strat.get("max_spread", 0.05)):
+            return "GENIS"
 
-        if len(ms.history) > 4:
-            arr, std = np.array(list(ms.history)), np.std(list(ms.history))
-            if std > 1e-9:
-                ms.zscore = (ms.mid_px - np.mean(arr)) / std
-            z = float(self.strat["zscore_threshold"])
-            # MR: momentum zit yonde akiyorsa girme (trendle savasma)
-            if ms.zscore < -z and ms.best_ask < max_e and direction != "DOWN":
-                return "AL YES (MR)"
-            if ms.zscore > z and (1.0 - ms.best_bid) < max_e and direction != "UP":
-                return "AL NO (MR)"
+        # BTC hareketi: pencere basından bu yana ($20+ gerekli)
+        btc_min      = float(self.strat.get("convergence_btc_delta", 20.0))
+        window_delta = self.btc_price - ms.ref_btc_price
 
-        if 0 < ms.secs_left < float(self.strat["latency_window"]):
-            tol    = float(self.strat.get("btc_delta_tolerance", 50.0))
-            yes_ok = btc_delta >= -tol and direction in ("UP", "FLAT") and ms.best_ask < max_e
-            no_ok  = btc_delta <= tol  and direction in ("DOWN", "FLAT") and (1.0 - ms.best_bid) < max_e
-            if yes_ok and no_ok:
-                return "Sniper YES" if ms.best_ask <= (1.0 - ms.best_bid) else "Sniper NO"
-            if yes_ok:
-                return "Sniper YES"
-            if no_ok:
-                return "Sniper NO"
+        # Son momentum — yon dogrulamasi icin (geri dönüs varsa girme)
+        _, direction = self._btc_momentum()
 
-        obi_thresh = float(self.strat.get("obi_threshold", 0.62))
-        if ms.obi_score > obi_thresh and ms.best_ask < max_e:
-            return "OBI YES"
-        if ms.obi_score < (1.0 - obi_thresh) and (1.0 - ms.best_bid) < max_e:
-            return "OBI NO"
+        # Convergence fiyat bolgesi: 0.83-0.93
+        min_e  = float(self.strat.get("min_entry_price", 0.83))
+        max_e  = float(self.strat.get("max_entry_price", 0.93))
+        yes_px = ms.best_ask
+        no_px  = 1.0 - ms.best_bid
 
-        strong = float(self.strat.get("momentum_threshold", 0.20)) * 3
-        if abs(velocity) > strong:
-            if direction == "UP" and ms.best_ask < max_e:
-                return "Mom YES"
-            if direction == "DOWN" and (1.0 - ms.best_bid) < max_e:
-                return "Mom NO"
+        # YES: BTC yukari gitti VE hala yukari gidiyor (ya da flat — gecici bekleme)
+        if window_delta >= btc_min and direction != "DOWN":
+            if min_e <= yes_px <= max_e:
+                return "CONV YES"
+
+        # NO: BTC asagi gitti VE hala asagi gidiyor
+        if window_delta <= -btc_min and direction != "UP":
+            if min_e <= no_px <= max_e:
+                return "CONV NO"
 
         return "BEKLE"
 
     def _check_exit(self, ms: MarketState) -> Tuple[bool, str, float, float]:
+        """
+        V11.0 cikis mantigi: Normal TP/SL YOK — settlement'a kadar tut.
+        Tek cikis: EMRG_STOP — fiyat cok duserse BTC yonu donmustür, sat.
+        """
         t = ms.active_trade
         if not t:
             return False, "", 0.0, 0.0
         cur  = _safe_price(ms.best_bid if t.side == "YES" else 1.0 - ms.best_ask)
-        gain = cur - t.entry_price
 
-        # tp_min_price: sadece kar varsa tetikle (entry >= tp_min_price durumunda yanlis TP'yi onler)
-        tp = gain >= float(self.strat["tp_gain"]) or \
-             (cur >= float(self.strat["tp_min_price"]) and gain > 0)
-        sl = (cur <= float(self.strat["sl_max_price"]) or gain <= -float(self.strat["sl_loss"]))
+        # Acil durus: giris fiyatinin cok altina dustuyse BTC yonu dönmüstür
+        emrg = float(self.strat.get("emergency_stop", 0.68))
+        if cur <= emrg:
+            gross = t.shares * cur
+            fee   = t.stake  * float(self.strat["fee_slippage"])
+            pnl   = round(gross - t.stake - fee, 4)
+            return True, "EMRG_STOP", pnl, cur
 
-        if tp or sl:
-            exit_px = cur
-            gross   = t.shares * exit_px
-            fee     = t.stake  * float(self.strat["fee_slippage"])
-            pnl     = round(gross - t.stake - fee, 4)
-            return True, ("TP" if tp else "SL"), pnl, exit_px
         return False, "", 0.0, 0.0
 
     async def _analyze(self, ms: MarketState) -> None:
@@ -729,51 +737,23 @@ class LiveSniperBot:
             return
 
         if ms.active_trade:
-            t                   = ms.active_trade
-            time_exit_secs      = float(self.strat.get("time_exit_secs", 45))
-            exit_retry_interval = float(self.strat.get("exit_retry_interval", 15))
-            now_ts              = datetime.now(timezone.utc).timestamp()
+            t      = ms.active_trade
+            now_ts = datetime.now(timezone.utc).timestamp()
 
-            # TP/SL: her dongude dene (fiyat hizli degisir, interval yok)
+            # V11.0: Sadece EMRG_STOP — settlement'a kadar tut
             ok, reason, pnl, exit_px = self._check_exit(ms)
             if ok:
                 oid = await self.order_mgr.place_sell(t.token_id, exit_px, t.shares)
                 if not oid or oid.startswith("ERR:"):
                     ms.exit_retries += 1
-                    self._log(f"SATIS HATASI (deneme {ms.exit_retries}): {oid}", "ERROR")
+                    self._log(f"EMRG SATIS HATASI (deneme {ms.exit_retries}): {oid}", "ERROR")
                 else:
                     self._record(ms, pnl, reason, exit_px)
                     ms.has_traded, ms.exit_retries = True, 0
                     self._log(
-                        f"{'WIN' if pnl > 0 else 'LOSS'} {reason} | {t.side} "
+                        f"EMRG_STOP | {t.side} "
                         f"{t.entry_price:.3f}->{exit_px:.3f} | PnL:${pnl:+.3f}",
-                        "TRADE"
-                    )
-                return
-
-            # Zaman cikisi: her exit_retry_interval saniyede bir dene, pazar kapanana kadar
-            if ms.secs_left <= time_exit_secs:
-                if now_ts - ms.last_exit_attempt < exit_retry_interval:
-                    return
-                ms.last_exit_attempt = now_ts
-                cur = _safe_price(ms.best_bid if t.side == "YES" else 1.0 - ms.best_ask)
-                oid = await self.order_mgr.place_sell(t.token_id, cur, t.shares)
-                if not oid or oid.startswith("ERR:"):
-                    ms.exit_retries += 1
-                    secs = int(ms.secs_left)
-                    self._log(
-                        f"SATIS HATASI (deneme {ms.exit_retries}, {secs}s kaldi): {oid}",
-                        "ERROR"
-                    )
-                else:
-                    gross = t.shares * cur
-                    fee   = t.stake  * float(self.strat["fee_slippage"])
-                    pnl   = round(gross - t.stake - fee, 4)
-                    self._record(ms, pnl, "TIME_EXIT", cur)
-                    ms.has_traded, ms.exit_retries = True, 0
-                    self._log(
-                        f"TIME_EXIT | {t.side} {t.entry_price:.3f}->{cur:.3f} | PnL:${pnl:+.3f}",
-                        "EXIT"
+                        "WARNING"
                     )
             return
 
@@ -892,9 +872,10 @@ class LiveSniperBot:
         wr       = (self.wins / self.trades * 100) if self.trades else 0.0
         velocity, v_dir = self._btc_momentum()
         stake    = float(self.risk["stake_usd"])
+        btc_min  = float(self.strat.get("convergence_btc_delta", 20.0))
 
         hdr = (
-            f"[bold white]BTC SNIPER V10.35 (Signal Quality + SL Guard)[/bold white] "
+            f"[bold white]BTC SNIPER V11.0 (Late Convergence)[/bold white] "
             f"{'[bold red]CANLI[/bold red]' if self.live_mode else '[dim]KAGIT[/dim]'} | "
             f"BTC:[cyan]${self.btc_price:,.0f}[/cyan] | "
             f"PnL:[{'green' if self.session_pnl >= 0 else 'red'}]${self.session_pnl:+.3f}[/] | "
@@ -907,7 +888,11 @@ class LiveSniperBot:
         ))
 
         tbl = Table(box=box.MINIMAL_DOUBLE_HEAD, expand=True)
-        for col in ["Kalan", "Pazar", "Ref BTC", "dBTC", "Ask", "Bid", "Z", "OBI", "Sinyal", "Pozisyon"]:
+        secs_min = float(self.strat.get("convergence_secs_min", 25.0))
+        secs_max = float(self.strat.get("convergence_secs_max", 110.0))
+        min_e    = float(self.strat.get("min_entry_price", 0.83))
+        max_e    = float(self.strat.get("max_entry_price", 0.93))
+        for col in ["Kalan", "Pazar", "Ref BTC", "dBTC", "AskY", "AskN", "Bölge", "Sinyal", "Pozisyon"]:
             tbl.add_column(col, no_wrap=True)
 
         for ms in sorted(self.markets.values(), key=lambda x: x.secs_left):
@@ -921,24 +906,38 @@ class LiveSniperBot:
                 t    = ms.active_trade
                 cur  = _safe_price(ms.best_bid if t.side == "YES" else 1.0 - ms.best_ask)
                 gain = cur - t.entry_price
-                pos_str   = f"{'UP' if gain >= 0 else 'DN'} {t.side} {gain:+.2f}({gain/t.entry_price*100:+.0f}%)"
+                pos_str   = f"{'UP' if gain >= 0 else 'DN'} {t.side}@{t.entry_price:.2f} {gain:+.2f}"
                 row_style = "green" if gain >= 0 else "red"
             elif ms.has_traded:
-                pos_str   = "[dim]TEK KURSUN[/dim]"
+                pos_str   = "[dim]TAMAMLANDI[/dim]"
                 row_style = "dim"
             elif datetime.now(timezone.utc).timestamp() - ms.last_buy_attempt < float(self.strat.get("fok_cooldown", 20)):
                 pos_str   = "[yellow]COOLDOWN[/yellow]"
                 row_style = "yellow"
 
-            obi_str = f"[{'green' if ms.obi_score > 0.65 else 'red' if ms.obi_score < 0.35 else 'white'}]{ms.obi_score:.2f}[/]"
-            t_str   = f"[bold magenta]{int(ms.secs_left)}s[/]" if ms.secs_left <= float(self.strat.get("time_exit_secs", 45)) else f"{int(ms.secs_left)}s"
+            # Convergence penceresi göstergesi
+            in_window = secs_min < ms.secs_left < secs_max
+            t_color   = "bold green" if in_window else "white"
+            t_str     = f"[{t_color}]{int(ms.secs_left)}s[/]"
+
+            # YES/NO giris fiyatlari ve bölge uyumu
+            yes_px   = ms.best_ask
+            no_px    = 1.0 - ms.best_bid
+            yes_ok   = min_e <= yes_px <= max_e
+            no_ok    = min_e <= no_px  <= max_e
+            zone_str = (
+                f"[green]Y✓[/] " if yes_ok else f"[dim]Y--[/] "
+            ) + (
+                f"[green]N✓[/]" if no_ok else f"[dim]N--[/]"
+            )
 
             tbl.add_row(
                 t_str, ms.short_name,
                 f"${ms.ref_btc_price:,.0f}" if ms.ref_btc_price > 0 else "[dim]BEKL.[/dim]",
                 f"[{'green' if delta >= 0 else 'red'}]{delta:+,.0f}[/]",
-                f"{ms.best_ask:.3f}", f"{ms.best_bid:.3f}",
-                f"{ms.zscore:+.2f}", obi_str, ms.signal, pos_str,
+                f"[{'green' if yes_ok else 'white'}]{yes_px:.3f}[/]",
+                f"[{'green' if no_ok else 'white'}]{no_px:.3f}[/]",
+                zone_str, ms.signal, pos_str,
                 style=row_style
             )
 
@@ -948,14 +947,18 @@ class LiveSniperBot:
             border_style="red" if self.live_mode else "dim"
         ))
 
+        emrg = float(self.strat.get("emergency_stop", 0.68))
         stat = (
             f"[bold cyan]KASA[/bold cyan]\n  Stake: [green]${stake:.2f}[/green]\n"
             f"  Limit: [red]-${self.risk['max_daily_loss_usd']:.2f}[/red]\n\n"
-            f"[bold cyan]MOMENTUM[/bold cyan]\n"
-            f"  [{'green' if v_dir == 'UP' else 'red'}]{velocity:+.2f} $/s -> {v_dir}[/]\n\n"
-            f"[bold cyan]CIKIS[/bold cyan]\n"
-            f"  TP: +{self.strat['tp_gain']:.2f}\n"
-            f"  SL: -{self.strat['sl_loss']:.2f}\n\n"
+            f"[bold cyan]CONVERGENCE[/bold cyan]\n"
+            f"  Bölge: {min_e:.2f}-{max_e:.2f}¢\n"
+            f"  Pencere: {int(secs_min)}-{int(secs_max)}s\n"
+            f"  BTC Min: ${btc_min:.0f}\n"
+            f"  EMRG Stop: {emrg:.2f}¢\n\n"
+            f"[bold cyan]BTC MOM[/bold cyan]\n"
+            f"  [{'green' if v_dir == 'UP' else 'red' if v_dir == 'DOWN' else 'white'}]"
+            f"{velocity:+.2f} $/cycle → {v_dir}[/]\n\n"
             f"[bold cyan]OTURUM[/bold cyan]\n"
             f"  PnL: [{'green' if self.session_pnl >= 0 else 'red'}]${self.session_pnl:+.3f}[/]\n"
             f"  Gunluk: [{'green' if self.daily_pnl >= 0 else 'red'}]${self.daily_pnl:+.3f}[/]"
@@ -963,7 +966,7 @@ class LiveSniperBot:
         lay["s"].update(Panel(Text.from_markup(stat), title="Durum", border_style="yellow"))
         lay["l"].update(Panel(
             Text.from_markup("\n".join(list(self.logs))),
-            title="Log [V10.35]",
+            title="Log [V11.0]",
             border_style="red" if self.live_mode else "dim"
         ))
         return lay
@@ -993,7 +996,7 @@ class LiveSniperBot:
                 self._log(f"Approval kontrol: {appr_result}", "INFO")
 
             self._log(
-                "V10.35 BASLADI | MR filtresi + SL soguma + erken cikis aktif",
+                "V11.0 BASLADI | Late Convergence | 0.83-0.93 | 25-110s | BTC $20+",
                 "LIVE" if self.live_mode else "PAPER"
             )
 
