@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """
-Polymarket BTC Sniper V11.0 (Late Convergence Strategy)
+Polymarket BTC Sniper V11.1 (Late Convergence Strategy)
 =========================================================
+  V11.1 — PNL MATEMATIK DUZELTMESI:
+  - EMRG_STOP, SETTL_WIN, SETTL_LOSS: gercek maliyet (shares * entry_price)
+    kullanilacak, sabit stake ($5) degil.
+  - Ornek: 5 hisse * 0.87 = $4.35 gercek maliyet, stake=$5 degil.
+  - Break-even icin gereken win rate: ~%68 (Gemini'nin %90 iddiasi yanlistir).
+
   V11.0 — TAM STRATEJI DEGISIMI (V10.35 uzerine):
 
   ARASTIRMA BULGULARI:
@@ -718,9 +724,10 @@ class LiveSniperBot:
         # Acil durus: giris fiyatinin cok altina dustuyse BTC yonu dönmüstür
         emrg = float(self.strat.get("emergency_stop", 0.68))
         if cur <= emrg:
-            gross = t.shares * cur
-            fee   = t.stake  * float(self.strat["fee_slippage"])
-            pnl   = round(gross - t.stake - fee, 4)
+            gross       = t.shares * cur
+            actual_cost = t.shares * t.entry_price
+            fee         = actual_cost * float(self.strat["fee_slippage"])
+            pnl         = round(gross - actual_cost - fee, 4)
             return True, "EMRG_STOP", pnl, cur
 
         return False, "", 0.0, 0.0
@@ -822,13 +829,16 @@ class LiveSniperBot:
         if ms.active_trade:
             t   = ms.active_trade
             win = (self.btc_price > ms.ref_btc_price) if t.side == "YES" else (self.btc_price <= ms.ref_btc_price)
+            actual_cost = t.shares * t.entry_price
             if win:
-                pnl = round((t.shares * 1.0) - t.stake - (t.stake * float(self.strat["fee_slippage"])), 4)
+                fee = actual_cost * float(self.strat["fee_slippage"])
+                pnl = round((t.shares * 1.0) - actual_cost - fee, 4)
                 self._record(ms, pnl, "SETTL_WIN", 1.0)
                 self._log(f"SETTL_WIN | {t.side} | PnL:${pnl:+.3f}", "TRADE")
             else:
-                self._record(ms, -t.stake, "SETTL_LOSS", 0.0)
-                self._log(f"SETTL_LOSS | {t.side} | -${t.stake}", "WARNING")
+                pnl = round(-actual_cost, 4)
+                self._record(ms, pnl, "SETTL_LOSS", 0.0)
+                self._log(f"SETTL_LOSS | {t.side} | -${actual_cost:.3f}", "WARNING")
         del self.markets[mid]
 
     def _record(self, ms: MarketState, pnl: float, rtype: str, exit_px: float) -> None:
@@ -875,7 +885,7 @@ class LiveSniperBot:
         btc_min  = float(self.strat.get("convergence_btc_delta", 20.0))
 
         hdr = (
-            f"[bold white]BTC SNIPER V11.0 (Late Convergence)[/bold white] "
+            f"[bold white]BTC SNIPER V11.1 (Late Convergence)[/bold white] "
             f"{'[bold red]CANLI[/bold red]' if self.live_mode else '[dim]KAGIT[/dim]'} | "
             f"BTC:[cyan]${self.btc_price:,.0f}[/cyan] | "
             f"PnL:[{'green' if self.session_pnl >= 0 else 'red'}]${self.session_pnl:+.3f}[/] | "
@@ -966,7 +976,7 @@ class LiveSniperBot:
         lay["s"].update(Panel(Text.from_markup(stat), title="Durum", border_style="yellow"))
         lay["l"].update(Panel(
             Text.from_markup("\n".join(list(self.logs))),
-            title="Log [V11.0]",
+            title="Log [V11.1]",
             border_style="red" if self.live_mode else "dim"
         ))
         return lay
@@ -996,7 +1006,7 @@ class LiveSniperBot:
                 self._log(f"Approval kontrol: {appr_result}", "INFO")
 
             self._log(
-                "V11.0 BASLADI | Late Convergence | 0.83-0.93 | 25-110s | BTC $20+",
+                "V11.1 BASLADI | Late Convergence | 0.83-0.93 | 25-110s | BTC $20+",
                 "LIVE" if self.live_mode else "PAPER"
             )
 
