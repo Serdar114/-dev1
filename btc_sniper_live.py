@@ -129,12 +129,15 @@ class LiveTrade:
 
 class MarketState:
     def __init__(self, mid: str, question: str, end_time: datetime,
-                 yes_id: str = "", no_id: str = ""):
-        self.mid        = mid
-        self.question   = question
-        self.end_time   = end_time
-        self.yes_id     = yes_id
-        self.no_id      = no_id
+                 yes_id: str = "", no_id: str = "", horizon_min: int = 5):
+        self.mid         = mid
+        self.question    = question
+        self.end_time    = end_time
+        self.yes_id      = yes_id
+        self.no_id       = no_id
+        # Pazar açılış zamanı: end - horizon (5m veya 15m)
+        self.horizon_min: int      = horizon_min
+        self.start_time: datetime  = end_time - timedelta(minutes=horizon_min)
         self.best_ask:  float = 0.5
         self.best_bid:  float = 0.5
         self.signal:    str   = "BEKLE"
@@ -144,8 +147,9 @@ class MarketState:
         self.sl_strikes:   int   = 0
         # FOK cooldown (V14.5)
         self.last_buy_attempt: float = 0.0
-        # Settle için Chainlink referansi (V14.5 ref_price, V14.8'de Chainlink)
-        self.ref_chainlink: float = 0.0
+        # Pazar AÇILIŞ anındaki Chainlink referansi (settlement için kritik)
+        self.ref_chainlink:    float = 0.0
+        self.ref_chainlink_ts: Optional[datetime] = None  # ne zaman set edildi
 
     @property
     def secs_left(self) -> float:
@@ -401,9 +405,16 @@ class KrajekisSniperBot:
         yes_id = cids[0] if len(cids) > 0 else ""
         no_id  = cids[1] if len(cids) > 1 else ""
         if mid not in self.markets:
-            question = m.get("question") or ev.get("title") or "BTC Up/Down"
-            self.markets[mid] = MarketState(mid, question, end_t, yes_id, no_id)
-            self._log(f"Radar: {question[:48]}", "INFO")
+            question    = m.get("question") or ev.get("title") or "BTC Up/Down"
+            slug        = m.get("slug", "") + question
+            horizon_min = 15 if "15m" in slug.lower() or "15 min" in slug.lower() else 5
+            ms_new = MarketState(mid, question, end_t, yes_id, no_id, horizon_min)
+            self.markets[mid] = ms_new
+            self._log(
+                f"Radar [{horizon_min}m]: {question[:44]} "
+                f"start={ms_new.start_time.strftime('%H:%M')}UTC",
+                "INFO"
+            )
             return 1
         return 0
 
@@ -497,12 +508,23 @@ class KrajekisSniperBot:
         except Exception:
             pass
 
-        # ref_chainlink: pazar ilk gorulduğunde Chainlink fiyatini kilitle
-        cl_now = self.prices["BTC_CHAINLINK"]
+        # ref_chainlink: pazar AÇILIŞ zamanından itibaren kilitle (start_time geçtikten sonra)
+        cl_now  = self.prices["BTC_CHAINLINK"]
+        now_utc = datetime.now(timezone.utc)
         if cl_now > 0:
             for ms in self.markets.values():
                 if ms.ref_chainlink == 0.0 and ms.secs_left > 0:
-                    ms.ref_chainlink = cl_now
+                    lag_secs = (now_utc - ms.start_time).total_seconds()
+                    if lag_secs >= 0:
+                        ms.ref_chainlink    = cl_now
+                        ms.ref_chainlink_ts = now_utc
+                        self._log(
+                            f"REF LOCK [{ms.horizon_min}m] "
+                            f"{ms.short_name[:32]} | "
+                            f"CL=${cl_now:,.0f} | "
+                            f"+{int(lag_secs)}s gecikmeli",
+                            "INFO"
+                        )
 
         # Order book
         tasks = [
@@ -620,7 +642,9 @@ class KrajekisSniperBot:
                 await self.order_mgr.place_sell(
                     ms.active_trade.token_id, exit_px, ms.active_trade.net_shares
                 )
-                self._record(ms, pnl, reason, exit_px)
+                self._record(ms, pnl, reason, exit_px,
+                             btc_ref_used=ms.ref_chainlink,
+                             ref_src="MARKET_OPEN" if ms.ref_chainlink > 0 else "NONE")
                 ms.has_traded = True
                 self._log(f"CIKIS | {reason} | PnL: ${pnl:+.3f}", "TRADE")
             return
@@ -690,19 +714,30 @@ class KrajekisSniperBot:
             return
 
         if ms.active_trade:
-            t        = ms.active_trade
-            btc_now  = self.prices["BTC_CHAINLINK"]
-            btc_ref  = t.entry_asset_px   # Chainlink at entry
+            t       = ms.active_trade
+            btc_now = self.prices["BTC_CHAINLINK"]
+            # Doğru referans: pazar AÇILIŞI anındaki Chainlink (start_time'da set edilen)
+            btc_ref = ms.ref_chainlink if ms.ref_chainlink > 0 else t.entry_asset_px
+
+            # Stale uyarısı: exit fiyatı ref ile aynıysa Chainlink güncellenememiş demektir
+            if btc_now > 0 and abs(btc_now - btc_ref) < 0.01:
+                self._log(
+                    f"UYARI: Chainlink stale olabilir! ref={btc_ref:,.2f} exit={btc_now:,.2f}",
+                    "WARNING"
+                )
+
+            ref_src = "MARKET_OPEN" if ms.ref_chainlink > 0 else "ENTRY_FALLBACK"
 
             if btc_ref > 0 and btc_now > 0:
-                btc_up = btc_now > btc_ref
+                btc_up = btc_now >= btc_ref   # "eşit veya üst → UP" (Polymarket kuralı)
                 won    = (btc_up and t.side == "YES") or (not btc_up and t.side == "NO")
             else:
                 # Fallback: orderbook fiyati
                 cur_poly = _safe_price(
                     ms.best_bid if t.side == "YES" else 1.0 - ms.best_ask
                 )
-                won = cur_poly > t.entry_price
+                won    = cur_poly > t.entry_price
+                ref_src = "ORDERBOOK_FALLBACK"
 
             if won:
                 pnl    = round(t.net_shares * 1.0 - t.raw_shares * t.entry_price, 4)
@@ -712,10 +747,11 @@ class KrajekisSniperBot:
                 reason = "SETTL_LOSS"
 
             exit_px = 1.0 if won else 0.0
-            self._record(ms, pnl, reason, exit_px)
+            self._record(ms, pnl, reason, exit_px, btc_ref, ref_src)
             self._log(
-                f"SETTLED | {reason} | "
-                f"Link ref:${btc_ref:,.0f}→{btc_now:,.0f} | PnL:${pnl:+.3f}",
+                f"SETTLED | {reason} | [{ref_src}] "
+                f"CL:{btc_ref:,.0f}→{btc_now:,.0f} "
+                f"(Δ${btc_now-btc_ref:+,.0f}) | PnL:${pnl:+.3f}",
                 "TRADE" if won else "WARNING"
             )
 
@@ -723,7 +759,8 @@ class KrajekisSniperBot:
 
     # ------------------------------------------------------------------ kayit
 
-    def _record(self, ms: MarketState, pnl: float, rtype: str, exit_px: float) -> None:
+    def _record(self, ms: MarketState, pnl: float, rtype: str, exit_px: float,
+                btc_ref_used: float = 0.0, ref_src: str = "") -> None:
         """Her islemi trades_krajekis.jsonl dosyasina yaz + sayaclari guncelle."""
         t = ms.active_trade
         if not t:
@@ -738,21 +775,26 @@ class KrajekisSniperBot:
             self.losses += 1
 
         record = {
-            "ts":          datetime.now(timezone.utc).isoformat(),
-            "mid":         ms.mid,
-            "question":    ms.question[:60],
-            "side":        t.side,
-            "entry":       t.entry_price,
-            "exit":        exit_px,
-            "raw_shares":  t.raw_shares,
-            "net_shares":  round(t.net_shares, 4),
-            "stake":       t.stake,
-            "pnl":         pnl,
-            "result":      rtype,
-            "btc_chainlink_ref":  t.entry_asset_px,
-            "btc_chainlink_exit": self.prices.get("BTC_CHAINLINK", 0.0),
-            "btc_binance":        self.prices.get("BTC_BINANCE", 0.0),
-            "live":        self.live_mode,
+            "ts":               datetime.now(timezone.utc).isoformat(),
+            "mid":              ms.mid,
+            "question":         ms.question[:60],
+            "horizon_min":      ms.horizon_min,
+            "market_start_utc": ms.start_time.isoformat(),
+            "side":             t.side,
+            "entry":            t.entry_price,
+            "exit":             exit_px,
+            "raw_shares":       t.raw_shares,
+            "net_shares":       round(t.net_shares, 4),
+            "stake":            t.stake,
+            "pnl":              pnl,
+            "result":           rtype,
+            "btc_chainlink_market_open": ms.ref_chainlink,   # pazar açılışı (settlement ref)
+            "btc_chainlink_entry":       t.entry_asset_px,   # trade entry anı
+            "btc_chainlink_exit":        self.prices.get("BTC_CHAINLINK", 0.0),
+            "btc_chainlink_ref_used":    btc_ref_used,        # _settle'da kullanılan ref
+            "ref_source":                ref_src,
+            "btc_binance":               self.prices.get("BTC_BINANCE", 0.0),
+            "live":                      self.live_mode,
         }
         try:
             mem = self.cfg.get("memory_file", "trades_krajekis.jsonl")
