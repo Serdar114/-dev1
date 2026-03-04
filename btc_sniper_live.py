@@ -1,32 +1,30 @@
 #!/usr/bin/env python3
 """
-Polymarket Krajekis Auto-Sniper V14.5 (Paper-Ready Edition)
-=========================================================
-  Strateji: Krajekis BTC 5m/15m playbook — VWAP + EMA + RSI + MACD
-  Paper modda 50 islem hedefi; pozitif win rate kanıtlanırsa live.
+Polymarket Krajekis Auto-Sniper V14.8 (Merged Edition)
+=======================================================
+  V14.7'nin iyi eklemeleri + V14.5'in kritik fixleri birlestirildi.
 
-  V14.5 DUZELTMELER (Claude Senior Audit):
-  1. [FIX] _record(): Her islemi trades_krajekis.jsonl dosyasina yazar.
-     Oturum kapaninca tum trade gecmisi kaybolmuyordu — artik kalici.
-  2. [FIX] max_daily_loss_usd enforce edildi: Gunluk limit asilinca
-     bot yeni islem açmiyor, ekranda "GUNLUK LIMIT" gosteriyor.
-  3. [FIX] max_open_positions enforce edildi: Esik asilinca yeni giris
-     yapilmiyor. Ayni anda maks 2 pozisyon (config ile degistirilebilir).
-  4. [FIX] _settle(): Gercek binary sonuc hesabi. ref_price (pazar
-     acilisindaki BTC) ile kapanistaki BTC karsilastirilir;
-     yon dogru ise 1.0 (tam kazanc), yanlis ise 0.0 (tam kayip).
-     Stale Polymarket fiyati yaniltici PnL veriyordu.
-  5. [FIX] fok_cooldown: Basarisiz FOK'tan sonra last_buy_attempt
-     set edilir, cooldown suresi geçmeden tekrar denenmez.
-  6. [FIX] daily_pnl her gun UTC geceyarisinda sifirlaniyor.
+  V14.7'DEN ALINAN IYZILER:
+  + Chainlink BTC/USD Oracle (Polygon on-chain) fiyat cekme
+  + SL 3-tick gürültü koruması (sl_strikes sayaci)
+  + Fee simülasyonu (paper PnL'i gercekci yapar)
+  + Dual fiyat ekrani (Chainlink vs Binance)
 
-  V14.4'TEN KORUNAN IYZILER:
-  - TP/SL Polymarket hisse fiyati uzerinden (%20 / %15)
-  - V11 approve_token + ensure_approvals sistemi
-  - Giris araligi: 0.70 - 0.95
-  - Saf Pandas TA (VWAP, EMA21/50, RSI14, MACD)
-  - Timestamp slug ile 5m/15m pazar radar
-  - paper_only: true guvenligi
+  V14.5'TEN RESTORE EDILEN FIXLER (V14.7 silmisti):
+  + _record(): Her islemi trades_krajekis.jsonl dosyasina yazar [KRITIK]
+  + max_daily_loss_usd enforce edildi
+  + daily_pnl takibi ve UTC geceyarisi sifirlama
+  + max_open_positions enforce edildi
+  + fok_cooldown: last_buy_attempt ile enforce
+  + MarketState.ref_price: pazar acilisindaki Chainlink fiyati
+
+  V14.8'DE DUZELTILEN V14.7 HATALARI:
+  1. _settle(): cur_poly (stale orderbook) yerine Chainlink karsilastirmasi
+     ile gercek binary sonuc (1.0 / 0.0) hesabi. Ref = entry_asset_px
+     (Chainlink at entry), simdi = BTC_CHAINLINK. Yon dogru → WIN.
+  2. MarketState.ref_price eklendi — settle icin Chainlink referansi.
+  3. _record() JSONL yazimi restore edildi.
+  4. Tum risk kontrolleri (_analyze icinde) restore edildi.
 """
 import sys
 import asyncio
@@ -40,6 +38,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Tuple
+
 from rich.console import Console
 from rich.table import Table
 from rich.live import Live
@@ -56,6 +55,10 @@ try:
 except ImportError:
     CLOB_OK = False
 
+
+# ---------------------------------------------------------------------------
+# Yardimci fonksiyonlar
+# ---------------------------------------------------------------------------
 
 def load_config(path: str = "config.json") -> dict:
     if not os.path.exists(path):
@@ -87,11 +90,26 @@ def _safe_price(p: float) -> float:
 
 
 def _safe_amounts(price: float, stake: float) -> Tuple[float, float]:
-    """Tam sayi hisse: n*price her zaman 2 ondalikli USDC verir."""
-    price_r = round(max(0.01, min(0.99, float(price))), 2)
+    """Tam sayi hisse; n*price her zaman 2 ondalikli USDC verir."""
+    price_r    = round(max(0.01, min(0.99, float(price))), 2)
     shares_int = float(int(round(stake / price_r, 4)))
     return price_r, shares_int
 
+
+def _fee_shares(price: float, raw_shares: float) -> float:
+    """
+    Polymarket kripto taker fee simülasyonu.
+    fee_pct = fee_rate * (p*(1-p))^2   [fee_rate=0.25, exponent=2]
+    Buy emirlerinde ücret share olarak kesilir.
+    p=0.70 → ~%0.55  |  p=0.78 → ~%0.72  |  p=0.50 → ~%1.56 (maks)
+    """
+    p = max(0.01, min(0.99, price))
+    return raw_shares * 0.25 * (p * (1.0 - p)) ** 2
+
+
+# ---------------------------------------------------------------------------
+# Veri yapilari
+# ---------------------------------------------------------------------------
 
 @dataclass
 class LiveTrade:
@@ -99,9 +117,10 @@ class LiveTrade:
     token_id:       str
     side:           str
     entry_price:    float
-    shares:         float
+    raw_shares:     float        # Sat in hisse
+    net_shares:     float        # Fee kesildikten sonra elde edilen hisse
     stake:          float
-    entry_asset_px: float
+    entry_asset_px: float        # Giriste Chainlink BTC fiyati (settle referansi)
     order_id:       str = ""
     entry_time:     datetime = field(
         default_factory=lambda: datetime.now(timezone.utc)
@@ -116,16 +135,17 @@ class MarketState:
         self.end_time   = end_time
         self.yes_id     = yes_id
         self.no_id      = no_id
-        self.asset      = "BTC"
         self.best_ask:  float = 0.5
         self.best_bid:  float = 0.5
         self.signal:    str   = "BEKLE"
         self.active_trade: Optional[LiveTrade] = None
-        self.has_traded:    bool  = False
-        self.exit_retries:  int   = 0
+        self.has_traded:   bool  = False
+        # SL gürültü koruması (V14.7)
+        self.sl_strikes:   int   = 0
+        # FOK cooldown (V14.5)
         self.last_buy_attempt: float = 0.0
-        # FIX-4: Pazar acilisindaki BTC fiyati — settle icin referans
-        self.ref_price: float = 0.0
+        # Settle için Chainlink referansi (V14.5 ref_price, V14.8'de Chainlink)
+        self.ref_chainlink: float = 0.0
 
     @property
     def secs_left(self) -> float:
@@ -139,6 +159,10 @@ class MarketState:
     def short_name(self) -> str:
         return (self.question[:34] + "...") if len(self.question) > 35 else self.question
 
+
+# ---------------------------------------------------------------------------
+# Order yöneticisi
+# ---------------------------------------------------------------------------
 
 class OrderManager:
     def __init__(self, cfg: dict, live_mode: bool):
@@ -170,7 +194,6 @@ class OrderManager:
         if not self.live_mode:
             self._paper_seq += 1
             return f"PAPER-{self._paper_seq:04d}"
-
         def _do():
             try:
                 client = self._client_or_raise()
@@ -181,18 +204,15 @@ class OrderManager:
                 return (resp.get("orderID") or resp.get("order_id") or resp.get("id", ""))
             except Exception as e:
                 return f"ERR:{e}"
-
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._executor, _do)
+        return await asyncio.get_running_loop().run_in_executor(self._executor, _do)
 
     async def place_sell(self, token_id: str, price: float, shares: float) -> str:
         if not self.live_mode:
             self._paper_seq += 1
             return f"PAPER-SELL-{self._paper_seq:04d}"
-
         def _do():
-            client = self._client_or_raise()
             try:
+                client = self._client_or_raise()
                 price_r, shares_r = _safe_amounts(price, shares * price)
                 args   = OrderArgs(price=price_r, size=shares_r, side=SELL, token_id=token_id)
                 signed = client.create_order(args)
@@ -200,15 +220,11 @@ class OrderManager:
                 return (resp.get("orderID") or resp.get("order_id") or resp.get("id", ""))
             except Exception as e:
                 return f"ERR:{e}"
-
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._executor, _do)
+        return await asyncio.get_running_loop().run_in_executor(self._executor, _do)
 
     async def approve_token(self, token_id: str) -> str:
-        """V11 onay sistemi: alim sonrasi hemen CONDITIONAL approval set et."""
         if not self.live_mode:
             return "PAPER"
-
         def _do():
             try:
                 from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
@@ -222,48 +238,11 @@ class OrderManager:
                 return f"OK:{resp}"
             except Exception as e:
                 return f"ERR:{e}"
-
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._executor, _do)
-
-    async def get_balance(self) -> float:
-        if not self.live_mode:
-            return 0.0
-
-        def _do():
-            import urllib.request as _req
-            NATIVE_USDC = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
-            wallet = self.cfg["credentials"].get("wallet_address", "")
-            if wallet:
-                try:
-                    padded  = wallet.lower().replace("0x", "").zfill(64)
-                    data    = "0x70a08231" + padded
-                    payload = json.dumps({
-                        "jsonrpc": "2.0", "method": "eth_call",
-                        "params": [{"to": NATIVE_USDC, "data": data}, "latest"],
-                        "id": 1
-                    }).encode()
-                    req = _req.Request(
-                        "https://polygon-rpc.com", data=payload,
-                        headers={"Content-Type": "application/json"}, method="POST"
-                    )
-                    with _req.urlopen(req, timeout=5) as resp:
-                        result  = json.loads(resp.read())
-                        hex_val = result.get("result", "0x0") or "0x0"
-                        raw     = int(hex_val, 16) if hex_val not in ("0x", "") else 0
-                        return float(raw) / 1e6
-                except Exception:
-                    pass
-            return 0.0
-
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._executor, _do)
+        return await asyncio.get_running_loop().run_in_executor(self._executor, _do)
 
     async def ensure_approvals(self) -> str:
-        """V11 startup onay sistemi: COLLATERAL + CONDITIONAL."""
         if not self.live_mode:
             return "PAPER"
-
         def _do():
             import time as _time
             client  = self._client_or_raise()
@@ -289,23 +268,22 @@ class OrderManager:
             except ImportError:
                 return "IMPORT_ERR"
             return ",".join(results)
-
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._executor, _do)
+        return await asyncio.get_running_loop().run_in_executor(self._executor, _do)
 
     async def cancel_all(self) -> None:
         if not self.live_mode:
             return
-
         def _do():
             try:
                 self._client_or_raise().cancel_all_orders()
             except Exception:
                 pass
+        await asyncio.get_running_loop().run_in_executor(self._executor, _do)
 
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(self._executor, _do)
 
+# ---------------------------------------------------------------------------
+# Ana bot
+# ---------------------------------------------------------------------------
 
 class KrajekisSniperBot:
     def __init__(self, config: dict):
@@ -314,25 +292,30 @@ class KrajekisSniperBot:
         self.strat = config["strategy"]
         self.net   = config["network"]
 
-        if self.strat.get("paper_only", True):
-            self.live_mode = False
-        else:
-            self.live_mode = CLOB_OK and _cfg_has_creds(config)
+        self.live_mode = (
+            False if self.strat.get("paper_only", True)
+            else (CLOB_OK and _cfg_has_creds(config))
+        )
 
         self.console   = Console()
         self.order_mgr = OrderManager(config, self.live_mode)
         self.markets:  Dict[str, MarketState] = {}
         self.logs:     deque = deque(maxlen=14)
-        self.prices:   Dict[str, float] = {"BTC": 0.0}
-        self.ta_data:  Dict[str, dict]  = {}
 
+        # Fiyatlar: TA icin Binance, settlement icin Chainlink
+        self.prices:   Dict[str, float] = {
+            "BTC_BINANCE":    0.0,
+            "BTC_CHAINLINK":  0.0,
+        }
+        self.ta_data:  Dict[str, dict] = {}
+
+        # Sayaçlar
         self.trades:      int   = 0
         self.wins:        int   = 0
         self.losses:      int   = 0
         self.session_pnl: float = 0.0
         self.daily_pnl:   float = 0.0
 
-        # FIX-2: Gunluk reset zamani
         self._daily_reset: datetime = (
             datetime.now(timezone.utc)
             .replace(hour=0, minute=0, second=0, microsecond=0)
@@ -340,7 +323,7 @@ class KrajekisSniperBot:
         )
         self._running: bool = True
 
-    # ------------------------------------------------------------------ helpers
+    # ------------------------------------------------------------------ yardimci
 
     def _log(self, msg: str, level: str = "INFO") -> None:
         ts     = datetime.now().strftime("%H:%M:%S")
@@ -356,15 +339,11 @@ class KrajekisSniperBot:
         self.logs.append(f"[{c}][{ts}] {level}[/] {msg}")
         try:
             with open("debug.log", "a", encoding="utf-8") as f:
-                f.write(
-                    f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
-                    f" [{level}] {msg}\n"
-                )
+                f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [{level}] {msg}\n")
         except Exception:
             pass
 
     def _check_daily_reset(self) -> None:
-        """FIX-2: UTC geceyarisinda gunluk PnL sifirla."""
         if datetime.now(timezone.utc) >= self._daily_reset:
             self.daily_pnl    = 0.0
             self._daily_reset += timedelta(days=1)
@@ -378,19 +357,16 @@ class KrajekisSniperBot:
     def _open_positions(self) -> int:
         return sum(1 for m in self.markets.values() if m.active_trade)
 
-    # ------------------------------------------------------------------ market fetch
+    # ------------------------------------------------------------------ pazar radar
 
     async def _update_markets(self, session: aiohttp.ClientSession) -> None:
-        """Timestamp slug ile gizli 5m/15m BTC pazarlarini cek."""
         now      = int(datetime.now(timezone.utc).timestamp())
-        base_5m  = (now // 300) * 300
-        base_15m = (now // 900) * 900
-
-        sluglar = []
+        base_5m  = (now // 300)  * 300
+        base_15m = (now // 900)  * 900
+        sluglar  = []
         for i in range(-1, 4):
             sluglar.append(f"btc-updown-5m-{base_5m  + i * 300}")
             sluglar.append(f"btc-updown-15m-{base_15m + i * 900}")
-
         for slug in sluglar:
             try:
                 async with session.get(
@@ -400,8 +376,7 @@ class KrajekisSniperBot:
                 ) as r:
                     if r.status == 200:
                         data = await r.json()
-                        evs  = data if isinstance(data, list) else [data]
-                        for ev in evs:
+                        for ev in (data if isinstance(data, list) else [data]):
                             if not ev or not isinstance(ev, dict):
                                 continue
                             for m in ev.get("markets", []):
@@ -422,11 +397,9 @@ class KrajekisSniperBot:
             return 0
         if (end_t - datetime.now(timezone.utc)).total_seconds() < -60:
             return 0
-
         cids   = _parse_clob_token_ids(m.get("clobTokenIds", []))
         yes_id = cids[0] if len(cids) > 0 else ""
         no_id  = cids[1] if len(cids) > 1 else ""
-
         if mid not in self.markets:
             question = m.get("question") or ev.get("title") or "BTC Up/Down"
             self.markets[mid] = MarketState(mid, question, end_t, yes_id, no_id)
@@ -434,10 +407,47 @@ class KrajekisSniperBot:
             return 1
         return 0
 
-    # ------------------------------------------------------------------ price + TA
+    # ------------------------------------------------------------------ fiyat + TA
+
+    async def _fetch_chainlink_btc(self, session: aiohttp.ClientSession) -> float:
+        """
+        Polygon uzerindeki Chainlink BTC/USD aggregator'dan fiyat cek.
+        Kontrat: 0xc907E116054Ad103354f2D350FD2514433D57F6f
+        latestRoundData() → (roundId, answer, startedAt, updatedAt, answeredInRound)
+        answer = 2. slot (offset 66:130), 8 decimals.
+        """
+        try:
+            payload = {
+                "jsonrpc": "2.0", "method": "eth_call",
+                "params": [{
+                    "to":   "0xc907E116054Ad103354f2D350FD2514433D57F6f",
+                    "data": "0xfeaf968c"   # latestRoundData()
+                }, "latest"],
+                "id": 1,
+            }
+            async with session.post(
+                "https://polygon-rpc.com",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as r:
+                if r.status == 200:
+                    res     = await r.json()
+                    hex_val = res.get("result", "")
+                    # 5 × 32-byte slot; 2. slot (index 1) = answer
+                    if hex_val and len(hex_val) >= 2 + 5 * 64:
+                        answer_hex = hex_val[2 + 64: 2 + 128]
+                        return int(answer_hex, 16) / 1e8
+        except Exception:
+            pass
+        return 0.0
 
     async def _fetch_prices_and_ta(self, session: aiohttp.ClientSession) -> None:
-        """Binance 1m kline ile BTC fiyati + saf Pandas TA hesapla."""
+        # 1. Chainlink (settlement referansi)
+        cl = await self._fetch_chainlink_btc(session)
+        if cl > 0:
+            self.prices["BTC_CHAINLINK"] = cl
+
+        # 2. Binance klines (TA icin)
         try:
             async with session.get(
                 "https://api.binance.com/api/v3/klines",
@@ -445,37 +455,36 @@ class KrajekisSniperBot:
                 timeout=aiohttp.ClientTimeout(total=5)
             ) as r:
                 if r.status == 200:
-                    data = await r.json()
-                    df   = pd.DataFrame(
-                        data,
+                    df = pd.DataFrame(
+                        await r.json(),
                         columns=["ts", "open", "high", "low", "close", "vol",
                                  "ct", "qav", "nt", "tbv", "tqv", "ig"]
                     )
                     for col in ("close", "high", "low", "vol"):
                         df[col] = df[col].astype(float)
 
-                    self.prices["BTC"] = df["close"].iloc[-1]
+                    self.prices["BTC_BINANCE"] = df["close"].iloc[-1]
 
-                    # EMA 21 / 50
+                    # Chainlink cokmusse Binance'i yedek kullan
+                    if self.prices["BTC_CHAINLINK"] == 0.0:
+                        self.prices["BTC_CHAINLINK"] = self.prices["BTC_BINANCE"]
+
+                    # TA hesaplari
                     df["EMA_21"] = df["close"].ewm(span=21, adjust=False).mean()
                     df["EMA_50"] = df["close"].ewm(span=50, adjust=False).mean()
 
-                    # RSI 14
                     delta = df["close"].diff()
                     gain  = delta.where(delta > 0, 0).ewm(alpha=1/14, adjust=False).mean()
                     loss  = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
                     df["RSI_14"] = 100 - (100 / (1 + gain / loss))
 
-                    # VWAP (100 dakikalik kayan pencere — session proxy)
                     tp         = (df["high"] + df["low"] + df["close"]) / 3
                     df["VWAP"] = (df["vol"] * tp).cumsum() / df["vol"].cumsum()
 
-                    # MACD histogram
                     ema12 = df["close"].ewm(span=12, adjust=False).mean()
                     ema26 = df["close"].ewm(span=26, adjust=False).mean()
-                    macd_line   = ema12 - ema26
-                    signal_line = macd_line.ewm(span=9, adjust=False).mean()
-                    df["MACD_Hist"] = macd_line - signal_line
+                    ml    = ema12 - ema26
+                    df["MACD_Hist"] = ml - ml.ewm(span=9, adjust=False).mean()
 
                     last = df.iloc[-1]
                     self.ta_data["BTC"] = {
@@ -488,13 +497,14 @@ class KrajekisSniperBot:
         except Exception:
             pass
 
-        # FIX-4: ref_price — pazar ilk gorunduğunde BTC fiyatini kilitle
-        btc_now = self.prices.get("BTC", 0.0)
-        if btc_now > 0:
+        # ref_chainlink: pazar ilk gorulduğunde Chainlink fiyatini kilitle
+        cl_now = self.prices["BTC_CHAINLINK"]
+        if cl_now > 0:
             for ms in self.markets.values():
-                if ms.ref_price == 0.0 and 0 < ms.secs_left:
-                    ms.ref_price = btc_now
+                if ms.ref_chainlink == 0.0 and ms.secs_left > 0:
+                    ms.ref_chainlink = cl_now
 
+        # Order book
         tasks = [
             self._fetch_book(session, ms)
             for ms in list(self.markets.values())
@@ -522,20 +532,15 @@ class KrajekisSniperBot:
         except Exception:
             pass
 
-    # ------------------------------------------------------------------ signal
+    # ------------------------------------------------------------------ sinyal
 
     def _signal(self, ms: MarketState) -> str:
         if ms.secs_left <= 0:
             return "BEKLE"
 
-        # Krajekis sweet spot: son 5-10 dk (15m) veya son 1-3 dk (5m)
         is_15m = "15m" in ms.short_name.lower() or "15 minute" in ms.short_name.lower()
-        if is_15m:
-            st = float(self.strat.get("sweet_spot_15m_start", 10.0))
-            en = float(self.strat.get("sweet_spot_15m_end", 5.0))
-        else:
-            st = float(self.strat.get("sweet_spot_5m_start", 3.0))
-            en = float(self.strat.get("sweet_spot_5m_end", 1.0))
+        st = float(self.strat.get("sweet_spot_15m_start" if is_15m else "sweet_spot_5m_start", 10.0 if is_15m else 3.0))
+        en = float(self.strat.get("sweet_spot_15m_end"   if is_15m else "sweet_spot_5m_end",   5.0  if is_15m else 1.0))
 
         if not (en <= ms.mins_left <= st):
             return "ZAMAN DISI"
@@ -544,7 +549,8 @@ class KrajekisSniperBot:
         if not ta or pd.isna(ta["vwap"]):
             return "TA BEKLENIYOR"
 
-        px    = self.prices["BTC"]
+        # TA: Binance momentum fiyati
+        px    = self.prices["BTC_BINANCE"]
         vwap  = ta["vwap"]
         rsi   = ta["rsi"]
         ema21 = ta["ema21"]
@@ -554,24 +560,23 @@ class KrajekisSniperBot:
         if ms.best_ask - ms.best_bid > float(self.strat.get("max_spread", 0.05)):
             return "GENIS MAKAS"
 
-        # Yukari: fiyat VWAP üstü + EMA bullish + RSI overbought degil + MACD pozitif
         if (px > vwap and ema21 > ema50
-                and rsi < float(self.strat.get("rsi_overbought", 70))
-                and macd > 0):
+                and rsi < float(self.strat.get("rsi_overbought", 70)) and macd > 0):
             return "UP (LONG)"
 
-        # Asagi: fiyat VWAP alti + EMA bearish + RSI oversold degil + MACD negatif
         if (px < vwap and ema21 < ema50
-                and rsi > float(self.strat.get("rsi_oversold", 30))
-                and macd < 0):
+                and rsi > float(self.strat.get("rsi_oversold", 30)) and macd < 0):
             return "DN (SHORT)"
 
         return "YAPI BOZUK"
 
-    # ------------------------------------------------------------------ exit
+    # ------------------------------------------------------------------ cikis
 
     def _check_exit(self, ms: MarketState) -> Tuple[bool, str, float, float]:
-        """TP/SL Polymarket hisse fiyati uzerinden (BTC yuzdesi degil)."""
+        """
+        TP/SL: Polymarket hisse fiyati hareketi uzerinden.
+        SL: 3 ardisik kontrolde de esik altinda kalirsa tetiklenir (gurultu korumasi).
+        """
         t = ms.active_trade
         if not t:
             return False, "", 0.0, 0.0
@@ -579,23 +584,29 @@ class KrajekisSniperBot:
         tp = float(self.strat.get("tp_pct_gain", 0.20))
         sl = float(self.strat.get("sl_pct_loss", 0.15))
 
-        cur_poly = _safe_price(ms.best_bid if t.side == "YES" else 1.0 - ms.best_ask)
-        move_pct = (cur_poly - t.entry_price) / t.entry_price
+        cur_poly  = _safe_price(ms.best_bid if t.side == "YES" else 1.0 - ms.best_ask)
+        move_pct  = (cur_poly - t.entry_price) / t.entry_price
 
         if move_pct >= tp:
-            pnl = round((t.shares * cur_poly) - (t.shares * t.entry_price), 4)
-            return True, "TAKE_PROFIT", pnl, cur_poly
+            pnl = (t.net_shares * cur_poly) - (t.raw_shares * t.entry_price)
+            ms.sl_strikes = 0
+            return True, "TAKE_PROFIT", round(pnl, 4), cur_poly
 
         if move_pct <= -sl:
-            pnl = round((t.shares * cur_poly) - (t.shares * t.entry_price), 4)
-            return True, "STOP_LOSS", pnl, cur_poly
+            ms.sl_strikes += 1
+            if ms.sl_strikes >= 3:
+                pnl = (t.net_shares * cur_poly) - (t.raw_shares * t.entry_price)
+                ms.sl_strikes = 0
+                return True, "STOP_LOSS", round(pnl, 4), cur_poly
+        else:
+            ms.sl_strikes = 0
 
         return False, "", 0.0, 0.0
 
-    # ------------------------------------------------------------------ analyze
+    # ------------------------------------------------------------------ analiz
 
     async def _analyze(self, ms: MarketState) -> None:
-        # FIX-2: Gunluk kayip limiti
+        # Gunluk kayip limiti
         if self._daily_limit_hit:
             ms.signal = "GUNLUK LIMIT"
             return
@@ -607,7 +618,7 @@ class KrajekisSniperBot:
             ok, reason, pnl, exit_px = self._check_exit(ms)
             if ok:
                 await self.order_mgr.place_sell(
-                    ms.active_trade.token_id, exit_px, ms.active_trade.shares
+                    ms.active_trade.token_id, exit_px, ms.active_trade.net_shares
                 )
                 self._record(ms, pnl, reason, exit_px)
                 ms.has_traded = True
@@ -618,7 +629,7 @@ class KrajekisSniperBot:
         if "UP" not in ms.signal and "DN" not in ms.signal:
             return
 
-        # FIX-3: Ayni anda max pozisyon kontrolu
+        # Maks pozisyon kontrolu
         max_pos = int(self.risk.get("max_open_positions", 2))
         if self._open_positions >= max_pos:
             ms.signal = "POS DOLU"
@@ -633,86 +644,87 @@ class KrajekisSniperBot:
         if entry < min_e or entry > max_e or not token_id:
             return
 
-        # FIX-5: fok_cooldown — basarisiz sonrasi bekleme
-        now_ts  = datetime.now(timezone.utc).timestamp()
-        fok_cd  = float(self.strat.get("fok_cooldown", 20))
+        # FOK cooldown
+        now_ts = datetime.now(timezone.utc).timestamp()
+        fok_cd = float(self.strat.get("fok_cooldown", 20))
         if now_ts - ms.last_buy_attempt < fok_cd:
             return
 
-        stake  = float(self.risk["stake_usd"])
-        _, shares = _safe_amounts(entry, stake)
+        stake = float(self.risk["stake_usd"])
+        _, raw_shares = _safe_amounts(entry, stake)
+        net_shares    = raw_shares - _fee_shares(entry, raw_shares)
 
         ms.last_buy_attempt = now_ts
-        oid = await self.order_mgr.place_buy(token_id, entry, shares)
+        oid = await self.order_mgr.place_buy(token_id, entry, raw_shares)
 
         if not oid or oid.startswith("ERR:"):
-            self._log(f"FOK iptal — {int(fok_cd)}s bekleniyor | {oid}", "WARNING")
+            self._log(f"FOK iptal ({int(fok_cd)}s bekle) | {oid}", "WARNING")
             return
 
+        cl_now = self.prices["BTC_CHAINLINK"]
         ms.active_trade = LiveTrade(
             market_id=ms.mid, token_id=token_id, side=side,
-            entry_price=entry, shares=shares, stake=stake,
-            entry_asset_px=self.prices.get("BTC", 0.0), order_id=oid
+            entry_price=entry, raw_shares=raw_shares, net_shares=net_shares,
+            stake=stake, entry_asset_px=cl_now, order_id=oid
         )
         self._log(
             f"{'LIVE' if self.live_mode else 'PAPER'} SNIPE ({side}) | "
-            f"{entry:.3f} | {shares:.0f} hisse | ${stake}",
+            f"{entry:.3f} | {raw_shares:.0f} hisse (net:{net_shares:.2f}) | "
+            f"Link:${cl_now:,.0f}",
             "LIVE" if self.live_mode else "PAPER"
         )
-
-        # V11 approval: alim sonrasi hemen token approval
         appr = await self.order_mgr.approve_token(token_id)
         if appr not in ("PAPER",):
-            self._log(f"Token Approval: {appr[:60]}", "INFO")
+            self._log(f"Approval: {appr[:60]}", "INFO")
 
     # ------------------------------------------------------------------ settle
 
     async def _settle(self, mid: str) -> None:
         """
-        FIX-4: Gercek binary sonuc.
-        ref_price (pazar acilisindaki BTC) vs simdi karsilastirilir.
-        Yon dogru → 1.0 (tam kazanc), yanlis → 0.0 (tam kayip).
+        Gercek binary sonuc: Chainlink at entry vs Chainlink simdi.
+        entry_asset_px (Chainlink giriste) → btc_now (Chainlink simdi)
+        Yon dogru → shares * 1.0 kazanc, yanlis → tam kayip.
         """
         ms = self.markets.get(mid)
         if not ms:
             return
 
         if ms.active_trade:
-            t       = ms.active_trade
-            btc_now = self.prices.get("BTC", 0.0)
+            t        = ms.active_trade
+            btc_now  = self.prices["BTC_CHAINLINK"]
+            btc_ref  = t.entry_asset_px   # Chainlink at entry
 
-            if ms.ref_price > 0 and btc_now > 0:
-                btc_up = btc_now > ms.ref_price
+            if btc_ref > 0 and btc_now > 0:
+                btc_up = btc_now > btc_ref
                 won    = (btc_up and t.side == "YES") or (not btc_up and t.side == "NO")
             else:
-                # ref_price yoksa son Polymarket fiyatini proxy kullan
+                # Fallback: orderbook fiyati
                 cur_poly = _safe_price(
                     ms.best_bid if t.side == "YES" else 1.0 - ms.best_ask
                 )
                 won = cur_poly > t.entry_price
 
-            actual_cost = t.shares * t.entry_price
             if won:
-                pnl    = round(t.shares * 1.0 - actual_cost, 4)
+                pnl    = round(t.net_shares * 1.0 - t.raw_shares * t.entry_price, 4)
                 reason = "SETTL_WIN"
             else:
-                pnl    = round(-actual_cost, 4)
+                pnl    = round(-(t.raw_shares * t.entry_price), 4)
                 reason = "SETTL_LOSS"
 
             exit_px = 1.0 if won else 0.0
             self._record(ms, pnl, reason, exit_px)
             self._log(
-                f"SETTLED | {reason} | BTC ref:{ms.ref_price:,.0f} → "
-                f"simdi:{btc_now:,.0f} | PnL: ${pnl:+.3f}",
+                f"SETTLED | {reason} | "
+                f"Link ref:${btc_ref:,.0f}→{btc_now:,.0f} | PnL:${pnl:+.3f}",
                 "TRADE" if won else "WARNING"
             )
 
         del self.markets[mid]
 
-    # ------------------------------------------------------------------ record
+    # ------------------------------------------------------------------ kayit
 
     def _record(self, ms: MarketState, pnl: float, rtype: str, exit_px: float) -> None:
-        """FIX-1: Her islemi JSONL dosyasina yaz + sayaclari guncelle."""
+        """Her islemi trades_krajekis.jsonl dosyasina yaz + sayaclari guncelle."""
         t = ms.active_trade
         if not t:
             return
@@ -726,19 +738,21 @@ class KrajekisSniperBot:
             self.losses += 1
 
         record = {
-            "ts":         datetime.now(timezone.utc).isoformat(),
-            "mid":        ms.mid,
-            "question":   ms.question[:60],
-            "side":       t.side,
-            "entry":      t.entry_price,
-            "exit":       exit_px,
-            "shares":     t.shares,
-            "stake":      t.stake,
-            "pnl":        pnl,
-            "result":     rtype,
-            "btc_ref":    ms.ref_price,
-            "btc_exit":   self.prices.get("BTC", 0.0),
-            "live":       self.live_mode,
+            "ts":          datetime.now(timezone.utc).isoformat(),
+            "mid":         ms.mid,
+            "question":    ms.question[:60],
+            "side":        t.side,
+            "entry":       t.entry_price,
+            "exit":        exit_px,
+            "raw_shares":  t.raw_shares,
+            "net_shares":  round(t.net_shares, 4),
+            "stake":       t.stake,
+            "pnl":         pnl,
+            "result":      rtype,
+            "btc_chainlink_ref":  t.entry_asset_px,
+            "btc_chainlink_exit": self.prices.get("BTC_CHAINLINK", 0.0),
+            "btc_binance":        self.prices.get("BTC_BINANCE", 0.0),
+            "live":        self.live_mode,
         }
         try:
             mem = self.cfg.get("memory_file", "trades_krajekis.jsonl")
@@ -756,24 +770,25 @@ class KrajekisSniperBot:
         lay.split_column(
             Layout(name="h", size=3),
             Layout(name="b", ratio=1),
-            Layout(name="l", size=14)
+            Layout(name="l", size=14),
         )
         lay["b"].split_row(Layout(name="mt", ratio=4), Layout(name="s", size=40))
 
-        btc_px = self.prices.get("BTC", 0.0)
-        ta_btc = self.ta_data.get("BTC", {})
-        vwap   = ta_btc.get("vwap", 0.0)
-        rsi    = ta_btc.get("rsi", 0.0)
-        wr     = (self.wins / self.trades * 100) if self.trades else 0.0
-        limit  = abs(self.risk.get("max_daily_loss_usd", 3.0))
+        cl  = self.prices.get("BTC_CHAINLINK", 0.0)
+        bn  = self.prices.get("BTC_BINANCE",   0.0)
+        ta  = self.ta_data.get("BTC", {})
+        rsi = ta.get("rsi", 0.0)
+        wr  = (self.wins / self.trades * 100) if self.trades else 0.0
+        lim = abs(self.risk.get("max_daily_loss_usd", 3.0))
 
         hdr = (
-            f"[bold white]KRAJEKIS BTC AUTO-SNIPER V14.5[/bold white] "
-            f"{'[bold red]CANLI[/bold red]' if self.live_mode else '[dim]PAPER (SIFIR RISK)[/dim]'} | "
-            f"BTC:[cyan]${btc_px:,.0f}[/cyan] | "
-            f"VWAP:[yellow]${vwap:,.0f}[/yellow] | "
+            f"[bold white]KRAJEKIS BTC SNIPER V14.8[/bold white] "
+            f"{'[bold red]CANLI[/bold red]' if self.live_mode else '[dim]PAPER[/dim]'} | "
+            f"Link:[bold green]${cl:,.0f}[/bold green] "
+            f"(Bin:[cyan]${bn:,.0f}[/cyan] Δ${abs(cl-bn):,.0f}) | "
+            f"VWAP:[yellow]${ta.get('vwap',0):,.0f}[/yellow] | "
             f"RSI:[magenta]{rsi:.1f}[/magenta] | "
-            f"PnL:[{'green' if self.session_pnl >= 0 else 'red'}]${self.session_pnl:+.3f}[/] | "
+            f"PnL:[{'green' if self.session_pnl>=0 else 'red'}]${self.session_pnl:+.3f}[/] | "
             f"W/L:[green]{self.wins}[/green]/[red]{self.losses}[/red]({wr:.0f}%)"
         )
         lay["h"].update(Panel(Text.from_markup(hdr), border_style="cyan"))
@@ -785,73 +800,72 @@ class KrajekisSniperBot:
         for ms in sorted(self.markets.values(), key=lambda x: x.secs_left):
             if ms.secs_left <= 0:
                 continue
-            pos_str    = ""
-            row_style  = "white"
+            pos_str   = ""
+            row_style = "white"
             if ms.active_trade:
-                t         = ms.active_trade
-                cur_poly  = _safe_price(ms.best_bid if t.side == "YES" else 1.0 - ms.best_ask)
-                gain      = cur_poly - t.entry_price
-                pos_str   = f"{t.side}@{t.entry_price:.2f} ({gain:+.2f})"
+                t        = ms.active_trade
+                cur_poly = _safe_price(ms.best_bid if t.side == "YES" else 1.0 - ms.best_ask)
+                gain     = cur_poly - t.entry_price
+                pos_str  = f"{t.side}@{t.entry_price:.2f} ({gain:+.2f})"
                 row_style = "green" if gain >= 0 else "red"
             elif ms.has_traded:
                 pos_str   = "[dim]KAPANDI[/dim]"
                 row_style = "dim"
 
-            time_str = f"{int(ms.mins_left)}m {int(ms.secs_left % 60)}s"
             tbl.add_row(
-                time_str, ms.short_name,
-                f"{ms.best_ask:.3f}", f"{1.0 - ms.best_bid:.3f}",
+                f"{int(ms.mins_left)}m {int(ms.secs_left%60)}s",
+                ms.short_name,
+                f"{ms.best_ask:.3f}", f"{1.0-ms.best_bid:.3f}",
                 ms.signal, pos_str,
-                style=row_style
+                style=row_style,
             )
 
         lay["mt"].update(Panel(
             tbl,
-            title=f"Radar ({sum(1 for m in self.markets.values() if m.secs_left > 0)} pazar"
-                  f" | {self._open_positions} acik pozisyon)",
-            border_style="cyan"
+            title=f"Radar ({sum(1 for m in self.markets.values() if m.secs_left>0)} pazar"
+                  f" | {self._open_positions} acik)",
+            border_style="cyan",
         ))
 
         stat = (
-            f"[bold cyan]TA YAPISI (BTC)[/bold cyan]\n"
-            f"  Fiyat: [cyan]${btc_px:,.0f}[/cyan]\n"
-            f"  VWAP:  [yellow]${vwap:,.0f}[/yellow]\n"
-            f"  EMA21: ${ta_btc.get('ema21', 0):,.0f}\n"
-            f"  EMA50: ${ta_btc.get('ema50', 0):,.0f}\n"
+            f"[bold cyan]TA (Binance)[/bold cyan]\n"
+            f"  Fiyat: [cyan]${bn:,.0f}[/cyan]\n"
+            f"  VWAP:  [yellow]${ta.get('vwap',0):,.0f}[/yellow]\n"
+            f"  EMA21: ${ta.get('ema21',0):,.0f}\n"
+            f"  EMA50: ${ta.get('ema50',0):,.0f}\n"
             f"  RSI:   [magenta]{rsi:.1f}[/magenta]\n"
-            f"  MACD:  {'[green]' if ta_btc.get('macd', 0) > 0 else '[red]'}"
-            f"{ta_btc.get('macd', 0):+.2f}[/]\n\n"
-            f"[bold cyan]KRAJEKIS ZAMANLAMA[/bold cyan]\n"
-            f"  15m Pencere: {self.strat.get('sweet_spot_15m_end')}-"
+            f"  MACD:  {'[green]' if ta.get('macd',0)>0 else '[red]'}{ta.get('macd',0):+.2f}[/]\n\n"
+            f"[bold cyan]ORACLE (Chainlink)[/bold cyan]\n"
+            f"  Fiyat: [bold green]${cl:,.0f}[/bold green]\n"
+            f"  Fark:  ${abs(cl-bn):,.1f}\n\n"
+            f"[bold cyan]KRAJEKIS PENCERE[/bold cyan]\n"
+            f"  15m: {self.strat.get('sweet_spot_15m_end')}-"
             f"{self.strat.get('sweet_spot_15m_start')} dk\n"
-            f"  5m  Pencere: {self.strat.get('sweet_spot_5m_end')}-"
+            f"  5m:  {self.strat.get('sweet_spot_5m_end')}-"
             f"{self.strat.get('sweet_spot_5m_start')} dk\n"
-            f"  Giris: {self.strat.get('min_entry_price')}-"
-            f"{self.strat.get('max_entry_price')}\n"
-            f"  TP: +%{self.strat.get('tp_pct_gain', 0.20)*100:.0f} | "
-            f"SL: -%{self.strat.get('sl_pct_loss', 0.15)*100:.0f}\n\n"
+            f"  Giris: {self.strat.get('min_entry_price')}-{self.strat.get('max_entry_price')}\n"
+            f"  TP: +%{self.strat.get('tp_pct_gain',0.2)*100:.0f} | "
+            f"SL: -%{self.strat.get('sl_pct_loss',0.15)*100:.0f} (3-tick)\n\n"
             f"[bold cyan]KASA[/bold cyan]\n"
-            f"  Gunluk PnL: "
-            f"[{'green' if self.daily_pnl >= 0 else 'red'}]${self.daily_pnl:+.3f}[/]\n"
-            f"  Gunluk Limit: [red]-${limit:.2f}[/]\n"
-            f"  Toplam Islem: [white]{self.trades}[/white]\n"
-            f"  Win Rate: [green]{wr:.1f}%[/green]"
+            f"  Gunluk: [{'green' if self.daily_pnl>=0 else 'red'}]${self.daily_pnl:+.3f}[/] "
+            f"(limit: -${lim:.2f})\n"
+            f"  Toplam: {self.trades} islem | WR: [green]{wr:.1f}%[/green]"
         )
         lay["s"].update(Panel(Text.from_markup(stat), title="Krajekis Analiz", border_style="yellow"))
         lay["l"].update(Panel(
             Text.from_markup("\n".join(list(self.logs))),
-            title="Sistem Log [V14.5]",
-            border_style="cyan"
+            title="Sistem Log [V14.8]",
+            border_style="cyan",
         ))
         return lay
 
-    # ------------------------------------------------------------------ main
+    # ------------------------------------------------------------------ ana döngü
 
     async def main_run(self) -> None:
         connector = aiohttp.TCPConnector(
             limit=20,
             resolver=aiohttp.ThreadedResolver(),
-            family=socket.AF_INET
+            family=socket.AF_INET,
         )
         async with aiohttp.ClientSession(connector=connector) as session:
             if self.live_mode:
@@ -859,9 +873,8 @@ class KrajekisSniperBot:
                 self._log(f"Live Onay: {appr}", "INFO")
 
             self._log(
-                "V14.5 Krajekis BTC Radari Basliyor... "
-                f"({'CANLI' if self.live_mode else 'PAPER'})",
-                "LIVE" if self.live_mode else "PAPER"
+                f"V14.8 Krajekis Basladi ({'CANLI' if self.live_mode else 'PAPER'})",
+                "LIVE" if self.live_mode else "PAPER",
             )
 
             with Live(self._render(), refresh_per_second=2, screen=True) as live:
@@ -884,6 +897,8 @@ class KrajekisSniperBot:
             await self.order_mgr.cancel_all()
 
 
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
     cfg_path = sys.argv[1] if len(sys.argv) > 1 else "config.json"
     try:
@@ -893,7 +908,7 @@ if __name__ == "__main__":
 
     bot = KrajekisSniperBot(cfg)
     if bot.live_mode:
-        ans = input("  CANLI PARA modunda calisacak. Devam? [evet/hayir]: ").strip().lower()
+        ans = input("CANLI PARA modunda. Devam? [evet/hayir]: ").strip().lower()
         if ans not in ("evet", "e", "yes", "y"):
             sys.exit(0)
     try:
