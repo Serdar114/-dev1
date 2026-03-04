@@ -15,21 +15,25 @@
   "risk": {
     "stake_usd": 5.0,
     "max_daily_loss_usd": 10.0,
-    "max_open_positions": 1
+    "max_open_positions": 3
   },
   "strategy": {
     "min_entry_price": 0.83,
     "max_entry_price": 0.93,
     "max_spread": 0.05,
-    "emergency_stop": 0.68,
-    "convergence_btc_delta": 20.0,
+    "emergency_stop": 0.73,
+    "convergence_btc_delta": 12.0,
+    "convergence_eth_delta": 1.0,
+    "convergence_sol_delta": 0.08,
     "convergence_secs_min": 25.0,
     "convergence_secs_max": 110.0,
     "fee_slippage": 0.003,
     "exit_retry_interval": 15,
     "fok_cooldown": 20,
     "momentum_window": 45,
-    "momentum_threshold": 0.05
+    "momentum_threshold": 0.05,
+    "eth_momentum_threshold": 0.003,
+    "sol_momentum_threshold": 0.0002
   },
   "memory_file": "trades_live.jsonl"
 }

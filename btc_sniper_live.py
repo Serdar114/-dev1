@@ -132,28 +132,29 @@ def _safe_amounts(price: float, stake: float) -> Tuple[float, float]:
 
 @dataclass
 class LiveTrade:
-    market_id:   str
-    token_id:    str
-    side:        str
-    entry_price: float
-    shares:      float
-    stake:       float
-    entry_btc:   float
-    ref_btc:     float
-    order_id:    str = ""
-    entry_time:  datetime = field(
+    market_id:      str
+    token_id:       str
+    side:           str
+    entry_price:    float
+    shares:         float
+    stake:          float
+    entry_asset_px: float
+    ref_asset_px:   float
+    order_id:       str = ""
+    entry_time:     datetime = field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
 
 
 class MarketState:
     def __init__(self, mid: str, question: str, end_time: datetime,
-                 yes_id: str = "", no_id: str = ""):
+                 yes_id: str = "", no_id: str = "", asset: str = "BTC"):
         self.mid        = mid
         self.question   = question
         self.end_time   = end_time
         self.yes_id     = yes_id
         self.no_id      = no_id
+        self.asset      = asset
         self.best_ask:  float = 0.5
         self.best_bid:  float = 0.5
         self.mid_px:    float = 0.5
@@ -162,7 +163,7 @@ class MarketState:
         self.obi_score: float = 0.5
         self.signal:    str   = "BEKLE"
         self.active_trade: Optional[LiveTrade] = None
-        self.ref_btc_price: float = 0.0
+        self.ref_price:     float = 0.0
         self.has_traded:    bool  = False
         self.exit_retries:      int   = 0
         self.last_buy_attempt:  float = 0.0
@@ -407,8 +408,12 @@ class LiveSniperBot:
         self.order_mgr = OrderManager(config, self.live_mode)
         self.markets:      Dict[str, MarketState] = {}
         self.logs:         deque = deque(maxlen=14)
-        self.btc_price:    float = 0.0
-        self.btc_history:  deque = deque(maxlen=60)
+        self.prices:       Dict[str, float] = {"BTC": 0.0, "ETH": 0.0, "SOL": 0.0}
+        self.histories:    Dict[str, deque] = {
+            "BTC": deque(maxlen=60),
+            "ETH": deque(maxlen=60),
+            "SOL": deque(maxlen=60),
+        }
         self.trades:       int   = 0
         self.wins:         int   = 0
         self.losses:       int   = 0
@@ -423,6 +428,10 @@ class LiveSniperBot:
         self._running: bool = True
         self._consec_losses: int   = 0
         self._sl_cooldown_until: float = 0.0
+
+    @property
+    def btc_price(self) -> float:
+        return self.prices.get("BTC", 0.0)
 
     def _log(self, msg: str, level: str = "INFO") -> None:
         ts = datetime.now().strftime("%H:%M:%S")
@@ -453,8 +462,7 @@ class LiveSniperBot:
     def _daily_limit_hit(self) -> bool:
         return self.daily_pnl <= -abs(self.risk["max_daily_loss_usd"])
 
-    async def _fetch_btc_rest(self, session: aiohttp.ClientSession) -> Optional[float]:
-        symbol = self.net.get("binance_symbol", "BTCUSDT").replace("/", "")
+    async def _fetch_price_rest(self, session: aiohttp.ClientSession, symbol: str) -> Optional[float]:
         try:
             async with session.get(
                 "https://api.binance.com/api/v3/ticker/price",
@@ -483,8 +491,12 @@ class LiveSniperBot:
                         if not ev or not isinstance(ev, dict):
                             continue
                         title = str(ev.get("title", "")).lower()
-                        if ("bitcoin" in title or "btc" in title) and \
-                           ("up" in title or "down" in title or "updown" in title):
+                        is_crypto = (
+                            ("bitcoin" in title or "btc" in title) or
+                            ("ethereum" in title or "eth updown" in title or "eth-updown" in title) or
+                            ("solana" in title or "sol updown" in title or "sol-updown" in title)
+                        )
+                        if is_crypto and ("up" in title or "down" in title or "updown" in title):
                             for m in ev.get("markets", []):
                                 found += self._process_market(m, ev)
         except Exception:
@@ -514,7 +526,9 @@ class LiveSniperBot:
             base = (now // 300) * 300
             sluglar = (
                 [f"bitcoin-up-or-down-{base + i * 300}" for i in range(-1, 8)] +
-                [f"btc-updown-5m-{base + i * 300}" for i in range(-1, 8)]
+                [f"btc-updown-5m-{base + i * 300}" for i in range(-1, 8)] +
+                [f"eth-updown-5m-{base + i * 300}" for i in range(-1, 8)] +
+                [f"sol-updown-5m-{base + i * 300}" for i in range(-1, 8)]
             )
             for slug in sluglar:
                 try:
@@ -552,7 +566,14 @@ class LiveSniperBot:
         no_id  = cids[1] if len(cids) > 1 else ""
         if mid not in self.markets:
             question = m.get("question") or ev.get("title") or "Bitcoin Up or Down"
-            self.markets[mid] = MarketState(mid, question, end_t, yes_id, no_id)
+            q_lower  = question.lower()
+            if "eth" in q_lower or "ethereum" in q_lower:
+                asset = "ETH"
+            elif "sol" in q_lower or "solana" in q_lower:
+                asset = "SOL"
+            else:
+                asset = "BTC"
+            self.markets[mid] = MarketState(mid, question, end_t, yes_id, no_id, asset)
             self._log(
                 f"Yeni pazar | {int((end_t - datetime.now(timezone.utc)).total_seconds())}s | {question[:48]}",
                 "INFO"
@@ -567,28 +588,41 @@ class LiveSniperBot:
             return 0
 
     async def _fetch_prices(self, session: aiohttp.ClientSession) -> None:
-        price = await self._fetch_btc_rest(session)
-        if price:
-            self.btc_price = price
-            self.btc_history.append(self.btc_price)
-        else:
+        SYMBOLS = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT"}
+        GECKO   = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana"}
+
+        price_tasks = {asset: self._fetch_price_rest(session, sym) for asset, sym in SYMBOLS.items()}
+        results = await asyncio.gather(*price_tasks.values(), return_exceptions=True)
+        for asset, price in zip(price_tasks.keys(), results):
+            if isinstance(price, float) and price > 0:
+                self.prices[asset] = price
+                self.histories[asset].append(price)
+
+        # Fallback CoinGecko sadece eksik olanlar icin
+        missing = [a for a in SYMBOLS if self.prices[a] == 0.0]
+        if missing:
             try:
+                ids = ",".join(GECKO[a] for a in missing)
                 async with session.get(
                     "https://api.coingecko.com/api/v3/simple/price",
-                    params={"ids": "bitcoin", "vs_currencies": "usd"},
+                    params={"ids": ids, "vs_currencies": "usd"},
                     timeout=aiohttp.ClientTimeout(total=5)
                 ) as r:
                     if r.status == 200:
-                        self.btc_price = float((await r.json())["bitcoin"]["usd"])
-                        self.btc_history.append(self.btc_price)
+                        data = await r.json()
+                        for asset in missing:
+                            val = data.get(GECKO[asset], {}).get("usd")
+                            if val:
+                                self.prices[asset] = float(val)
+                                self.histories[asset].append(float(val))
             except Exception:
                 pass
 
-        if self.btc_price > 0:
-            for ms in list(self.markets.values()):
-                if ms.ref_btc_price == 0.0 and 0 < ms.secs_left <= 300:
-                    ms.ref_btc_price = self.btc_price
-                    self._log(f"REF MUHUR | ${self.btc_price:,.2f} | {ms.short_name}", "INFO")
+        for ms in list(self.markets.values()):
+            px = self.prices.get(ms.asset, 0.0)
+            if px > 0 and ms.ref_price == 0.0 and 0 < ms.secs_left <= 300:
+                ms.ref_price = px
+                self._log(f"REF MUHUR | ${px:,.2f} | {ms.short_name}", "INFO")
 
         tasks = [
             self._fetch_book(session, ms)
@@ -650,19 +684,25 @@ class LiveSniperBot:
         ms.mid_px = (ms.best_ask + ms.best_bid) / 2.0
         ms.history.append(ms.mid_px)
 
-    def _btc_momentum(self) -> Tuple[float, str]:
-        """Son N kayittaki BTC yonunu hesapla (~90s at 2s/cycle icin win=45)."""
+    def _asset_momentum(self, asset: str = "BTC") -> Tuple[float, str]:
+        """Son N kayittaki asset yonunu hesapla."""
         win    = int(self.strat.get("momentum_window", 45))
-        thresh = float(self.strat.get("momentum_threshold", 0.05))
-        prices = list(self.btc_history)[-win:]
-        if len(prices) < 3:
+        # Her asset icin farkli threshold: BTC ~0.05, ETH ~0.003, SOL ~0.0002
+        default_thresh = {"BTC": 0.05, "ETH": 0.003, "SOL": 0.0002}.get(asset, 0.05)
+        thresh = float(self.strat.get(f"{asset.lower()}_momentum_threshold", default_thresh))
+        hist   = list(self.histories.get(asset, deque()))[-win:]
+        if len(hist) < 3:
             return 0.0, "FLAT"
-        velocity = (prices[-1] - prices[0]) / max(len(prices) - 1, 1)
+        velocity = (hist[-1] - hist[0]) / max(len(hist) - 1, 1)
         if velocity > thresh:
             return velocity, "UP"
         if velocity < -thresh:
             return velocity, "DOWN"
         return velocity, "FLAT"
+
+    def _btc_momentum(self) -> Tuple[float, str]:
+        """Geriye donuk uyumluluk icin BTC momentum."""
+        return self._asset_momentum("BTC")
 
     def _signal(self, ms: MarketState) -> str:
         """
@@ -672,7 +712,7 @@ class LiveSniperBot:
         """
         if ms.secs_left <= 0:
             return "BEKLE"
-        if ms.ref_btc_price == 0.0:
+        if ms.ref_price == 0.0:
             return "BEKLENIYOR"
 
         # Convergence penceresi: sadece son 25-110 saniyede gir
@@ -686,12 +726,15 @@ class LiveSniperBot:
         if spread > float(self.strat.get("max_spread", 0.05)):
             return "GENIS"
 
-        # BTC hareketi: pencere basından bu yana ($20+ gerekli)
-        btc_min      = float(self.strat.get("convergence_btc_delta", 20.0))
-        window_delta = self.btc_price - ms.ref_btc_price
+        # Asset hareketi: pencere basından bu yana (min delta gerekli)
+        asset = ms.asset
+        default_delta = {"BTC": 12.0, "ETH": 1.0, "SOL": 0.08}.get(asset, 12.0)
+        btc_min      = float(self.strat.get(f"convergence_{asset.lower()}_delta", default_delta))
+        asset_price  = self.prices.get(asset, 0.0)
+        window_delta = asset_price - ms.ref_price
 
         # Son momentum — yon dogrulamasi icin (geri dönüs varsa girme)
-        _, direction = self._btc_momentum()
+        _, direction = self._asset_momentum(asset)
 
         # Convergence fiyat bolgesi: 0.83-0.93
         min_e  = float(self.strat.get("min_entry_price", 0.83))
@@ -817,7 +860,8 @@ class LiveSniperBot:
         ms.active_trade = LiveTrade(
             market_id=ms.mid, token_id=token_id, side=side,
             entry_price=entry, shares=shares, stake=stake,
-            entry_btc=self.btc_price, ref_btc=ms.ref_btc_price, order_id=oid
+            entry_asset_px=self.prices.get(ms.asset, 0.0),
+            ref_asset_px=ms.ref_price, order_id=oid
         )
         self._log(
             f"[{'LIVE' if self.live_mode else 'PAPER'}] {ms.signal} | "
@@ -835,7 +879,8 @@ class LiveSniperBot:
             return
         if ms.active_trade:
             t   = ms.active_trade
-            win = (self.btc_price > ms.ref_btc_price) if t.side == "YES" else (self.btc_price <= ms.ref_btc_price)
+            cur_px = self.prices.get(ms.asset, 0.0)
+            win = (cur_px > ms.ref_price) if t.side == "YES" else (cur_px <= ms.ref_price)
             actual_cost = t.shares * t.entry_price
             if win:
                 fee = actual_cost * float(self.strat["fee_slippage"])
@@ -889,12 +934,16 @@ class LiveSniperBot:
         wr       = (self.wins / self.trades * 100) if self.trades else 0.0
         velocity, v_dir = self._btc_momentum()
         stake    = float(self.risk["stake_usd"])
-        btc_min  = float(self.strat.get("convergence_btc_delta", 20.0))
+        btc_min  = float(self.strat.get("convergence_btc_delta", 12.0))
 
+        eth_px = self.prices.get("ETH", 0.0)
+        sol_px = self.prices.get("SOL", 0.0)
         hdr = (
-            f"[bold white]BTC SNIPER V11.1 (Late Convergence)[/bold white] "
+            f"[bold white]MULTI SNIPER V12.0 (Late Convergence)[/bold white] "
             f"{'[bold red]CANLI[/bold red]' if self.live_mode else '[dim]KAGIT[/dim]'} | "
-            f"BTC:[cyan]${self.btc_price:,.0f}[/cyan] | "
+            f"BTC:[cyan]${self.btc_price:,.0f}[/cyan] "
+            f"ETH:[cyan]${eth_px:,.0f}[/cyan] "
+            f"SOL:[cyan]${sol_px:,.1f}[/cyan] | "
             f"PnL:[{'green' if self.session_pnl >= 0 else 'red'}]${self.session_pnl:+.3f}[/] | "
             f"USDC:[yellow]${self.usdc_balance:.2f}[/yellow] | "
             f"W/L:[green]{self.wins}[/green]/[red]{self.losses}[/red]({wr:.0f}%)"
@@ -996,10 +1045,12 @@ class LiveSniperBot:
         )
         async with aiohttp.ClientSession(connector=connector) as session:
             for _ in range(5):
-                price = await self._fetch_btc_rest(session)
-                if price:
-                    self.btc_price = price
-                    self.btc_history.append(price)
+                for asset, symbol in [("BTC","BTCUSDT"),("ETH","ETHUSDT"),("SOL","SOLUSDT")]:
+                    px = await self._fetch_price_rest(session, symbol)
+                    if px:
+                        self.prices[asset] = px
+                        self.histories[asset].append(px)
+                if self.prices["BTC"] > 0:
                     break
                 await asyncio.sleep(2)
 
@@ -1013,7 +1064,7 @@ class LiveSniperBot:
                 self._log(f"Approval kontrol: {appr_result}", "INFO")
 
             self._log(
-                "V11.1 BASLADI | Late Convergence | 0.83-0.93 | 25-110s | BTC $20+",
+                "V12.0 BASLADI | Multi-Asset (BTC+ETH+SOL) | Late Convergence | 0.83-0.93 | 25-110s",
                 "LIVE" if self.live_mode else "PAPER"
             )
 
