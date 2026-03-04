@@ -19,7 +19,8 @@
   },
   "strategy": {
     "min_entry_price": 0.83,
-    "max_entry_price": 0.93,
+    "max_entry_price": 0.89,
+    "no_exit_secs": 60,
     "max_spread": 0.05,
     "emergency_stop": 0.73,
     "convergence_btc_delta": 12.0,

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Polymarket BTC Sniper V11.2 (Late Convergence Strategy)
+Polymarket BTC Sniper V11.3 (Late Convergence Strategy)
 =========================================================
   V11.1 — PNL MATEMATIK DUZELTMESI:
   - EMRG_STOP, SETTL_WIN, SETTL_LOSS: gercek maliyet (shares * entry_price)
@@ -758,15 +758,17 @@ class LiveSniperBot:
         """
         V11.0 cikis mantigi: Normal TP/SL YOK — settlement'a kadar tut.
         Tek cikis: EMRG_STOP — fiyat cok duserse BTC yonu donmustür, sat.
-        V11.2: Son 30 saniyede EMRG kontrol edilmez; market kapanirken
-               best_bid kurur, sahte tetik + basa donen PolyApiException olur.
+        V11.3: no_exit_secs config'den okunur (varsayilan 60). Son 60s'de
+               EMRG kontrol edilmez; balina ignesi + likidite kurumasi
+               sebebiyle sahte tetiklenme onlenir.
         """
         t = ms.active_trade
         if not t:
             return False, "", 0.0, 0.0
 
-        # Son 30 saniye: settlement zaten geliyor, satmaya calisma
-        if ms.secs_left <= 30:
+        # Son no_exit_secs saniye: settlement geliyor, EMRG tetikleme
+        no_exit = float(self.strat.get("no_exit_secs", 60))
+        if ms.secs_left <= no_exit:
             return False, "", 0.0, 0.0
 
         cur  = _safe_price(ms.best_bid if t.side == "YES" else 1.0 - ms.best_ask)
