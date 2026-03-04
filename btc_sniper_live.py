@@ -964,7 +964,7 @@ class LiveSniperBot:
         for ms in sorted(self.markets.values(), key=lambda x: x.secs_left):
             if ms.secs_left <= 0:
                 continue
-            delta   = self.btc_price - ms.ref_btc_price if ms.ref_btc_price > 0 else 0.0
+            delta   = self.prices.get(ms.asset, 0.0) - ms.ref_price if ms.ref_price > 0 else 0.0
             pos_str = ""
             row_style = "white"
 
@@ -999,7 +999,7 @@ class LiveSniperBot:
 
             tbl.add_row(
                 t_str, ms.short_name,
-                f"${ms.ref_btc_price:,.0f}" if ms.ref_btc_price > 0 else "[dim]BEKL.[/dim]",
+                f"${ms.ref_price:,.0f}" if ms.ref_price > 0 else "[dim]BEKL.[/dim]",
                 f"[{'green' if delta >= 0 else 'red'}]{delta:+,.0f}[/]",
                 f"[{'green' if yes_ok else 'white'}]{yes_px:.3f}[/]",
                 f"[{'green' if no_ok else 'white'}]{no_px:.3f}[/]",
