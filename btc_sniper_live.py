@@ -313,6 +313,10 @@ class KrajekisSniperBot:
         }
         self.ta_data:  Dict[str, dict] = {}
 
+        # Chainlink stale takibi
+        self._chainlink_last_value:   float = 0.0
+        self._chainlink_last_changed: float = 0.0   # unix timestamp
+
         # Sayaçlar
         self.trades:      int   = 0
         self.wins:        int   = 0
@@ -456,6 +460,9 @@ class KrajekisSniperBot:
         # 1. Chainlink (settlement referansi)
         cl = await self._fetch_chainlink_btc(session)
         if cl > 0:
+            if abs(cl - self._chainlink_last_value) > 0.01:
+                self._chainlink_last_value   = cl
+                self._chainlink_last_changed = datetime.now(timezone.utc).timestamp()
             self.prices["BTC_CHAINLINK"] = cl
 
         # 2. Binance klines (TA icin)
@@ -603,8 +610,9 @@ class KrajekisSniperBot:
         if not t:
             return False, "", 0.0, 0.0
 
-        tp = float(self.strat.get("tp_pct_gain", 0.20))
-        sl = float(self.strat.get("sl_pct_loss", 0.15))
+        tp      = float(self.strat.get("tp_pct_gain", 0.20))
+        sl      = float(self.strat.get("sl_pct_loss", 0.15))
+        hard_sl = float(self.strat.get("hard_sl_pct", 0.25))
 
         cur_poly  = _safe_price(ms.best_bid if t.side == "YES" else 1.0 - ms.best_ask)
         move_pct  = (cur_poly - t.entry_price) / t.entry_price
@@ -614,6 +622,13 @@ class KrajekisSniperBot:
             ms.sl_strikes = 0
             return True, "TAKE_PROFIT", round(pnl, 4), cur_poly
 
+        # Hard SL: 3-tick beklenmeden anlik cikis
+        if move_pct <= -hard_sl:
+            pnl = (t.net_shares * cur_poly) - (t.raw_shares * t.entry_price)
+            ms.sl_strikes = 0
+            return True, "STOP_LOSS", round(pnl, 4), cur_poly
+
+        # Soft SL: 3 ardisik olumsuz tick
         if move_pct <= -sl:
             ms.sl_strikes += 1
             if ms.sl_strikes >= 3:
@@ -662,6 +677,24 @@ class KrajekisSniperBot:
         side     = "YES" if "UP" in ms.signal else "NO"
         token_id = ms.yes_id if side == "YES" else ms.no_id
         entry    = ms.best_ask if side == "YES" else 1.0 - ms.best_bid
+
+        # NO bets devre disi kontrolu
+        if side == "NO" and not self.strat.get("no_bets_enabled", False):
+            ms.signal = "NO KAPALI"
+            return
+
+        # Chainlink stale kontrolu: son X dakikada fiyat degismediyse girmeme
+        stale_limit_min = float(self.strat.get("chainlink_stale_skip_min", 15))
+        now_ts = datetime.now(timezone.utc).timestamp()
+        if (self._chainlink_last_changed > 0
+                and (now_ts - self._chainlink_last_changed) > stale_limit_min * 60):
+            stale_min = int((now_ts - self._chainlink_last_changed) / 60)
+            self._log(
+                f"CHAINLINK STALE {stale_min}dk — trade atlandi ({ms.short_name[:30]})",
+                "WARNING"
+            )
+            ms.signal = f"CL STALE {stale_min}dk"
+            return
 
         min_e = float(self.strat.get("min_entry_price", 0.70))
         max_e = float(self.strat.get("max_entry_price", 0.95))

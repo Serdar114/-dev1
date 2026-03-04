@@ -29,8 +29,11 @@
     "max_entry_price": 0.95,
     "tp_pct_gain": 0.20,
     "sl_pct_loss": 0.15,
+    "hard_sl_pct": 0.25,
     "fok_cooldown": 20,
-    "max_spread": 0.05
+    "max_spread": 0.05,
+    "no_bets_enabled": false,
+    "chainlink_stale_skip_min": 15
   },
   "memory_file": "trades_krajekis.jsonl"
 }
