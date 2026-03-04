@@ -1,10 +1,10 @@
 {
   "credentials": {
-    "private_key": "0x3eea5d7836eb5a7f38b1b6ebeefd1e3afc0bc9217a523681e358a4835d689893",
-    "wallet_address": "0xa131947e8F1404806b278765C314590c7cE51D0E",
-    "api_key": "560b86bb-cae7-52b5-d400-e4542b88f288",
-    "api_secret": "xAh_Bb_re_P0jxS5OuyMuYwdOzOHWqjU728WBb9x-VU=",
-    "api_passphrase": "5d75a8cd9a291c1bbaa8168c0387312389007cb562d918e732b1984302830030"
+    "private_key": "",
+    "wallet_address": "",
+    "api_key": "",
+    "api_secret": "",
+    "api_passphrase": ""
   },
   "network": {
     "clob_url": "https://clob.polymarket.com",
@@ -13,28 +13,24 @@
     "binance_symbol": "BTCUSDT"
   },
   "risk": {
-    "stake_usd": 2.0,
+    "stake_usd": 3.0,
     "max_daily_loss_usd": 3.0,
     "max_open_positions": 2
   },
   "strategy": {
-    "min_entry_price": 0.83,
-    "max_entry_price": 0.89,
-    "no_exit_secs": 60,
-    "max_spread": 0.05,
-    "emergency_stop": 0.73,
-    "convergence_btc_delta": 12.0,
-    "convergence_eth_delta": 1.0,
-    "convergence_sol_delta": 0.08,
-    "convergence_secs_min": 25.0,
-    "convergence_secs_max": 110.0,
-    "fee_slippage": 0.003,
-    "exit_retry_interval": 15,
+    "paper_only": true,
+    "sweet_spot_15m_start": 10.0,
+    "sweet_spot_15m_end": 5.0,
+    "sweet_spot_5m_start": 3.0,
+    "sweet_spot_5m_end": 1.0,
+    "rsi_overbought": 70.0,
+    "rsi_oversold": 30.0,
+    "min_entry_price": 0.70,
+    "max_entry_price": 0.95,
+    "tp_pct_gain": 0.20,
+    "sl_pct_loss": 0.15,
     "fok_cooldown": 20,
-    "momentum_window": 45,
-    "momentum_threshold": 0.05,
-    "eth_momentum_threshold": 0.003,
-    "sol_momentum_threshold": 0.0002
+    "max_spread": 0.05
   },
-  "memory_file": "trades_live.jsonl"
+  "memory_file": "trades_krajekis.jsonl"
 }
