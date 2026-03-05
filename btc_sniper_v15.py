@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Polymarket Krajekis Auto-Sniper V15.1 (HIGH-FREQUENCY EDITION)
-===============================================================
-  V15.0 uzerine degisiklikler:
-  + 5m pazarlar geri eklendi (hem 5m hem 15m izleniyor)
-  + Spread limiti 0.03 → 0.04 (biraz daha genis, daha fazla giris)
-  + NO bahisleri acik (V14.8'deki no_bets_enabled kontrolu yok)
-  + Chainlink cache-buster korundu
-  + FOK cooldown ve max_open_positions korundu
+Polymarket Krajekis Auto-Sniper V15.2 (HYBRID EDITION)
+=======================================================
+  V15.1 uzerine degisiklikler:
+  + BRAIN 1 (YES): TA tabanli yiikselis sinyali, TP ile cikis, SL korundu
+  + BRAIN 2 (NO):  Son 30-150 saniyede, BTC acilisin altindaysa giris,
+                   Stop-Loss YOK, settlement'a kadar tut, max_entry_no=0.83
+  + YES ve NO icin ayri max_entry parametreleri (max_entry_yes / max_entry_no)
+  + TA tabanli DN sinyali kaldirildi (NO icin artik _signal_no_late kullaniliyor)
 """
 import sys
 import asyncio
@@ -526,15 +526,47 @@ class KrajekisSniperBot:
         if ms.best_ask - ms.best_bid > max_spread:
             return "GENIS MAKAS"
 
+        # Brain 1: Sadece YES (yukselis) sinyali - DN artik Brain 2'ye ait
         if (px > vwap and ema21 > ema50
                 and rsi < float(self.strat.get("rsi_overbought", 70)) and macd > 0):
             return "UP (LONG)"
 
-        if (px < vwap and ema21 < ema50
-                and rsi > float(self.strat.get("rsi_oversold", 30)) and macd < 0):
-            return "DN (SHORT)"
-
         return "YAPI BOZUK"
+
+    # ------------------------------------------------------------------ Brain 2: NO
+
+    def _signal_no_late(self, ms: MarketState) -> bool:
+        """
+        Brain 2 (NO): TA kullanmaz. Son 30-150 saniyede, BTC pazar acilisindan
+        yeterince asagidaysa NO al. Stop-Loss yok, settlement'a kadar bekle.
+        """
+        secs = ms.secs_left
+        win_start = float(self.strat.get("no_window_secs_start", 150.0))
+        win_end   = float(self.strat.get("no_window_secs_end",   30.0))
+        if not (win_end <= secs <= win_start):
+            return False
+
+        # Pazar acilisindaki BTC fiyati gerekli
+        ref = ms.ref_chainlink
+        if ref <= 0:
+            return False
+
+        btc_now = self.prices["BTC_BINANCE"]
+        # 5m ve 15m icin farkli dusus esigi
+        if ms.horizon_min == 5:
+            drop_needed = float(self.strat.get("no_min_btc_drop_5m", 80.0))
+        else:
+            drop_needed = float(self.strat.get("no_min_btc_drop_15m", 150.0))
+
+        if btc_now >= ref - drop_needed:
+            return False
+
+        # Spread kontrolu
+        max_spread = float(self.strat.get("max_spread", 0.04))
+        if ms.best_ask - ms.best_bid > max_spread:
+            return False
+
+        return True
 
     # ------------------------------------------------------------------ cikis
 
@@ -555,6 +587,11 @@ class KrajekisSniperBot:
             ms.sl_strikes = 0
             return True, "TAKE_PROFIT", round(pnl, 4), cur_poly
 
+        # Brain 2 (NO): Stop-Loss yok - settlement'a kadar tut
+        if t.side == "NO":
+            return False, "", 0.0, 0.0
+
+        # Brain 1 (YES): Normal SL mantigi
         if move_pct <= -hard_sl:
             pnl = (t.net_shares * cur_poly) - (t.raw_shares * t.entry_price)
             ms.sl_strikes = 0
@@ -592,22 +629,34 @@ class KrajekisSniperBot:
                 self._log(f"CIKIS | {reason} | PnL: ${pnl:+.3f}", "TRADE")
             return
 
-        ms.signal = self._signal(ms)
-        if "UP" not in ms.signal and "DN" not in ms.signal:
-            return
-
         max_pos = int(self.risk.get("max_open_positions", 2))
         if self._open_positions >= max_pos:
             ms.signal = "POS DOLU"
             return
 
-        side     = "YES" if "UP" in ms.signal else "NO"
-        token_id = ms.yes_id if side == "YES" else ms.no_id
-        entry    = ms.best_ask if side == "YES" else 1.0 - ms.best_bid
-
         min_e = float(self.strat.get("min_entry_price", 0.70))
-        max_e = float(self.strat.get("max_entry_price", 0.95))
-        if entry < min_e or entry > max_e or not token_id:
+
+        # --- Brain 1: YES (TA tabanli yukselis) ---
+        ms.signal = self._signal(ms)
+        if "UP" in ms.signal:
+            side     = "YES"
+            token_id = ms.yes_id
+            entry    = ms.best_ask
+            max_e    = float(self.strat.get("max_entry_yes", 0.87))
+            if entry < min_e or entry > max_e or not token_id:
+                return
+
+        # --- Brain 2: NO (gec giris, BTC dusus teyidi) ---
+        elif self._signal_no_late(ms):
+            side     = "NO"
+            token_id = ms.no_id
+            entry    = 1.0 - ms.best_bid
+            max_e    = float(self.strat.get("max_entry_no", 0.83))
+            ms.signal = f"DN (LATE-NO) ref={ms.ref_chainlink:,.0f}"
+            if entry < min_e or entry > max_e or not token_id:
+                return
+
+        else:
             return
 
         # FOK cooldown
@@ -757,7 +806,7 @@ class KrajekisSniperBot:
         lim = abs(self.risk.get("max_daily_loss_usd", 3.0))
 
         hdr = (
-            f"[bold white]KRAJEKIS V15.1 (HF Edition)[/bold white] "
+            f"[bold white]KRAJEKIS V15.2 (Hybrid Edition)[/bold white] "
             f"{'[bold red]CANLI[/bold red]' if self.live_mode else '[dim]PAPER[/dim]'} | "
             f"Link:[bold green]${cl:,.0f}[/bold green] "
             f"(Bin:[cyan]${bn:,.0f}[/cyan] Δ${abs(cl-bn):,.0f}) | "
@@ -815,19 +864,22 @@ class KrajekisSniperBot:
             f"  Fark:  ${abs(cl-bn):,.1f}\n\n"
             f"[bold cyan]FILTRELER[/bold cyan]\n"
             f"  Makas: max {self.strat.get('max_spread', 0.04):.2f}\n"
-            f"  Giris: {self.strat.get('min_entry_price', 0.70)}-{self.strat.get('max_entry_price', 0.95)}\n"
-            f"  5m pencere: {self.strat.get('sweet_spot_5m_end',1)}-{self.strat.get('sweet_spot_5m_start',3)} dk\n"
-            f"  15m pencere: {self.strat.get('sweet_spot_15m_end',5)}-{self.strat.get('sweet_spot_15m_start',10)} dk\n"
-            f"  NO bahis: ACIK\n\n"
+            f"  [cyan]Brain1 YES[/cyan]: max {self.strat.get('max_entry_yes', 0.87):.2f}\n"
+            f"  [yellow]Brain2 NO[/yellow]:  max {self.strat.get('max_entry_no', 0.83):.2f} "
+            f"(son {int(self.strat.get('no_window_secs_start',150))}s)\n"
+            f"  NO drop 5m: ${self.strat.get('no_min_btc_drop_5m',80):.0f} "
+            f"| 15m: ${self.strat.get('no_min_btc_drop_15m',150):.0f}\n"
+            f"  5m YES pencere: {self.strat.get('sweet_spot_5m_end',1)}-{self.strat.get('sweet_spot_5m_start',3)} dk\n"
+            f"  15m YES pencere: {self.strat.get('sweet_spot_15m_end',5)}-{self.strat.get('sweet_spot_15m_start',10)} dk\n\n"
             f"[bold cyan]KASA[/bold cyan]\n"
             f"  Gunluk: [{'green' if self.daily_pnl>=0 else 'red'}]${self.daily_pnl:+.3f}[/] "
             f"(limit: -${lim:.2f})\n"
             f"  Toplam: {self.trades} islem | WR: [green]{wr:.1f}%[/green]"
         )
-        lay["s"].update(Panel(Text.from_markup(stat), title="Krajekis V15.1", border_style="yellow"))
+        lay["s"].update(Panel(Text.from_markup(stat), title="Krajekis V15.2 Hybrid", border_style="yellow"))
         lay["l"].update(Panel(
             Text.from_markup("\n".join(list(self.logs))),
-            title="Sistem Log [V15.1]",
+            title="Sistem Log [V15.2 Hybrid | Brain1=YES-TA Brain2=NO-Late]",
             border_style="cyan",
         ))
         return lay
@@ -846,7 +898,7 @@ class KrajekisSniperBot:
                 self._log(f"Live Onay: {appr}", "INFO")
 
             self._log(
-                f"V15.1 HF Edition Basladi ({'CANLI' if self.live_mode else 'PAPER'})",
+                f"V15.2 Hybrid Edition Basladi ({'CANLI' if self.live_mode else 'PAPER'})",
                 "LIVE" if self.live_mode else "PAPER",
             )
 
