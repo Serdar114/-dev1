@@ -50,7 +50,8 @@
     "exit_retry_interval":   15,
     "fok_cooldown":          20,
     "rsi_overbought":        70,
-    "rsi_oversold":          30
+    "rsi_oversold":          30,
+    "min_signal_score":      2
   },
   "memory_file": "trades_paper.jsonl"
 }
