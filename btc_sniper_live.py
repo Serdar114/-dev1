@@ -597,12 +597,24 @@ class KrajekisSniperBot:
         if ms.best_ask - ms.best_bid > float(self.strat.get("max_spread", 0.05)):
             return "GENIS MAKAS"
 
-        if (px > vwap and ema21 > ema50
-                and rsi < float(self.strat.get("rsi_overbought", 70)) and macd > 0):
-            return "UP (LONG)"
+        # 4 kosuldan 3'u yeterliyse sinyal uret (daha fazla firsat)
+        up_score = sum([
+            px > vwap,
+            ema21 > ema50,
+            rsi < float(self.strat.get("rsi_overbought", 70)),
+            macd > 0,
+        ])
+        dn_score = sum([
+            px < vwap,
+            ema21 < ema50,
+            rsi > float(self.strat.get("rsi_oversold", 30)),
+            macd < 0,
+        ])
 
-        if (px < vwap and ema21 < ema50
-                and rsi > float(self.strat.get("rsi_oversold", 30)) and macd < 0):
+        min_score = int(self.strat.get("min_signal_score", 3))
+        if up_score >= min_score and up_score >= dn_score:
+            return "UP (LONG)"
+        if dn_score >= min_score and dn_score > up_score:
             return "DN (SHORT)"
 
         return "YAPI BOZUK"
