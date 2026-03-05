@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Polymarket Krajekis Auto-Sniper V15.2 (HYBRID EDITION)
+Polymarket Krajekis Auto-Sniper V15.4 (HYBRID EDITION)
 =======================================================
-  V15.1 uzerine degisiklikler:
-  + BRAIN 1 (YES): TA tabanli yiikselis sinyali, TP ile cikis, SL korundu
-  + BRAIN 2 (NO):  Son 30-150 saniyede, BTC acilisin altindaysa giris,
-                   Stop-Loss YOK, settlement'a kadar tut, max_entry_no=0.83
-  + YES ve NO icin ayri max_entry parametreleri (max_entry_yes / max_entry_no)
-  + TA tabanli DN sinyali kaldirildi (NO icin artik _signal_no_late kullaniliyor)
+  V15.4 degisiklikleri:
+  + BRAIN 1 (YES): Skor tabanli sinyal — 4 TA kosulundan en az 3'u zorunlu
+  + BRAIN 1 (YES): Son 3 mumun hepsinin yukselis (close>open) sart — momentum filtresi
+  + BRAIN 2 (NO):  Oncelik kazandi — ayni anda YES de yaniyorsa NO alinir
+  + Brain 2 NO esikleri dusuruldu: 5m $80->$60 | 15m $150->$100 (daha fazla NO firsati)
+  + max_open_positions: 1->3 (saatte 5-7 giris hedefi)
+  + min_signal_score: 2->3 (YES icin daha yuksek kalite bari)
 """
 import sys
 import asyncio
@@ -453,7 +454,7 @@ class KrajekisSniperBot:
                         columns=["ts", "open", "high", "low", "close", "vol",
                                  "ct", "qav", "nt", "tbv", "tqv", "ig"]
                     )
-                    for col in ("close", "high", "low", "vol"):
+                    for col in ("open", "close", "high", "low", "vol"):
                         df[col] = df[col].astype(float)
 
                     self.prices["BTC_BINANCE"] = df["close"].iloc[-1]
@@ -478,12 +479,18 @@ class KrajekisSniperBot:
                     df["MACD_Hist"] = ml - ml.ewm(span=9, adjust=False).mean()
 
                     last = df.iloc[-1]
+                    # Son 3 mumun hepsi yukselis mi (close > open)?
+                    last3_bullish = all(
+                        df["close"].iloc[i] > df["open"].iloc[i]
+                        for i in [-3, -2, -1]
+                    )
                     self.ta_data["BTC"] = {
-                        "vwap":  float(last["VWAP"]),
-                        "rsi":   float(last["RSI_14"]),
-                        "ema21": float(last["EMA_21"]),
-                        "ema50": float(last["EMA_50"]),
-                        "macd":  float(last["MACD_Hist"]),
+                        "vwap":         float(last["VWAP"]),
+                        "rsi":          float(last["RSI_14"]),
+                        "ema21":        float(last["EMA_21"]),
+                        "ema50":        float(last["EMA_50"]),
+                        "macd":         float(last["MACD_Hist"]),
+                        "last3_bullish": last3_bullish,
                     }
         except Exception:
             pass
@@ -548,10 +555,23 @@ class KrajekisSniperBot:
         if ms.best_ask - ms.best_bid > max_spread:
             return "GENIS MAKAS"
 
-        # Brain 1: Sadece YES (yukselis) sinyali - DN artik Brain 2'ye ait
-        if (px > vwap and ema21 > ema50
-                and rsi < float(self.strat.get("rsi_overbought", 70)) and macd > 0):
-            return "UP (LONG)"
+        # Brain 1: YES sinyali — skor tabanlı (min_signal_score) + son 3 mum momentum
+        # Her TA koşulu 1 puan; minimum 3/4 GEREKLİ
+        score = 0
+        if px > vwap:
+            score += 1
+        if ema21 > ema50:
+            score += 1
+        if rsi < float(self.strat.get("rsi_overbought", 70)):
+            score += 1
+        if macd > 0:
+            score += 1
+
+        min_score     = int(self.strat.get("min_signal_score", 3))
+        last3_bullish = ta.get("last3_bullish", False)
+
+        if score >= min_score and last3_bullish:
+            return f"UP (LONG) {score}/4"
 
         return "YAPI BOZUK"
 
@@ -658,18 +678,8 @@ class KrajekisSniperBot:
 
         min_e = float(self.strat.get("min_entry_price", 0.70))
 
-        # --- Brain 1: YES (TA tabanli yukselis) ---
-        ms.signal = self._signal(ms)
-        if "UP" in ms.signal:
-            side     = "YES"
-            token_id = ms.yes_id
-            entry    = ms.best_ask
-            max_e    = float(self.strat.get("max_entry_yes", 0.87))
-            if entry < min_e or entry > max_e or not token_id:
-                return
-
-        # --- Brain 2: NO (gec giris, BTC dusus teyidi) ---
-        elif self._signal_no_late(ms):
+        # Brain 2: NO önce kontrol edilir (arbitraj mantigi — YES'e gore daha güvenli)
+        if self._signal_no_late(ms):
             side     = "NO"
             token_id = ms.no_id
             entry    = 1.0 - ms.best_bid
@@ -678,8 +688,18 @@ class KrajekisSniperBot:
             if entry < min_e or entry > max_e or not token_id:
                 return
 
+        # Brain 1: YES — sadece NO sinyali yoksa devreye girer
         else:
-            return
+            ms.signal = self._signal(ms)
+            if "UP" in ms.signal:
+                side     = "YES"
+                token_id = ms.yes_id
+                entry    = ms.best_ask
+                max_e    = float(self.strat.get("max_entry_yes", 0.87))
+                if entry < min_e or entry > max_e or not token_id:
+                    return
+            else:
+                return
 
         # FOK cooldown
         now_ts = datetime.now(timezone.utc).timestamp()
@@ -832,7 +852,7 @@ class KrajekisSniperBot:
         lim = abs(self.risk.get("max_daily_loss_usd", 3.0))
 
         hdr = (
-            f"[bold white]KRAJEKIS V15.2 (Hybrid Edition)[/bold white] "
+            f"[bold white]KRAJEKIS V15.4 (Hybrid Edition)[/bold white] "
             f"{'[bold red]CANLI[/bold red]' if self.live_mode else '[dim]PAPER[/dim]'} | "
             f"Link:[bold green]${cl:,.0f}[/bold green] "
             f"(Bin:[cyan]${bn:,.0f}[/cyan] Δ${abs(cl-bn):,.0f}) | "
@@ -902,10 +922,10 @@ class KrajekisSniperBot:
             f"(limit: -${lim:.2f})\n"
             f"  Toplam: {self.trades} islem | WR: [green]{wr:.1f}%[/green]"
         )
-        lay["s"].update(Panel(Text.from_markup(stat), title="Krajekis V15.2 Hybrid", border_style="yellow"))
+        lay["s"].update(Panel(Text.from_markup(stat), title="Krajekis V15.4 Hybrid", border_style="yellow"))
         lay["l"].update(Panel(
             Text.from_markup("\n".join(list(self.logs))),
-            title="Sistem Log [V15.2 Hybrid | Brain1=YES-TA Brain2=NO-Late]",
+            title="Sistem Log [V15.4 Hybrid | Brain1=YES-TA Brain2=NO-Late]",
             border_style="cyan",
         ))
         return lay
@@ -924,7 +944,7 @@ class KrajekisSniperBot:
                 self._log(f"Live Onay: {appr}", "INFO")
 
             self._log(
-                f"V15.2 Hybrid Edition Basladi ({'CANLI' if self.live_mode else 'PAPER'})",
+                f"V15.4 Hybrid Edition Basladi ({'CANLI' if self.live_mode else 'PAPER'})",
                 "LIVE" if self.live_mode else "PAPER",
             )
 
