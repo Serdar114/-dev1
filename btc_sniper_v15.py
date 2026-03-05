@@ -418,6 +418,21 @@ class KrajekisSniperBot:
                             f"| CL=${cl_price:,.0f} | +{int(lag_secs)}s gecikmeli",
                             "INFO"
                         )
+        else:
+            # Chainlink alinamazsa Binance ile ref_chainlink'i doldur (ENTRY_FALLBACK engeli)
+            bn_now = self.prices.get("BTC_BINANCE", 0.0)
+            if bn_now > 0:
+                for ms in list(self.markets.values()):
+                    if ms.ref_chainlink == 0.0 and ms.secs_left > 0:
+                        lag_secs = (now_utc - ms.start_time).total_seconds()
+                        if lag_secs >= 0:
+                            ms.ref_chainlink    = bn_now
+                            ms.ref_chainlink_ts = now_utc
+                            self._log(
+                                f"BINANCE LOCK [{ms.horizon_min}m] {ms.short_name[:20]}... "
+                                f"| BN=${bn_now:,.0f} | +{int(lag_secs)}s (CL yok)",
+                                "WARNING"
+                            )
 
         try:
             async with session.get(
@@ -710,7 +725,11 @@ class KrajekisSniperBot:
                     "WARNING"
                 )
 
-            ref_src = "MARKET_OPEN" if ms.ref_chainlink > 0 else "ENTRY_FALLBACK"
+            if ms.ref_chainlink > 0 and ms.ref_chainlink_ts:
+                lag = (ms.ref_chainlink_ts - ms.start_time).total_seconds()
+                ref_src = "CHAINLINK_OPEN" if lag < 30 else "CHAINLINK_LATE"
+            else:
+                ref_src = "ENTRY_FALLBACK"
 
             if btc_ref > 0 and btc_now > 0:
                 btc_up = btc_now >= btc_ref
