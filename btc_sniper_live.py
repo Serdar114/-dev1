@@ -430,30 +430,38 @@ class KrajekisSniperBot:
         Kontrat: 0xc907E116054Ad103354f2D350FD2514433D57F6f
         latestRoundData() → (roundId, answer, startedAt, updatedAt, answeredInRound)
         answer = 2. slot (offset 66:130), 8 decimals.
+        Birden fazla RPC endpoint — biri cokerse digeri devreye girer.
         """
-        try:
-            payload = {
-                "jsonrpc": "2.0", "method": "eth_call",
-                "params": [{
-                    "to":   "0xc907E116054Ad103354f2D350FD2514433D57F6f",
-                    "data": "0xfeaf968c"   # latestRoundData()
-                }, "latest"],
-                "id": 1,
-            }
-            async with session.post(
-                "https://polygon-rpc.com",
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=5)
-            ) as r:
-                if r.status == 200:
-                    res     = await r.json()
-                    hex_val = res.get("result", "")
-                    # 5 × 32-byte slot; 2. slot (index 1) = answer
-                    if hex_val and len(hex_val) >= 2 + 5 * 64:
-                        answer_hex = hex_val[2 + 64: 2 + 128]
-                        return int(answer_hex, 16) / 1e8
-        except Exception:
-            pass
+        _RPC_ENDPOINTS = [
+            "https://polygon-rpc.com",
+            "https://rpc.ankr.com/polygon",
+            "https://polygon.llamarpc.com",
+            "https://1rpc.io/matic",
+        ]
+        payload = {
+            "jsonrpc": "2.0", "method": "eth_call",
+            "params": [{
+                "to":   "0xc907E116054Ad103354f2D350FD2514433D57F6f",
+                "data": "0xfeaf968c"   # latestRoundData()
+            }, "latest"],
+            "id": 1,
+        }
+        for endpoint in _RPC_ENDPOINTS:
+            try:
+                async with session.post(
+                    endpoint,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as r:
+                    if r.status == 200:
+                        res     = await r.json()
+                        hex_val = res.get("result", "")
+                        # 5 × 32-byte slot; 2. slot (index 1) = answer
+                        if hex_val and len(hex_val) >= 2 + 5 * 64:
+                            answer_hex = hex_val[2 + 64: 2 + 128]
+                            return int(answer_hex, 16) / 1e8
+            except Exception:
+                continue
         return 0.0
 
     async def _fetch_prices_and_ta(self, session: aiohttp.ClientSession) -> None:

@@ -375,30 +375,37 @@ class KrajekisSniperBot:
     # ------------------------------------------------------------------ fiyat + TA
 
     async def _fetch_chainlink_btc(self, session: aiohttp.ClientSession) -> Optional[float]:
-        try:
-            # Cache-buster: dinamik request ID (V15 fix)
-            req_id  = int(time.time() * 1000)
-            payload = {
-                "jsonrpc": "2.0",
-                "method":  "eth_call",
-                "params":  [{
-                    "to":   "0xc907E116054Ad103354f2D350FD2514433D57F6f",
-                    "data": "0xfeaf968c"
-                }, "latest"],
-                "id": req_id,
-            }
-            async with session.post(
-                "https://polygon-rpc.com",
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=5)
-            ) as r:
-                if r.status == 200:
-                    res     = await r.json()
-                    hex_val = res.get("result", "")
-                    if hex_val and len(hex_val) >= 130:
-                        return int(hex_val[66:130], 16) / 1e8
-        except Exception:
-            pass
+        # Birden fazla ücretsiz Polygon RPC endpoint — biri çökerse diğeri devreye girer
+        _RPC_ENDPOINTS = [
+            "https://polygon-rpc.com",
+            "https://rpc.ankr.com/polygon",
+            "https://polygon.llamarpc.com",
+            "https://1rpc.io/matic",
+        ]
+        req_id = int(time.time() * 1000)
+        payload = {
+            "jsonrpc": "2.0",
+            "method":  "eth_call",
+            "params":  [{
+                "to":   "0xc907E116054Ad103354f2D350FD2514433D57F6f",
+                "data": "0xfeaf968c"
+            }, "latest"],
+            "id": req_id,
+        }
+        for endpoint in _RPC_ENDPOINTS:
+            try:
+                async with session.post(
+                    endpoint,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as r:
+                    if r.status == 200:
+                        res     = await r.json()
+                        hex_val = res.get("result", "")
+                        if hex_val and len(hex_val) >= 130:
+                            return int(hex_val[66:130], 16) / 1e8
+            except Exception:
+                continue
         return None
 
     async def _fetch_prices_and_ta(self, session: aiohttp.ClientSession) -> None:
