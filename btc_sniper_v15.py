@@ -525,10 +525,7 @@ class KrajekisSniperBot:
         backoff = 1.0
         logged  = False
 
-        ssl_ctx = ssl.create_default_context()
-        ssl_ctx.check_hostname = False
-        ssl_ctx.verify_mode    = ssl.CERT_NONE
-        connector = aiohttp.TCPConnector(family=socket.AF_INET, ssl=ssl_ctx, limit=4)
+        connector = aiohttp.TCPConnector(family=socket.AF_INET, limit=4)
 
         async with aiohttp.ClientSession(connector=connector) as sess:
             while self._running:
@@ -536,7 +533,6 @@ class KrajekisSniperBot:
                     async with sess.get(
                         _URL, params=_PARAMS,
                         timeout=aiohttp.ClientTimeout(total=3),
-                        ssl=ssl_ctx,
                     ) as r:
                         if r.status == 200:
                             data  = await r.json(content_type=None)
@@ -576,10 +572,7 @@ class KrajekisSniperBot:
         _DATA     = "0xfeaf968c"
         backoff   = 1.0
 
-        ssl_ctx = ssl.create_default_context()
-        ssl_ctx.check_hostname = False
-        ssl_ctx.verify_mode    = ssl.CERT_NONE
-        connector = aiohttp.TCPConnector(family=socket.AF_INET, ssl=ssl_ctx, limit=4)
+        connector = aiohttp.TCPConnector(family=socket.AF_INET, limit=4)
 
         async with aiohttp.ClientSession(connector=connector) as sess:
             while self._running:
@@ -594,7 +587,6 @@ class KrajekisSniperBot:
                         async with sess.post(
                             rpc, json=payload,
                             timeout=aiohttp.ClientTimeout(total=4),
-                            ssl=ssl_ctx,
                         ) as r:
                             if r.status == 200:
                                 res     = await r.json(content_type=None)
