@@ -560,9 +560,10 @@ class KrajekisSniperBot:
             except Exception as e:
                 self._rtds_binance_ok = False
                 if self._running:
+                    log_level = "DEBUG" if backoff >= 60.0 else "WARNING"
                     self._log(
                         f"RTDS Binance koptu: {str(e)[:50]} — {backoff:.0f}s sonra",
-                        "WARNING",
+                        log_level,
                     )
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 60.0)
@@ -649,9 +650,10 @@ class KrajekisSniperBot:
                 self._rtds_chainlink_ok = False
                 if self._running:
                     ep_label = endpoint.split("//")[-1].split("/")[0][:15]
+                    log_level = "DEBUG" if backoff >= 60.0 else "WARNING"
                     self._log(
                         f"RTDS CL koptu ({ep_label}): {str(e)[:40]} — {backoff:.0f}s",
-                        "WARNING",
+                        log_level,
                     )
                     await asyncio.sleep(backoff)
                     backoff  = min(backoff * 2, 60.0)
