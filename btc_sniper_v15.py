@@ -520,7 +520,7 @@ class KrajekisSniperBot:
 
     async def _rtds_binance_ws(self) -> None:
         """Background task — Binance aggTrade WebSocket, auto-reconnect."""
-        _URL    = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade"
+        _URL    = "wss://stream.binance.com:443/ws/btcusdt@aggTrade"
         backoff = 1.0
 
         while self._running:
