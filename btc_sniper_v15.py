@@ -525,16 +525,13 @@ class KrajekisSniperBot:
 
         while self._running:
             try:
-                ssl_ctx = ssl.create_default_context()
-                ssl_ctx.check_hostname = False
-                ssl_ctx.verify_mode = ssl.CERT_NONE
-                connector = aiohttp.TCPConnector(family=socket.AF_INET, ssl=ssl_ctx)
+                connector = aiohttp.TCPConnector(family=socket.AF_INET, ssl=False)
                 async with aiohttp.ClientSession(connector=connector) as ws_sess:
                     async with ws_sess.ws_connect(
                         _URL,
                         heartbeat=30,
                         timeout=aiohttp.ClientTimeout(total=None, connect=10),
-                        ssl=ssl_ctx,
+                        ssl=False,
                     ) as ws:
                         self._rtds_binance_ok = True
                         self._log("RTDS Binance WS baglandi (aggTrade)", "INFO")
@@ -602,12 +599,13 @@ class KrajekisSniperBot:
         while self._running:
             endpoint = _WSS_ENDPOINTS[ep_idx % len(_WSS_ENDPOINTS)]
             try:
-                connector = aiohttp.TCPConnector(family=socket.AF_INET)
+                connector = aiohttp.TCPConnector(family=socket.AF_INET, ssl=False)
                 async with aiohttp.ClientSession(connector=connector) as ws_sess:
                     async with ws_sess.ws_connect(
                         endpoint,
                         heartbeat=20,
                         timeout=aiohttp.ClientTimeout(total=None, connect=10),
+                        ssl=False,
                     ) as ws:
                         await ws.send_str(_SUB_MSG)
                         self._rtds_chainlink_ok = True
