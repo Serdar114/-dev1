@@ -68,6 +68,7 @@ Polymarket Krajekis Auto-Sniper V15.8 (EXECUTION ARMOR EDITION)
 import sys
 import asyncio
 import socket
+import ssl
 import aiohttp
 import json
 import math
@@ -519,17 +520,21 @@ class KrajekisSniperBot:
 
     async def _rtds_binance_ws(self) -> None:
         """Background task — Binance aggTrade WebSocket, auto-reconnect."""
-        _URL    = "wss://stream.binance.com:443/ws/btcusdt@aggTrade"
+        _URL    = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade"
         backoff = 1.0
 
         while self._running:
             try:
-                connector = aiohttp.TCPConnector(family=socket.AF_INET)
+                ssl_ctx = ssl.create_default_context()
+                ssl_ctx.check_hostname = False
+                ssl_ctx.verify_mode = ssl.CERT_NONE
+                connector = aiohttp.TCPConnector(family=socket.AF_INET, ssl=ssl_ctx)
                 async with aiohttp.ClientSession(connector=connector) as ws_sess:
                     async with ws_sess.ws_connect(
                         _URL,
                         heartbeat=30,
                         timeout=aiohttp.ClientTimeout(total=None, connect=10),
+                        ssl=ssl_ctx,
                     ) as ws:
                         self._rtds_binance_ok = True
                         self._log("RTDS Binance WS baglandi (aggTrade)", "INFO")
