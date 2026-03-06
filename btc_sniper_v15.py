@@ -1,49 +1,44 @@
 #!/usr/bin/env python3
 """
-Polymarket Krajekis Auto-Sniper V15.6 (R/R + SYNC EDITION)
-===========================================================
-  V15.6 değişiklikleri (Adım 2/3/4):
+Polymarket Krajekis Auto-Sniper V15.7 (CONVERGENCE EDITION)
+============================================================
+  V15.7 değişiklikleri (Araştırma Entegrasyonu):
 
-  ADIM 2 — Fee Kalibrasyonu:
-  + _calc_fee_usd(): Her trade için gerçek fee maliyetini USD olarak hesaplar.
-  + _validate_entry_edge(): Giriş öncesi minimum net kâr kontrolü (fee dahil).
-    min_edge_usd config param'ı ile kontrol edilir (default $0.25).
-  + _record(): fee_usd, net_profit_if_tp alanları JSONL kaydına eklendi.
+  CONVERGENCE MODEL — Ana Sinyal (Araştırma #1):
+  + _norm_cdf(): scipy gerektirmez, Φ(z) yaklaşımı (Abramowitz & Stegun).
+  + _calc_ev_settle(): Binary payout EV = P_win × net_shares - raw × entry.
+  + _fair_prob_up(): Dijital opsiyon modeli — P_up = Φ( Δ / (σ × √τ) )
+      Δ = (btc_now - ref_chainlink) / ref_chainlink  (strike'a mesafe)
+      σ = realized_vol (5m veya 15m ufka göre)
+      τ = secs_left / horizon_secs (0→1 normalize kalan süre)
+  + _in_yes_window() / _in_no_window(): Zaman penceresi yardımcıları.
+  + _pick_best_side(): YES ve NO EV hesapla → en yüksek EV'li taraf.
+  + Brain1/Brain2 unifikasyonu: _analyze() artık convergence bazlı.
+    conv_ev_threshold_usd (default $0.08): minimum EV eşiği.
+    conv_use_ta_filter (default false): YES için TA onayı isteğe bağlı.
+    conv_require_drop_filter (default false): NO için drop filtresi isteğe bağlı.
 
-  ADIM 3 — Risk/Ödül Düzeltmesi (kritik):
-  + _check_exit(): NO tradelerine SL eklendi — hard_sl_no_pct (default 0.30).
-    Önceki sürümde NO tradeleri ASLA erken kapanmıyordu → SETTL_LOSS = full stake.
-    Artık NO trade %30 aleyhte hareket ederse kesilir (max kayıp ~$1.5 vs -$4.95).
-  + "Let YES Settle" modu: let_yes_settle_secs (default 45s) — YES trade kârlıyken
-    ve settlement'a yakınsa TP almaz, 1.0'da settle olmasını bekler.
-    TP=$1.0 yerine SETTL_WIN=$3.5+ hedeflenir.
-  + R/R kalite kontrolü: min_rr_ratio (default 0.35) — beklenen kâr/max kayıp oranı
-    bu eşiğin altındaysa trade reddedilir.
+  ORDER FLOW IMBALANCE — Araştırma #2:
+  + _fetch_book(): Top-5 derinlik toplanıyor, OFI hesaplanıyor.
+    OFI = (bid_depth - ask_depth) / total ∈ [-1, +1]
+  + MarketState.ofi / tick_size: her döngüde güncelleniyor.
+  + LiveTrade.ofi_entry: giriş anındaki OFI loglanıyor.
 
-  ADIM 4 — Senkronizasyon Testi (ts_src_ms kullanımı):
-  + _validate_price_sync(): Giriş öncesi çalışır. Şunları kontrol eder:
-    1. Chainlink fiyatı Binance'den max_cl_deviation_pct (%6) fazla sapıyorsa
-       reddet (87492 anomalisi gibi hatalı Chainlink verisini engeller).
-    2. Chainlink ts_src_ms max_cl_staleness_ms (30s) eskiyse reddet.
-    3. BN-CL timestamp farkı > 60s ise uyar (senkronizasyon sorunu).
-  + _record(): ts_latency_ms (BN-CL kaynak zaman damgası farkı), sync_ok, cl_deviation_pct
-    alanları JSONL kaydına eklendi — Step 4 analizi için.
+  REALIZED VOLATILITY — Convergence modeli için:
+  + realized_vol_5m  = std(son 20 1m return) × √5
+  + realized_vol_15m = std(son 20 1m return) × √15
+  + ta_data["BTC"]'ye eklendi, _render()'da gösteriliyor.
 
-  V15.5 değişiklikleri (Adım 1 — RTDS WebSocket):
-  + _rtds_binance_ws() / _rtds_chainlink_ws(): background task, auto-reconnect.
-  + prices_ts dict: ts_src_ms kaynak zaman damgaları.
-  + _fetch_prices_and_ta(): RTDS taze ise HTTP fiyatını ezmez.
-
-  V15.4 değişiklikleri:
-  + BRAIN 1 (YES): Skor tabanli sinyal — 4 TA kosulundan en az 3'u zorunlu
-  + BRAIN 2 (NO):  Oncelik kazandi, NO esikleri dusuruldu
-  + max_open_positions: 3 | min_signal_score: 3
+  V15.6: NO SL + Let YES Settle + R/R filtresi + SYNC filtresi.
+  V15.5: RTDS WebSocket (Binance aggTrade + Chainlink Polygon).
+  V15.4: Brain1 TA skor + Brain2 NO-late + max_open_positions.
 """
 import sys
 import asyncio
 import socket
 import aiohttp
 import json
+import math
 import time
 import os
 import pandas as pd
@@ -99,7 +94,7 @@ def _safe_price(p: float) -> float:
 
 
 def _safe_amounts(price: float, stake: float) -> Tuple[float, float]:
-    price_r = round(max(0.01, min(0.99, float(price))), 2)
+    price_r    = round(max(0.01, min(0.99, float(price))), 2)
     shares_int = float(int(round(stake / price_r, 4)))
     return price_r, shares_int
 
@@ -111,22 +106,40 @@ def _calculate_fee_shares(price: float, raw_shares: float) -> float:
 
 
 def _calc_fee_usd(price: float, raw_shares: float) -> float:
-    """
-    ADIM 2 — Fee USD maliyeti.
-    Fee share'ler settlement'ta 1.0 değerinde ödendiği için fee_usd = fee_shares * 1.0.
-    """
+    """Fee USD maliyeti (settlement'ta 1.0 olduğu için fee_shares × 1.0)."""
     return _calculate_fee_shares(price, raw_shares)
 
 
 def _calc_net_profit_if_tp(entry: float, raw_shares: float, tp_pct: float) -> float:
-    """
-    ADIM 2 — TP'ye ulaşıldığında fee sonrası net kâr.
-    exit_price = entry * (1 + tp_pct)
-    pnl = net_shares * exit_price - raw_shares * entry
-    """
+    """TP'ye ulaşıldığında fee sonrası net kâr."""
     net_shares = raw_shares - _calculate_fee_shares(entry, raw_shares)
     exit_price = min(0.99, entry * (1.0 + tp_pct))
     return net_shares * exit_price - raw_shares * entry
+
+
+def _norm_cdf(z: float) -> float:
+    """
+    Standart normal CDF yaklaşımı — scipy gerektirmez.
+    Abramowitz & Stegun 7.1.26, maks hata < 7.5e-8.
+    """
+    t    = 1.0 / (1.0 + 0.2316419 * abs(z))
+    poly = t * (0.319381530
+                + t * (-0.356563782
+                       + t * (1.781477937
+                              + t * (-1.821255978
+                                     + t * 1.330274429))))
+    cdf  = 1.0 - (1.0 / math.sqrt(2 * math.pi)) * math.exp(-0.5 * z * z) * poly
+    return cdf if z >= 0 else 1.0 - cdf
+
+
+def _calc_ev_settle(entry: float, raw_shares: float, p_win: float) -> float:
+    """
+    Settlement-bazlı beklenen değer (binary payout 0 veya 1).
+    EV = P_win × net_shares - raw_shares × entry
+    Pozitif → beklenen kâr var.
+    """
+    net_shares = raw_shares - _calculate_fee_shares(entry, raw_shares)
+    return p_win * net_shares - raw_shares * entry
 
 
 @dataclass
@@ -141,7 +154,10 @@ class LiveTrade:
     entry_asset_px:   float
     order_id:         str      = ""
     entry_time:       datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    entry_ts_src_ms:  int      = 0   # Chainlink kaynak zaman damgası entry anında (ms)
+    entry_ts_src_ms:  int      = 0      # Chainlink kaynak zaman damgası (ms)
+    p_fair:           float    = 0.5    # V15.7: convergence fair probability
+    ev_usd:           float    = 0.0    # V15.7: expected value (USD) giriş anında
+    ofi_entry:        float    = 0.0    # V15.7: order flow imbalance giriş anında
 
 
 class MarketState:
@@ -163,8 +179,12 @@ class MarketState:
         self.sl_strikes:   int   = 0
         self.last_buy_attempt: float = 0.0
 
-        self.ref_chainlink:    float = 0.0
+        self.ref_chainlink:    float            = 0.0
         self.ref_chainlink_ts: Optional[datetime] = None
+
+        # V15.7: Orderbook derinlik / OFI
+        self.ofi:       float = 0.0    # order flow imbalance [-1, +1]
+        self.tick_size: float = 0.01   # güncel tick size
 
     @property
     def secs_left(self) -> float:
@@ -316,7 +336,6 @@ class KrajekisSniperBot:
             "BTC_BINANCE":   0.0,
             "BTC_CHAINLINK": 0.0,
         }
-        # RTDS: kaynak zaman damgaları (ms cinsinden Unix timestamp)
         self.prices_ts: Dict[str, int] = {
             "BTC_BINANCE_ts_src_ms":   0,
             "BTC_CHAINLINK_ts_src_ms": 0,
@@ -337,7 +356,6 @@ class KrajekisSniperBot:
         )
         self._running: bool = True
 
-        # RTDS durum bayrakları (UI için)
         self._rtds_binance_ok:   bool = False
         self._rtds_chainlink_ok: bool = False
         self._rtds_tasks:        List[asyncio.Task] = []
@@ -370,16 +388,15 @@ class KrajekisSniperBot:
 
     @property
     def _daily_limit_hit(self) -> bool:
-        return self.daily_pnl <= -abs(self.risk.get("max_daily_loss_usd", 3.0))
+        return self.daily_pnl <= -abs(self.risk.get("max_daily_loss_usd", 30.0))
 
     @property
     def _open_positions(self) -> int:
         return sum(1 for m in self.markets.values() if m.active_trade)
 
-    # ------------------------------------------------------------------ RTDS: yardımcı
+    # ------------------------------------------------------------------ RTDS yardımcı
 
     def _rtds_fresh(self, key_ts: str, max_age_s: float = 30.0) -> bool:
-        """RTDS fiyatının taze olup olmadığını kontrol eder (< max_age_s saniye)."""
         ts_ms = self.prices_ts.get(key_ts, 0)
         if ts_ms == 0:
             return False
@@ -388,14 +405,8 @@ class KrajekisSniperBot:
     # ------------------------------------------------------------------ RTDS: Binance WS
 
     async def _rtds_binance_ws(self) -> None:
-        """
-        Background task — Binance aggTrade WebSocket.
-        main_run'u BLOKLAMAZ. Kopma anında exponential backoff ile yeniden bağlanır.
-        Her trade mesajında:
-          self.prices["BTC_BINANCE"]             <- güncel fiyat
-          self.prices_ts["BTC_BINANCE_ts_src_ms"] <- Binance trade timestamp (ms)
-        """
-        _URL = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade"
+        """Background task — Binance aggTrade WebSocket, auto-reconnect."""
+        _URL    = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade"
         backoff = 1.0
 
         while self._running:
@@ -409,19 +420,18 @@ class KrajekisSniperBot:
                     ) as ws:
                         self._rtds_binance_ok = True
                         self._log("RTDS Binance WS baglandi (aggTrade)", "INFO")
-                        backoff = 1.0  # basarili baglantida sifirla
+                        backoff = 1.0
 
                         async for msg in ws:
                             if not self._running:
                                 break
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 try:
-                                    data     = json.loads(msg.data)
-                                    price    = float(data.get("p", 0))
-                                    # "T": trade time in milliseconds (Binance kaynak damgasi)
-                                    ts_src   = int(data.get("T", time.time() * 1000))
+                                    data   = json.loads(msg.data)
+                                    price  = float(data.get("p", 0))
+                                    ts_src = int(data.get("T", time.time() * 1000))
                                     if price > 0:
-                                        self.prices["BTC_BINANCE"]             = price
+                                        self.prices["BTC_BINANCE"]              = price
                                         self.prices_ts["BTC_BINANCE_ts_src_ms"] = ts_src
                                 except Exception:
                                     pass
@@ -433,12 +443,12 @@ class KrajekisSniperBot:
                                 break
 
             except asyncio.CancelledError:
-                raise  # task iptal edildi, propagate et
+                raise
             except Exception as e:
                 self._rtds_binance_ok = False
                 if self._running:
                     self._log(
-                        f"RTDS Binance WS koptu: {str(e)[:50]} — {backoff:.0f}s sonra yeniden",
+                        f"RTDS Binance koptu: {str(e)[:50]} — {backoff:.0f}s sonra",
                         "WARNING",
                     )
                     await asyncio.sleep(backoff)
@@ -449,19 +459,10 @@ class KrajekisSniperBot:
     # ------------------------------------------------------------------ RTDS: Chainlink WS
 
     async def _rtds_chainlink_ws(self) -> None:
-        """
-        Background task — Polygon eth_subscribe/logs (AnswerUpdated event).
-        Chainlink BTC/USD Polygon feed kontratını dinler, her on-chain güncelleme anında:
-          self.prices["BTC_CHAINLINK"]              <- güncel fiyat (8 decimals)
-          self.prices_ts["BTC_CHAINLINK_ts_src_ms"] <- on-chain updatedAt * 1000 (ms)
-        Kopma anında multi-endpoint fallback + exponential backoff ile yeniden bağlanır.
-        """
-        # Chainlink BTC/USD feed — Polygon mainnet
-        _CL_CONTRACT = "0xc907E116054Ad103354f2D350FD2514433D57F6f"
-        # keccak256("AnswerUpdated(int256,uint256,uint256)")
+        """Background task — Polygon eth_subscribe/logs AnswerUpdated, auto-reconnect."""
+        _CL_CONTRACT    = "0xc907E116054Ad103354f2D350FD2514433D57F6f"
         _ANSWER_UPDATED = "0x0559884fd3a460db3073b7fc896cc77986f16e378210ded43186175bf646fc5f"
-        # WSS RPC endpointleri — biri düşerse diğerine geçer
-        _WSS_ENDPOINTS = [
+        _WSS_ENDPOINTS  = [
             "wss://polygon-bor-rpc.publicnode.com",
             "wss://rpc.ankr.com/polygon/ws",
             "wss://polygon.llamarpc.com",
@@ -476,8 +477,8 @@ class KrajekisSniperBot:
             }],
         })
 
-        backoff  = 1.0
-        ep_idx   = 0
+        backoff = 1.0
+        ep_idx  = 0
 
         while self._running:
             endpoint = _WSS_ENDPOINTS[ep_idx % len(_WSS_ENDPOINTS)]
@@ -493,7 +494,7 @@ class KrajekisSniperBot:
                         self._rtds_chainlink_ok = True
                         ep_label = endpoint.split("//")[-1].split("/")[0][:20]
                         self._log(f"RTDS Chainlink WS baglandi ({ep_label})", "INFO")
-                        backoff = 1.0  # basarili baglantida sifirla
+                        backoff = 1.0
 
                         async for msg in ws:
                             if not self._running:
@@ -501,31 +502,24 @@ class KrajekisSniperBot:
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 try:
                                     data = json.loads(msg.data)
-                                    # Abonelik onay mesajı — atla
                                     if "result" in data and isinstance(data["result"], str):
                                         continue
-                                    # Log event bildirimi
                                     if "params" in data:
-                                        log = data["params"]["result"]
+                                        log    = data["params"]["result"]
                                         topics = log.get("topics", [])
                                         if len(topics) >= 2:
-                                            # topics[1] = int256 indexed current (fiyat)
                                             raw = int(topics[1], 16)
                                             if raw >= (1 << 255):
-                                                raw -= (1 << 256)  # signed int256
+                                                raw -= (1 << 256)
                                             price = raw / 1e8
-
-                                            # data alanı: updatedAt (uint256, Unix saniye)
                                             raw_data = log.get("data", "")
                                             if raw_data and len(raw_data) >= 66:
                                                 updated_at = int(raw_data[2:66], 16)
                                                 ts_src_ms  = updated_at * 1000
                                             else:
                                                 ts_src_ms = int(time.time() * 1000)
-
-                                            # Basit sanity check (BTC $10k-$1M arası)
                                             if 10_000 < price < 1_000_000:
-                                                self.prices["BTC_CHAINLINK"]             = price
+                                                self.prices["BTC_CHAINLINK"]              = price
                                                 self.prices_ts["BTC_CHAINLINK_ts_src_ms"] = ts_src_ms
                                 except Exception:
                                     pass
@@ -537,18 +531,18 @@ class KrajekisSniperBot:
                                 break
 
             except asyncio.CancelledError:
-                raise  # task iptal edildi, propagate et
+                raise
             except Exception as e:
                 self._rtds_chainlink_ok = False
                 if self._running:
                     ep_label = endpoint.split("//")[-1].split("/")[0][:15]
                     self._log(
-                        f"RTDS CL WS koptu ({ep_label}): {str(e)[:40]} — {backoff:.0f}s",
+                        f"RTDS CL koptu ({ep_label}): {str(e)[:40]} — {backoff:.0f}s",
                         "WARNING",
                     )
                     await asyncio.sleep(backoff)
                     backoff  = min(backoff * 2, 60.0)
-                    ep_idx  += 1  # bir sonraki endpoint'i dene
+                    ep_idx  += 1
 
         self._rtds_chainlink_ok = False
 
@@ -601,7 +595,7 @@ class KrajekisSniperBot:
             question    = m.get("question") or ev.get("title") or "BTC Up/Down"
             slug        = m.get("slug", "") + question
             horizon_min = 15 if "15m" in slug.lower() or "15 min" in slug.lower() else 5
-            ms_new = MarketState(mid, question, end_t, yes_id, no_id, horizon_min)
+            ms_new      = MarketState(mid, question, end_t, yes_id, no_id, horizon_min)
             self.markets[mid] = ms_new
             self._log(
                 f"Radar [{horizon_min}m]: {question[:40]} "
@@ -621,21 +615,17 @@ class KrajekisSniperBot:
             "https://polygon.llamarpc.com",
             "https://1rpc.io/matic",
         ]
-        req_id  = int(time.time() * 1000)
         payload = {
             "jsonrpc": "2.0",
             "method":  "eth_call",
-            "params":  [{
-                "to":   "0xc907E116054Ad103354f2D350FD2514433D57F6f",
-                "data": "0xfeaf968c",
-            }, "latest"],
-            "id": req_id,
+            "params":  [{"to": "0xc907E116054Ad103354f2D350FD2514433D57F6f",
+                         "data": "0xfeaf968c"}, "latest"],
+            "id": int(time.time() * 1000),
         }
         for endpoint in _RPC_ENDPOINTS:
             try:
                 async with session.post(
-                    endpoint,
-                    json=payload,
+                    endpoint, json=payload,
                     timeout=aiohttp.ClientTimeout(total=5)
                 ) as r:
                     if r.status == 200:
@@ -656,12 +646,11 @@ class KrajekisSniperBot:
         if not rtds_cl_fresh:
             cl_price = await self._fetch_chainlink_btc(session)
             if cl_price:
-                self.prices["BTC_CHAINLINK"]             = cl_price
+                self.prices["BTC_CHAINLINK"]              = cl_price
                 self.prices_ts["BTC_CHAINLINK_ts_src_ms"] = int(now_ms)
-        # cl_price her zaman güncel değerden alınır
         cl_price = self.prices.get("BTC_CHAINLINK", 0.0) or None
 
-        # Pazar referans fiyat kilitleme (kaynak fark etmez, her döngüde çalışır)
+        # Pazar referans fiyat kilitleme
         if cl_price:
             for ms in list(self.markets.values()):
                 if ms.ref_chainlink == 0.0 and ms.secs_left > 0:
@@ -676,7 +665,6 @@ class KrajekisSniperBot:
                             "INFO",
                         )
         else:
-            # Chainlink yoksa Binance ile yedek kilitle
             bn_now = self.prices.get("BTC_BINANCE", 0.0)
             if bn_now > 0:
                 for ms in list(self.markets.values()):
@@ -691,8 +679,7 @@ class KrajekisSniperBot:
                                 "WARNING",
                             )
 
-        # --- BINANCE KLINES: TA için her zaman çek ---
-        # RTDS < 5s taze ise kline kapanış fiyatı self.prices["BTC_BINANCE"]'ı ezmez
+        # --- BINANCE KLINES: TA + Realized Volatility ---
         rtds_bn_fresh = self._rtds_fresh("BTC_BINANCE_ts_src_ms", max_age_s=5.0)
         try:
             async with session.get(
@@ -709,14 +696,12 @@ class KrajekisSniperBot:
                     for col in ("open", "close", "high", "low", "vol"):
                         df[col] = df[col].astype(float)
 
-                    # RTDS taze değilse kline kapanışından güncelle
                     if not rtds_bn_fresh:
                         self.prices["BTC_BINANCE"] = df["close"].iloc[-1]
-
                     if not cl_price:
                         self.prices["BTC_CHAINLINK"] = self.prices["BTC_BINANCE"]
 
-                    # TA hesaplamaları
+                    # TA indikatörleri
                     df["EMA_21"] = df["close"].ewm(span=21, adjust=False).mean()
                     df["EMA_50"] = df["close"].ewm(span=50, adjust=False).mean()
 
@@ -733,18 +718,28 @@ class KrajekisSniperBot:
                     ml    = ema12 - ema26
                     df["MACD_Hist"] = ml - ml.ewm(span=9, adjust=False).mean()
 
-                    last = df.iloc[-1]
+                    last          = df.iloc[-1]
                     last3_bullish = all(
                         df["close"].iloc[i] > df["open"].iloc[i]
                         for i in [-3, -2, -1]
                     )
+
+                    # V15.7: Realized Volatility — son 20 1m bar'dan
+                    returns  = df["close"].pct_change().dropna()
+                    tail20   = returns.tail(20)
+                    sigma_1m = float(tail20.std()) if len(tail20) > 1 else 0.001
+                    vol_5m   = max(sigma_1m * math.sqrt(5),  0.0005)
+                    vol_15m  = max(sigma_1m * math.sqrt(15), 0.0009)
+
                     self.ta_data["BTC"] = {
-                        "vwap":          float(last["VWAP"]),
-                        "rsi":           float(last["RSI_14"]),
-                        "ema21":         float(last["EMA_21"]),
-                        "ema50":         float(last["EMA_50"]),
-                        "macd":          float(last["MACD_Hist"]),
-                        "last3_bullish": last3_bullish,
+                        "vwap":             float(last["VWAP"]),
+                        "rsi":              float(last["RSI_14"]),
+                        "ema21":            float(last["EMA_21"]),
+                        "ema50":            float(last["EMA_50"]),
+                        "macd":             float(last["MACD_Hist"]),
+                        "last3_bullish":    last3_bullish,
+                        "realized_vol_5m":  vol_5m,   # V15.7
+                        "realized_vol_15m": vol_15m,  # V15.7
                     }
         except Exception:
             pass
@@ -758,6 +753,7 @@ class KrajekisSniperBot:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _fetch_book(self, session: aiohttp.ClientSession, ms: MarketState) -> None:
+        """Orderbook çek + OFI hesapla (V15.7: top-5 derinlik)."""
         try:
             async with session.get(
                 f"{self.net['clob_url']}/book",
@@ -771,25 +767,31 @@ class KrajekisSniperBot:
                     asks = sorted(d.get("asks", []),
                                   key=lambda x: float(x.get("price", 0)))
                     if bids and asks:
-                        ms.best_bid = float(bids[0]["price"])
-                        ms.best_ask = float(asks[0]["price"])
+                        ms.best_bid  = float(bids[0]["price"])
+                        ms.best_ask  = float(asks[0]["price"])
+                        ms.tick_size = float(d.get("tick_size", 0.01))
+
+                        # V15.7: OFI — top-5 derinlik imbalance
+                        bid_depth = sum(float(b.get("size", 0)) for b in bids[:5])
+                        ask_depth = sum(float(a.get("size", 0)) for a in asks[:5])
+                        total     = bid_depth + ask_depth
+                        ms.ofi    = (bid_depth - ask_depth) / total if total > 0 else 0.0
         except Exception:
             pass
 
-    # ------------------------------------------------------------------ sinyal
+    # ------------------------------------------------------------------ TA sinyal (ikincil)
 
     def _signal(self, ms: MarketState) -> str:
+        """
+        Brain1 TA sinyali — V15.7'de sadece conv_use_ta_filter=True ise çağrılır.
+        Convergence modeli ana sinyal; bu metod isteğe bağlı TA onay filtresi.
+        """
         if ms.secs_left <= 0:
             return "BEKLE"
 
         is_15m = ms.horizon_min == 15
-        if is_15m:
-            st = float(self.strat.get("sweet_spot_15m_start", 10.0))
-            en = float(self.strat.get("sweet_spot_15m_end",   5.0))
-        else:
-            st = float(self.strat.get("sweet_spot_5m_start", 3.0))
-            en = float(self.strat.get("sweet_spot_5m_end",   1.0))
-
+        st = float(self.strat.get("sweet_spot_15m_start" if is_15m else "sweet_spot_5m_start", 10.0))
+        en = float(self.strat.get("sweet_spot_15m_end"   if is_15m else "sweet_spot_5m_end",   1.0))
         if not (en <= ms.mins_left <= st):
             return "ZAMAN DISI"
 
@@ -798,166 +800,215 @@ class KrajekisSniperBot:
             return "TA BEKLENIYOR"
 
         px    = self.prices["BTC_BINANCE"]
-        vwap  = ta["vwap"]
-        rsi   = ta["rsi"]
-        ema21 = ta["ema21"]
-        ema50 = ta["ema50"]
-        macd  = ta["macd"]
-
         max_spread = float(self.strat.get("max_spread", 0.04))
         if ms.best_ask - ms.best_bid > max_spread:
             return "GENIS MAKAS"
 
         score = 0
-        if px > vwap:  score += 1
-        if ema21 > ema50:  score += 1
-        if rsi < float(self.strat.get("rsi_overbought", 70)):  score += 1
-        if macd > 0:  score += 1
+        if px > ta["vwap"]:                                           score += 1
+        if ta["ema21"] > ta["ema50"]:                                 score += 1
+        if ta["rsi"] < float(self.strat.get("rsi_overbought", 70)):   score += 1
+        if ta["macd"] > 0:                                            score += 1
 
-        min_score     = int(self.strat.get("min_signal_score", 3))
-        last3_bullish = ta.get("last3_bullish", False)
-
-        if score >= min_score and last3_bullish:
+        min_score = int(self.strat.get("min_signal_score", 2))
+        if score >= min_score and ta.get("last3_bullish", False):
             return f"UP (LONG) {score}/4"
-
         return "YAPI BOZUK"
 
-    # ------------------------------------------------------------------ Brain 2: NO
-
     def _signal_no_late(self, ms: MarketState) -> bool:
+        """
+        Brain2 drop filtresi — V15.7'de sadece conv_require_drop_filter=True ise çağrılır.
+        """
         secs      = ms.secs_left
-        win_start = float(self.strat.get("no_window_secs_start", 150.0))
-        win_end   = float(self.strat.get("no_window_secs_end",   30.0))
+        win_start = float(self.strat.get("no_window_secs_start", 200.0))
+        win_end   = float(self.strat.get("no_window_secs_end",    20.0))
         if not (win_end <= secs <= win_start):
             return False
-
         ref = ms.ref_chainlink
         if ref <= 0:
             return False
-
-        btc_now = self.prices["BTC_BINANCE"]
-        if ms.horizon_min == 5:
-            drop_needed = float(self.strat.get("no_min_btc_drop_5m", 80.0))
-        else:
-            drop_needed = float(self.strat.get("no_min_btc_drop_15m", 150.0))
-
+        btc_now     = self.prices["BTC_BINANCE"]
+        drop_needed = float(self.strat.get(
+            "no_min_btc_drop_5m" if ms.horizon_min == 5 else "no_min_btc_drop_15m", 60.0
+        ))
         if btc_now >= ref - drop_needed:
             return False
-
-        max_spread = float(self.strat.get("max_spread", 0.04))
-        if ms.best_ask - ms.best_bid > max_spread:
+        if ms.best_ask - ms.best_bid > float(self.strat.get("max_spread", 0.04)):
             return False
-
         return True
 
-    # ------------------------------------------------------------------ ADIM 2: fee / edge
+    # ------------------------------------------------------------------ V15.7: zaman penceresi
+
+    def _in_yes_window(self, ms: MarketState) -> bool:
+        is_15m = ms.horizon_min == 15
+        st = float(self.strat.get("sweet_spot_15m_start" if is_15m else "sweet_spot_5m_start", 10.0))
+        en = float(self.strat.get("sweet_spot_15m_end"   if is_15m else "sweet_spot_5m_end",   1.0))
+        return en <= ms.mins_left <= st
+
+    def _in_no_window(self, ms: MarketState) -> bool:
+        secs  = ms.secs_left
+        start = float(self.strat.get("no_window_secs_start", 200.0))
+        end   = float(self.strat.get("no_window_secs_end",    20.0))
+        return end <= secs <= start
+
+    # ------------------------------------------------------------------ V15.7: convergence
+
+    def _fair_prob_up(self, ms: MarketState) -> float:
+        """
+        Dijital opsiyon yaklaşımıyla UP settle olasılığı.
+        P_up = Φ( Δ / (σ × √τ) )
+          Δ = (btc_now - ref_chainlink) / ref_chainlink
+          σ = realized_vol (5m veya 15m ufka göre)
+          τ = secs_left / horizon_secs (0→1)
+        """
+        btc_now = self.prices["BTC_BINANCE"]
+        strike  = ms.ref_chainlink
+        if strike <= 0 or btc_now <= 0:
+            return 0.5
+
+        horizon_secs = ms.horizon_min * 60
+        tau          = max(1.0, ms.secs_left) / horizon_secs
+
+        vol_key = "realized_vol_5m" if ms.horizon_min == 5 else "realized_vol_15m"
+        sigma   = self.ta_data.get("BTC", {}).get(vol_key)
+        if not sigma or sigma <= 1e-6:
+            sigma_5m = self.ta_data.get("BTC", {}).get("realized_vol_5m", 0.003)
+            sigma    = sigma_5m * math.sqrt(ms.horizon_min / 5.0)
+
+        delta = (btc_now - strike) / strike
+        denom = sigma * math.sqrt(max(tau, 0.01))
+        if denom < 1e-9:
+            return 1.0 if delta >= 0 else 0.0
+        return _norm_cdf(delta / denom)
+
+    def _pick_best_side(
+        self, ms: MarketState
+    ) -> Tuple[str, str, float, float, float]:
+        """
+        YES ve NO için convergence EV hesapla, en yüksek EV'li tarafı döndür.
+        Returns: (signal_str, side, entry, p_win, ev_usd)
+        """
+        max_spread = float(self.strat.get("max_spread", 0.04))
+        if ms.best_ask - ms.best_bid > max_spread:
+            return "GENIS MAKAS", "", 0.0, 0.5, -999.0
+
+        p_up  = self._fair_prob_up(ms)
+        p_dn  = 1.0 - p_up
+        stake = float(self.risk["stake_usd"])
+        min_e = float(self.strat.get("min_entry_price", 0.55))
+        best  = ("CONV LOW", "", 0.0, 0.5, -999.0)
+
+        # YES — sweet-spot zaman penceresindeyse
+        if self._in_yes_window(ms) and ms.yes_id:
+            entry = ms.best_ask
+            max_e = float(self.strat.get("max_entry_yes", 0.87))
+            if min_e <= entry <= max_e:
+                _, raw = _safe_amounts(entry, stake)
+                if raw > 0:
+                    ev = _calc_ev_settle(entry, raw, p_up)
+                    if ev > best[4]:
+                        best = (f"CONV YES P={p_up:.2f} EV=${ev:.3f}",
+                                "YES", entry, p_up, ev)
+
+        # NO — son-dakika zaman penceresindeyse
+        if self._in_no_window(ms) and ms.no_id:
+            entry = 1.0 - ms.best_bid
+            max_e = float(self.strat.get("max_entry_no", 0.83))
+            if min_e <= entry <= max_e:
+                _, raw = _safe_amounts(entry, stake)
+                if raw > 0:
+                    ev = _calc_ev_settle(entry, raw, p_dn)
+                    if ev > best[4]:
+                        best = (f"CONV NO  P={p_dn:.2f} EV=${ev:.3f}",
+                                "NO", entry, p_dn, ev)
+
+        return best
+
+    # ------------------------------------------------------------------ V15.6: yardımcılar
 
     def _validate_entry_edge(self, entry: float, raw_shares: float, side: str) -> bool:
-        """
-        ADIM 2 — Fee sonrası minimum net kâr kontrolü.
-        TP hedefine ulaşıldığında fee dahil kâr < min_edge_usd ise reddeder.
-        """
-        min_edge  = float(self.strat.get("min_edge_usd", 0.25))
-        tp_yes    = float(self.strat.get("tp_pct_gain", 0.20))
-        tp_no     = float(self.strat.get("tp_pct_gain_no", tp_yes))
-        tp        = tp_no if side == "NO" else tp_yes
-        net_pnl   = _calc_net_profit_if_tp(entry, raw_shares, tp)
+        """TP'deki minimum net kâr kontrolü (EV tamamlayıcısı)."""
+        min_edge = float(self.strat.get("min_edge_usd", 0.08))
+        tp_yes   = float(self.strat.get("tp_pct_gain", 0.20))
+        tp_no    = float(self.strat.get("tp_pct_gain_no", tp_yes))
+        tp       = tp_no if side == "NO" else tp_yes
+        net_pnl  = _calc_net_profit_if_tp(entry, raw_shares, tp)
         if net_pnl < min_edge:
             self._log(
-                f"EDGE RED: entry={entry:.3f} tp_pnl=${net_pnl:.3f} < min ${min_edge:.2f}",
+                f"EDGE RED: entry={entry:.3f} tp_pnl=${net_pnl:.3f} < ${min_edge:.2f}",
                 "WARNING",
             )
             return False
         return True
 
-    # ------------------------------------------------------------------ ADIM 4: sync
-
     def _validate_price_sync(self) -> Tuple[bool, str]:
-        """
-        ADIM 4 — Giriş öncesi fiyat senkronizasyon kontrolü.
-        Şunları reddeder:
-          1. Chainlink fiyatı Binance'den sapıyorsa (87492 anomalisi gibi).
-          2. Chainlink ts_src_ms çok eskiyse (stale data).
-        Döner: (geçerli_mi, red_nedeni)
-        """
-        cl    = self.prices.get("BTC_CHAINLINK", 0.0)
-        bn    = self.prices.get("BTC_BINANCE",   0.0)
+        """Chainlink–Binance senkronizasyon + anomali kontrolü."""
+        cl     = self.prices.get("BTC_CHAINLINK", 0.0)
+        bn     = self.prices.get("BTC_BINANCE",   0.0)
         now_ms = time.time() * 1000
 
         if cl <= 0 or bn <= 0:
-            return True, ""   # veri yoksa geç — diğer filtreler yakalar
+            return True, ""
 
-        # 1. Fiyat sapması kontrolü (87492 anomalisi gibi hatalı CL verisini engeller)
-        max_dev = float(self.strat.get("max_cl_deviation_pct", 0.06))
+        max_dev   = float(self.strat.get("max_cl_deviation_pct", 0.06))
         deviation = abs(cl - bn) / bn
         if deviation > max_dev:
             msg = f"SYNC RED: CL=${cl:,.0f} BN=${bn:,.0f} sapma=%{deviation*100:.1f}"
             self._log(msg, "WARNING")
             return False, msg
 
-        # 2. Chainlink ts_src_ms tazelik kontrolü
         cl_ts_ms  = self.prices_ts.get("BTC_CHAINLINK_ts_src_ms", 0)
         max_stale = float(self.strat.get("max_cl_staleness_ms", 30_000))
         cl_age_ms = now_ms - cl_ts_ms if cl_ts_ms > 0 else 999_999
         if cl_ts_ms > 0 and cl_age_ms > max_stale:
-            msg = f"SYNC RED: CL veri eskimiş ({cl_age_ms/1000:.0f}s)"
+            msg = f"SYNC RED: CL eskimiş ({cl_age_ms/1000:.0f}s)"
             self._log(msg, "WARNING")
             return False, msg
 
-        # 3. BN-CL timestamp farkı uyarısı (kayıt için, red değil)
         bn_ts_ms = self.prices_ts.get("BTC_BINANCE_ts_src_ms", 0)
         if bn_ts_ms > 0 and cl_ts_ms > 0:
-            latency = abs(bn_ts_ms - cl_ts_ms)
-            if latency > 60_000:
-                self._log(f"SYNC UYARI: BN-CL timestamp farki {latency/1000:.0f}s", "WARNING")
-
+            if abs(bn_ts_ms - cl_ts_ms) > 60_000:
+                self._log(
+                    f"SYNC UYARI: BN-CL fark {abs(bn_ts_ms-cl_ts_ms)/1000:.0f}s",
+                    "WARNING"
+                )
         return True, ""
 
-    # ------------------------------------------------------------------ ADIM 3: R/R
-
     def _calc_rr_ratio(self, entry: float, raw_shares: float, side: str) -> float:
-        """
-        ADIM 3 — Beklenen R/R oranı hesabı.
-        R/R = net_profit_at_tp / max_loss_at_sl
-        """
-        tp_yes = float(self.strat.get("tp_pct_gain",     0.20))
-        tp_no  = float(self.strat.get("tp_pct_gain_no",  tp_yes))
-        sl_yes = float(self.strat.get("hard_sl_pct",     0.25))
-        sl_no  = float(self.strat.get("hard_sl_no_pct",  0.30))
-
-        tp = tp_no   if side == "NO" else tp_yes
-        sl = sl_no   if side == "NO" else sl_yes
-
+        """R/R oranı (EV tamamlayıcısı)."""
+        tp_yes = float(self.strat.get("tp_pct_gain",    0.20))
+        tp_no  = float(self.strat.get("tp_pct_gain_no", tp_yes))
+        sl_yes = float(self.strat.get("hard_sl_pct",    0.25))
+        sl_no  = float(self.strat.get("hard_sl_no_pct", 0.30))
+        tp = tp_no if side == "NO" else tp_yes
+        sl = sl_no if side == "NO" else sl_yes
         net_shares = raw_shares - _calculate_fee_shares(entry, raw_shares)
-        profit = _calc_net_profit_if_tp(entry, raw_shares, tp)
-
-        exit_sl  = max(0.01, entry * (1.0 - sl))
-        max_loss = abs(net_shares * exit_sl - raw_shares * entry)
+        profit     = _calc_net_profit_if_tp(entry, raw_shares, tp)
+        exit_sl    = max(0.01, entry * (1.0 - sl))
+        max_loss   = abs(net_shares * exit_sl - raw_shares * entry)
         if max_loss <= 0:
             return 99.0
         return profit / max_loss
 
-    # ------------------------------------------------------------------ cikis
+    # ------------------------------------------------------------------ çıkış
 
     def _check_exit(self, ms: MarketState) -> Tuple[bool, str, float, float]:
         t = ms.active_trade
         if not t:
             return False, "", 0.0, 0.0
 
-        tp_yes     = float(self.strat.get("tp_pct_gain",       0.20))
-        tp_no      = float(self.strat.get("tp_pct_gain_no",    tp_yes))
-        sl         = float(self.strat.get("sl_pct_loss",       0.15))
-        hard_sl    = float(self.strat.get("hard_sl_pct",       0.25))
-        # ADIM 3: NO icin ayri (daha genis) hard SL esigi
-        hard_sl_no = float(self.strat.get("hard_sl_no_pct",    0.30))
+        tp_yes     = float(self.strat.get("tp_pct_gain",    0.20))
+        tp_no      = float(self.strat.get("tp_pct_gain_no", tp_yes))
+        sl         = float(self.strat.get("sl_pct_loss",    0.15))
+        hard_sl    = float(self.strat.get("hard_sl_pct",    0.25))
+        hard_sl_no = float(self.strat.get("hard_sl_no_pct", 0.30))
 
         tp = tp_no if t.side == "NO" else tp_yes
 
         cur_poly = _safe_price(ms.best_bid if t.side == "YES" else 1.0 - ms.best_ask)
         move_pct = (cur_poly - t.entry_price) / t.entry_price
 
-        # --- ADIM 3: "Let YES Settle" modu ---
-        # YES trade karliyla settlement'a cok yakinsa TP almaz, 1.0'da settle olur.
+        # "Let YES Settle" modu
         let_settle_secs    = float(self.strat.get("let_yes_settle_secs",           45.0))
         let_settle_min_pct = float(self.strat.get("let_yes_settle_min_profit_pct", 0.15))
         if (t.side == "YES"
@@ -966,14 +1017,13 @@ class KrajekisSniperBot:
                 and move_pct >= let_settle_min_pct):
             return False, "", 0.0, 0.0
 
-        # --- Take Profit ---
+        # Take Profit
         if move_pct >= tp:
             pnl = (t.net_shares * cur_poly) - (t.raw_shares * t.entry_price)
             ms.sl_strikes = 0
             return True, "TAKE_PROFIT", round(pnl, 4), cur_poly
 
-        # --- ADIM 3: NO Stop Loss (KRITIK — onceki versiyonda yoktu!) ---
-        # SETTL_LOSS'ta -$4.95 kaybetmek yerine SL ile ~-$1.5 kaybeder.
+        # NO Stop Loss (V15.6 kritik ekleme — SETTL_LOSS önleme)
         if t.side == "NO":
             if move_pct <= -hard_sl_no:
                 pnl = (t.net_shares * cur_poly) - (t.raw_shares * t.entry_price)
@@ -986,7 +1036,7 @@ class KrajekisSniperBot:
                 return True, "STOP_LOSS", round(pnl, 4), cur_poly
             return False, "", 0.0, 0.0
 
-        # --- YES Stop Loss ---
+        # YES Stop Loss
         if move_pct <= -hard_sl:
             pnl = (t.net_shares * cur_poly) - (t.raw_shares * t.entry_price)
             ms.sl_strikes = 0
@@ -1003,7 +1053,7 @@ class KrajekisSniperBot:
 
         return False, "", 0.0, 0.0
 
-    # ------------------------------------------------------------------ analiz
+    # ------------------------------------------------------------------ analiz (V15.7)
 
     async def _analyze(self, ms: MarketState) -> None:
         if self._daily_limit_hit:
@@ -1013,6 +1063,7 @@ class KrajekisSniperBot:
         if ms.has_traded and not ms.active_trade:
             return
 
+        # Mevcut pozisyon çıkış kontrolü
         if ms.active_trade:
             ok, reason, pnl, exit_px = self._check_exit(ms)
             if ok:
@@ -1024,63 +1075,62 @@ class KrajekisSniperBot:
                 self._log(f"CIKIS | {reason} | PnL: ${pnl:+.3f}", "TRADE")
             return
 
-        max_pos = int(self.risk.get("max_open_positions", 2))
+        # Maksimum pozisyon limiti
+        max_pos = int(self.risk.get("max_open_positions", 5))
         if self._open_positions >= max_pos:
             ms.signal = "POS DOLU"
             return
 
-        min_e = float(self.strat.get("min_entry_price", 0.70))
+        # Referans fiyat henüz kilitlenmemişse bekle
+        if ms.ref_chainlink <= 0:
+            ms.signal = "REF BEKLE"
+            return
 
-        if self._signal_no_late(ms):
-            side     = "NO"
-            token_id = ms.no_id
-            entry    = 1.0 - ms.best_bid
-            max_e    = float(self.strat.get("max_entry_no", 0.83))
-            ms.signal = f"DN (LATE-NO) ref={ms.ref_chainlink:,.0f}"
-            if entry < min_e or entry > max_e or not token_id:
-                return
-        else:
-            ms.signal = self._signal(ms)
-            if "UP" in ms.signal:
-                side     = "YES"
-                token_id = ms.yes_id
-                entry    = ms.best_ask
-                max_e    = float(self.strat.get("max_entry_yes", 0.87))
-                if entry < min_e or entry > max_e or not token_id:
-                    return
-            else:
+        # --- V15.7: Convergence modeli (ana sinyal) ---
+        signal, side, entry, p_win, ev = self._pick_best_side(ms)
+        ms.signal = signal
+
+        min_ev = float(self.strat.get("conv_ev_threshold_usd", 0.08))
+        if not side or ev < min_ev:
+            return
+
+        # TA onay filtresi (isteğe bağlı — paper aggressive'de kapalı)
+        if side == "YES" and self.strat.get("conv_use_ta_filter", False):
+            ta_sig = self._signal(ms)
+            if "UP" not in ta_sig:
+                ms.signal = f"CONV YES TA✗ {ta_sig[:8]}"
                 return
 
+        # NO drop filtresi (isteğe bağlı — paper aggressive'de kapalı)
+        if side == "NO" and self.strat.get("conv_require_drop_filter", False):
+            if not self._signal_no_late(ms):
+                ms.signal = "CONV NO DROP✗"
+                return
+
+        # FOK cooldown
         now_ts = datetime.now(timezone.utc).timestamp()
-        fok_cd = float(self.strat.get("fok_cooldown", 20))
+        fok_cd = float(self.strat.get("fok_cooldown", 10))
         if now_ts - ms.last_buy_attempt < fok_cd:
+            return
+
+        # Sync kontrolü (Chainlink anomali filtresi)
+        sync_ok, _ = self._validate_price_sync()
+        if not sync_ok:
+            ms.signal = "SYNC RED"
             return
 
         stake = float(self.risk["stake_usd"])
         _, raw_shares = _safe_amounts(entry, stake)
         net_shares    = raw_shares - _calculate_fee_shares(entry, raw_shares)
 
-        # ADIM 4: Fiyat senkronizasyon kontrolu (87492 anomalisi gibi outlier'lari engeller)
-        sync_ok, sync_reason = self._validate_price_sync()
-        if not sync_ok:
-            ms.signal = "SYNC RED"
-            return
-
-        # ADIM 3: R/R kalite kontrolu
-        min_rr = float(self.strat.get("min_rr_ratio", 0.35))
-        rr     = self._calc_rr_ratio(entry, raw_shares, side)
-        if rr < min_rr:
-            ms.signal = f"RR RED {rr:.2f}"
-            self._log(f"RR RED: {side} entry={entry:.3f} rr={rr:.2f} < {min_rr:.2f}", "WARNING")
-            return
-
-        # ADIM 2: Fee sonrasi minimum net kar kontrolu
+        # Edge güvencesi (EV tamamlayıcısı)
         if not self._validate_entry_edge(entry, raw_shares, side):
             ms.signal = "EDGE RED"
             return
 
+        token_id            = ms.yes_id if side == "YES" else ms.no_id
         ms.last_buy_attempt = now_ts
-        oid = await self.order_mgr.place_buy(token_id, entry, raw_shares)
+        oid                 = await self.order_mgr.place_buy(token_id, entry, raw_shares)
 
         if not oid or oid.startswith("ERR:"):
             self._log(f"FOK iptal ({int(fok_cd)}s bekle) | {oid}", "WARNING")
@@ -1089,21 +1139,22 @@ class KrajekisSniperBot:
         cl_now    = self.prices["BTC_CHAINLINK"]
         cl_ts_src = self.prices_ts.get("BTC_CHAINLINK_ts_src_ms", 0)
         fee_usd   = _calc_fee_usd(entry, raw_shares)
+        vol_key   = "realized_vol_5m" if ms.horizon_min == 5 else "realized_vol_15m"
+        sigma_now = self.ta_data.get("BTC", {}).get(vol_key, 0.003)
+
         ms.active_trade = LiveTrade(
             market_id=ms.mid, token_id=token_id, side=side,
             entry_price=entry, raw_shares=raw_shares, net_shares=net_shares,
             stake=stake, entry_asset_px=cl_now, order_id=oid,
             entry_ts_src_ms=cl_ts_src,
+            p_fair=p_win, ev_usd=ev, ofi_entry=ms.ofi,
         )
-        tp_yes = float(self.strat.get("tp_pct_gain", 0.20))
-        tp_no  = float(self.strat.get("tp_pct_gain_no", tp_yes))
-        tp_used = tp_no if side == "NO" else tp_yes
-        net_pnl_tp = _calc_net_profit_if_tp(entry, raw_shares, tp_used)
+
         self._log(
             f"{'LIVE' if self.live_mode else 'PAPER'} SNIPE ({side}) [{ms.horizon_min}m] | "
-            f"entry={entry:.3f} shares={raw_shares:.0f}(net:{net_shares:.2f}) | "
-            f"fee=${fee_usd:.3f} tp_pnl=${net_pnl_tp:.3f} rr={rr:.2f} | "
-            f"CL=${cl_now:,.0f}",
+            f"entry={entry:.3f} P_fair={p_win:.3f} EV=${ev:.3f} OFI={ms.ofi:+.2f} | "
+            f"σ={sigma_now*100:.2f}% τ={int(ms.secs_left)}s | "
+            f"fee=${fee_usd:.3f} | CL=${cl_now:,.0f}",
             "LIVE" if self.live_mode else "PAPER",
         )
         appr = await self.order_mgr.approve_token(token_id)
@@ -1129,7 +1180,7 @@ class KrajekisSniperBot:
                 )
 
             if ms.ref_chainlink > 0 and ms.ref_chainlink_ts:
-                lag = (ms.ref_chainlink_ts - ms.start_time).total_seconds()
+                lag     = (ms.ref_chainlink_ts - ms.start_time).total_seconds()
                 ref_src = "CHAINLINK_OPEN" if lag < 30 else "CHAINLINK_LATE"
             else:
                 ref_src = "ENTRY_FALLBACK"
@@ -1141,7 +1192,7 @@ class KrajekisSniperBot:
                 cur_poly = _safe_price(
                     ms.best_bid if t.side == "YES" else 1.0 - ms.best_ask
                 )
-                won    = cur_poly > t.entry_price
+                won     = cur_poly > t.entry_price
                 ref_src = "ORDERBOOK_FALLBACK"
 
             if won:
@@ -1162,7 +1213,7 @@ class KrajekisSniperBot:
 
         del self.markets[mid]
 
-    # ------------------------------------------------------------------ kayit
+    # ------------------------------------------------------------------ kayıt
 
     def _record(self, ms: MarketState, pnl: float, rtype: str, exit_px: float,
                 btc_ref_used: float = 0.0, ref_src: str = "") -> None:
@@ -1177,6 +1228,8 @@ class KrajekisSniperBot:
             self.wins   += 1
         else:
             self.losses += 1
+
+        vol_key = "realized_vol_5m" if ms.horizon_min == 5 else "realized_vol_15m"
 
         record = {
             "ts":                         datetime.now(timezone.utc).isoformat(),
@@ -1199,24 +1252,22 @@ class KrajekisSniperBot:
             "ref_source":                 ref_src,
             "btc_binance":                self.prices.get("BTC_BINANCE", 0.0),
             "live":                       self.live_mode,
-            # --- ADIM 4: RTDS zaman damgaları ve senkronizasyon metrikleri ---
+            # RTDS zaman damgaları
             "ts_src_ms_chainlink_entry":  t.entry_ts_src_ms,
             "ts_src_ms_chainlink_exit":   self.prices_ts.get("BTC_CHAINLINK_ts_src_ms", 0),
             "ts_src_ms_binance_exit":     self.prices_ts.get("BTC_BINANCE_ts_src_ms", 0),
             "rtds_binance_live":          self._rtds_binance_ok,
             "rtds_chainlink_live":        self._rtds_chainlink_ok,
-            # ADIM 4: BN-CL kaynak timestamp farki (ms) — latency analizi icin
             "ts_latency_ms": abs(
                 self.prices_ts.get("BTC_BINANCE_ts_src_ms", 0) -
                 self.prices_ts.get("BTC_CHAINLINK_ts_src_ms", 0)
             ),
-            # ADIM 4: CL-BN fiyat sapma yuzdesi — outlier tespiti icin
             "cl_deviation_pct": round(
                 abs(self.prices.get("BTC_CHAINLINK", 0) - self.prices.get("BTC_BINANCE", 1)) /
                 max(self.prices.get("BTC_BINANCE", 1), 1) * 100, 4
             ),
-            # ADIM 2: Gercek fee maliyeti ve TP'deki beklenen net kar
-            "fee_usd":          round(_calc_fee_usd(t.entry_price, t.raw_shares), 4),
+            # Fee / edge
+            "fee_usd": round(_calc_fee_usd(t.entry_price, t.raw_shares), 4),
             "net_profit_if_tp": round(
                 _calc_net_profit_if_tp(
                     t.entry_price, t.raw_shares,
@@ -1225,6 +1276,11 @@ class KrajekisSniperBot:
                     ))
                 ), 4
             ),
+            # V15.7: convergence metrikleri
+            "p_fair":        round(t.p_fair, 4),
+            "ev_usd":        round(t.ev_usd, 4),
+            "ofi_entry":     round(t.ofi_entry, 4),
+            "realized_vol":  round(self.ta_data.get("BTC", {}).get(vol_key, 0.0), 6),
         }
         try:
             mem = self.cfg.get("memory_file", "trades_v15_paper.jsonl")
@@ -1244,27 +1300,26 @@ class KrajekisSniperBot:
             Layout(name="b", ratio=1),
             Layout(name="l", size=14),
         )
-        lay["b"].split_row(Layout(name="mt", ratio=4), Layout(name="s", size=40))
+        lay["b"].split_row(Layout(name="mt", ratio=4), Layout(name="s", size=42))
 
         cl  = self.prices.get("BTC_CHAINLINK", 0.0)
         bn  = self.prices.get("BTC_BINANCE",   0.0)
         ta  = self.ta_data.get("BTC", {})
         rsi = ta.get("rsi", 0.0)
         wr  = (self.wins / self.trades * 100) if self.trades else 0.0
-        lim = abs(self.risk.get("max_daily_loss_usd", 3.0))
+        lim = abs(self.risk.get("max_daily_loss_usd", 30.0))
 
-        # RTDS durum göstergesi
-        bn_rtds  = "[bold green]BN✓[/bold green]" if self._rtds_binance_ok   else "[red]BN✗[/red]"
-        cl_rtds  = "[bold green]CL✓[/bold green]" if self._rtds_chainlink_ok else "[red]CL✗[/red]"
-        rtds_str = f"RTDS:{bn_rtds}/{cl_rtds}"
+        bn_rtds  = "[bold green]BN✓[/]" if self._rtds_binance_ok   else "[red]BN✗[/]"
+        cl_rtds  = "[bold green]CL✓[/]" if self._rtds_chainlink_ok else "[red]CL✗[/]"
+        vol_5m   = ta.get("realized_vol_5m", 0.0)
 
         hdr = (
-            f"[bold white]KRAJEKIS V15.6 R/R+SYNC[/bold white] "
+            f"[bold white]KRAJEKIS V15.7 CONVERGENCE[/bold white] "
             f"{'[bold red]CANLI[/bold red]' if self.live_mode else '[dim]PAPER[/dim]'} | "
-            f"{rtds_str} | "
+            f"RTDS:{bn_rtds}/{cl_rtds} | "
             f"Link:[bold green]${cl:,.0f}[/bold green] "
             f"(Bin:[cyan]${bn:,.0f}[/cyan] Δ${abs(cl-bn):,.0f}) | "
-            f"VWAP:[yellow]${ta.get('vwap',0):,.0f}[/yellow] | "
+            f"σ5m:[yellow]{vol_5m*100:.2f}%[/yellow] | "
             f"RSI:[magenta]{rsi:.1f}[/magenta] | "
             f"PnL:[{'green' if self.session_pnl>=0 else 'red'}]${self.session_pnl:+.3f}[/] | "
             f"W/L:[green]{self.wins}[/green]/[red]{self.losses}[/red]({wr:.0f}%)"
@@ -1272,7 +1327,7 @@ class KrajekisSniperBot:
         lay["h"].update(Panel(Text.from_markup(hdr), border_style="cyan"))
 
         tbl = Table(box=box.MINIMAL_DOUBLE_HEAD, expand=True)
-        for col in ["Kalan", "BTC Pazar", "YES", "NO", "Sinyal", "Pozisyon"]:
+        for col in ["Kalan", "Pazar", "YES", "NO", "Sinyal / Convergence", "Pozisyon"]:
             tbl.add_column(col, no_wrap=True)
 
         for ms in sorted(self.markets.values(), key=lambda x: x.secs_left):
@@ -1284,7 +1339,10 @@ class KrajekisSniperBot:
                 t        = ms.active_trade
                 cur_poly = _safe_price(ms.best_bid if t.side == "YES" else 1.0 - ms.best_ask)
                 gain     = cur_poly - t.entry_price
-                pos_str  = f"{t.side}@{t.entry_price:.2f} ({gain:+.2f})"
+                pos_str  = (
+                    f"{t.side}@{t.entry_price:.2f}({gain:+.2f}) "
+                    f"P={t.p_fair:.2f} EV=${t.ev_usd:.2f}"
+                )
                 row_style = "green" if gain >= 0 else "red"
             elif ms.has_traded:
                 pos_str   = "[dim]KAPANDI[/dim]"
@@ -1300,37 +1358,45 @@ class KrajekisSniperBot:
 
         lay["mt"].update(Panel(
             tbl,
-            title=f"Radar 5m+15m ({sum(1 for m in self.markets.values() if m.secs_left>0)} pazar"
-                  f" | {self._open_positions} acik)",
+            title=(f"Radar 5m+15m "
+                   f"({sum(1 for m in self.markets.values() if m.secs_left>0)} pazar"
+                   f" | {self._open_positions} acik)"),
             border_style="cyan",
         ))
 
-        # RTDS yaşlılık (ms cinsinden son güncelleme)
-        bn_age = int((time.time() * 1000 - self.prices_ts.get("BTC_BINANCE_ts_src_ms", 0)) / 1000)
-        cl_age = int((time.time() * 1000 - self.prices_ts.get("BTC_CHAINLINK_ts_src_ms", 0)) / 1000)
+        bn_age   = int((time.time()*1000 - self.prices_ts.get("BTC_BINANCE_ts_src_ms", 0))/1000)
+        cl_age   = int((time.time()*1000 - self.prices_ts.get("BTC_CHAINLINK_ts_src_ms", 0))/1000)
+        avg_ofi  = sum(m.ofi for m in self.markets.values() if m.secs_left > 0)
+        n_active = sum(1 for m in self.markets.values() if m.secs_left > 0)
+        avg_ofi  = avg_ofi / n_active if n_active > 0 else 0.0
 
         stat = (
             f"[bold cyan]TA (Binance)[/bold cyan]\n"
-            f"  Fiyat: [cyan]${bn:,.0f}[/cyan] ({bn_age}s once)\n"
+            f"  Fiyat: [cyan]${bn:,.0f}[/cyan] ({bn_age}s)\n"
             f"  VWAP:  [yellow]${ta.get('vwap',0):,.0f}[/yellow]\n"
-            f"  EMA21: ${ta.get('ema21',0):,.0f}\n"
-            f"  EMA50: ${ta.get('ema50',0):,.0f}\n"
-            f"  RSI:   [magenta]{rsi:.1f}[/magenta]\n"
-            f"  MACD:  {'[green]' if ta.get('macd',0)>0 else '[red]'}{ta.get('macd',0):+.2f}[/]\n\n"
+            f"  EMA21: ${ta.get('ema21',0):,.0f}  EMA50: ${ta.get('ema50',0):,.0f}\n"
+            f"  RSI:   [magenta]{rsi:.1f}[/magenta]  "
+            f"MACD: {'[green]' if ta.get('macd',0)>0 else '[red]'}{ta.get('macd',0):+.2f}[/]\n\n"
+            f"[bold cyan]CONVERGENCE (V15.7)[/bold cyan]\n"
+            f"  σ5m:   [yellow]{vol_5m*100:.3f}%[/yellow]  "
+            f"σ15m: {ta.get('realized_vol_15m',0)*100:.3f}%\n"
+            f"  OFI:   {'[green]' if avg_ofi>=0 else '[red]'}{avg_ofi:+.3f}[/] (ort.)\n"
+            f"  EV eşiği: ${self.strat.get('conv_ev_threshold_usd',0.08):.2f}  "
+            f"TA filtre: {'açık' if self.strat.get('conv_use_ta_filter',False) else 'kapalı'}\n\n"
             f"[bold cyan]ORACLE (Chainlink)[/bold cyan]\n"
-            f"  Fiyat: [bold green]${cl:,.0f}[/bold green] ({cl_age}s once)\n"
-            f"  Fark:  ${abs(cl-bn):,.1f}\n"
-            f"  RTDS:  {('OK' if self._rtds_chainlink_ok else 'HTTP fallback')}\n"
-            f"  Dev:   max {self.strat.get('max_cl_deviation_pct',0.06)*100:.0f}% | stale <{int(self.strat.get('max_cl_staleness_ms',30000)/1000)}s\n\n"
+            f"  Fiyat: [bold green]${cl:,.0f}[/bold green] ({cl_age}s)\n"
+            f"  Fark:  ${abs(cl-bn):,.1f}  "
+            f"RTDS: {'OK' if self._rtds_chainlink_ok else 'HTTP'}\n"
+            f"  Dev: max {self.strat.get('max_cl_deviation_pct',0.06)*100:.0f}%"
+            f" | stale <{int(self.strat.get('max_cl_staleness_ms',30000)/1000)}s\n\n"
             f"[bold cyan]FILTRELER[/bold cyan]\n"
-            f"  Makas: max {self.strat.get('max_spread', 0.04):.2f}\n"
-            f"  [cyan]Brain1 YES[/cyan]: max {self.strat.get('max_entry_yes', 0.87):.2f}\n"
-            f"  [yellow]Brain2 NO[/yellow]:  max {self.strat.get('max_entry_no', 0.83):.2f} "
-            f"(son {int(self.strat.get('no_window_secs_start',150))}s)\n"
-            f"  NO drop 5m: ${self.strat.get('no_min_btc_drop_5m',80):.0f} "
-            f"| 15m: ${self.strat.get('no_min_btc_drop_15m',150):.0f}\n"
-            f"  5m YES pencere: {self.strat.get('sweet_spot_5m_end',1)}-{self.strat.get('sweet_spot_5m_start',3)} dk\n"
-            f"  15m YES pencere: {self.strat.get('sweet_spot_15m_end',5)}-{self.strat.get('sweet_spot_15m_start',10)} dk\n\n"
+            f"  Makas: max {self.strat.get('max_spread',0.04):.2f}\n"
+            f"  YES: {self.strat.get('sweet_spot_5m_end',1.0)}-"
+            f"{self.strat.get('sweet_spot_5m_start',4.5)} dk (5m)\n"
+            f"  NO:  {int(self.strat.get('no_window_secs_end',20))}-"
+            f"{int(self.strat.get('no_window_secs_start',200))} sn\n"
+            f"  max_pos: {self.risk.get('max_open_positions',5)}  "
+            f"cooldown: {int(self.strat.get('fok_cooldown',10))}s\n\n"
             f"[bold cyan]KASA[/bold cyan]\n"
             f"  Gunluk: [{'green' if self.daily_pnl>=0 else 'red'}]${self.daily_pnl:+.3f}[/] "
             f"(limit: -${lim:.2f})\n"
@@ -1338,12 +1404,12 @@ class KrajekisSniperBot:
         )
         lay["s"].update(Panel(
             Text.from_markup(stat),
-            title="Krajekis V15.6 R/R+SYNC",
+            title="Krajekis V15.7 CONVERGENCE",
             border_style="yellow",
         ))
         lay["l"].update(Panel(
             Text.from_markup("\n".join(list(self.logs))),
-            title="Sistem Log [V15.6 | Brain1=YES-TA Brain2=NO-SL | RTDS+SYNC]",
+            title="Sistem Log [V15.7 | CONVERGENCE+OFI+VOL | RTDS+SYNC+SL]",
             border_style="cyan",
         ))
         return lay
@@ -1357,16 +1423,9 @@ class KrajekisSniperBot:
             family=socket.AF_INET,
         )
         async with aiohttp.ClientSession(connector=connector) as session:
-            # ---- RTDS background taskları başlat (main_run'u BLOKLAMAZ) ----
             self._rtds_tasks = [
-                asyncio.create_task(
-                    self._rtds_binance_ws(),
-                    name="rtds_binance",
-                ),
-                asyncio.create_task(
-                    self._rtds_chainlink_ws(),
-                    name="rtds_chainlink",
-                ),
+                asyncio.create_task(self._rtds_binance_ws(),   name="rtds_binance"),
+                asyncio.create_task(self._rtds_chainlink_ws(), name="rtds_chainlink"),
             ]
 
             try:
@@ -1375,7 +1434,11 @@ class KrajekisSniperBot:
                     self._log(f"Live Onay: {appr}", "INFO")
 
                 self._log(
-                    f"V15.5 RTDS Edition Basladi ({'CANLI' if self.live_mode else 'PAPER'})",
+                    f"V15.7 CONVERGENCE EDITION Basladi "
+                    f"({'CANLI' if self.live_mode else 'PAPER'}) | "
+                    f"EV>${self.strat.get('conv_ev_threshold_usd',0.08):.2f} "
+                    f"max_pos={self.risk.get('max_open_positions',5)} "
+                    f"cooldown={int(self.strat.get('fok_cooldown',10))}s",
                     "LIVE" if self.live_mode else "PAPER",
                 )
 
@@ -1396,7 +1459,6 @@ class KrajekisSniperBot:
                         cycle += 1
 
             finally:
-                # Çıkışta RTDS taskları temizle
                 self._running = False
                 for task in self._rtds_tasks:
                     task.cancel()

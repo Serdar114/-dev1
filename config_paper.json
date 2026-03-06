@@ -14,42 +14,51 @@
   },
   "risk": {
     "stake_usd": 5.0,
-    "max_daily_loss_usd": 30.0,
-    "max_open_positions": 1
+    "max_daily_loss_usd": 50.0,
+    "max_open_positions": 5
   },
   "strategy": {
     "paper_only": true,
 
-    "min_entry_price": 0.70,
+    "conv_ev_threshold_usd": 0.08,
+    "conv_use_ta_filter": false,
+    "conv_require_drop_filter": false,
 
+    "min_entry_price": 0.55,
     "max_entry_yes": 0.87,
     "max_entry_no":  0.83,
 
     "max_spread": 0.04,
 
-    "sweet_spot_15m_start": 10.0,
-    "sweet_spot_15m_end":    5.0,
-    "sweet_spot_5m_start":   3.0,
-    "sweet_spot_5m_end":     1.5,
+    "sweet_spot_15m_start": 12.0,
+    "sweet_spot_15m_end":    3.0,
+    "sweet_spot_5m_start":   4.5,
+    "sweet_spot_5m_end":     1.0,
 
-    "no_window_secs_start": 150.0,
-    "no_window_secs_end":    30.0,
-    "no_min_btc_drop_5m":   80.0,
-    "no_min_btc_drop_15m": 150.0,
+    "no_window_secs_start": 200.0,
+    "no_window_secs_end":    20.0,
+    "no_min_btc_drop_5m":   60.0,
+    "no_min_btc_drop_15m": 120.0,
 
-    "tp_pct_gain":  0.20,
-    "sl_pct_loss":  0.15,
-    "hard_sl_pct":  0.25,
+    "tp_pct_gain":    0.20,
+    "tp_pct_gain_no": 0.20,
+    "sl_pct_loss":    0.15,
+    "hard_sl_pct":    0.25,
+    "hard_sl_no_pct": 0.30,
 
-    "emergency_stop":         0.68,
-    "convergence_btc_delta":  15.0,
-    "convergence_secs_min":   25.0,
-    "convergence_secs_max":  110.0,
-    "fee_slippage":           0.003,
-    "exit_retry_interval":   15,
-    "fok_cooldown":          20,
-    "rsi_overbought":        70,
-    "rsi_oversold":          30
+    "let_yes_settle_secs":           45.0,
+    "let_yes_settle_min_profit_pct": 0.15,
+
+    "min_rr_ratio":  0.20,
+    "min_edge_usd":  0.08,
+
+    "max_cl_staleness_ms":  30000,
+    "max_cl_deviation_pct": 0.06,
+
+    "fok_cooldown":     10,
+    "rsi_overbought":   70,
+    "rsi_oversold":     30,
+    "min_signal_score": 2
   },
   "memory_file": "trades_paper.jsonl"
 }
