@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """
-Polymarket Krajekis Auto-Sniper V15.3 (ULTIMATE HYBRID EDITION)
-===============================================================
-  + Brain 1 (YES): Erken TA Trend stratejisi (3/4 Skor Sistemi ile esnetildi).
-  + Brain 2 (NO): Late Convergence stratejisi (Son saniye, Stop-Loss yok).
-  + Oracle: 4 farkli Polygon RPC endpoint ile kesintisiz Chainlink.
-  + Fallback: BINANCE_LOCK sistemi (0.0 hatasini tamamen onler).
+Polymarket Krajekis Sniper V16.0
+=================================
+  Brain 1 (YES): Erken TA Trend stratejisi (3/4 skor sistemi).
+  Brain 2 (NO) : Late Convergence stratejisi (son saniye, stop-loss yok).
+  Oracle       : 4x Polygon RPC ile Chainlink + Binance fallback.
 """
 import sys
-import asyncio
-import socket
-import aiohttp
 import json
 import os
 import time
+import asyncio
+import socket
+import ssl
 import pandas as pd
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -21,6 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Tuple
 
+import aiohttp
 from rich.console import Console
 from rich.table import Table
 from rich.live import Live
@@ -37,71 +37,87 @@ try:
 except ImportError:
     CLOB_OK = False
 
+# ---------------------------------------------------------------------------
+# Yapılandırma
+# ---------------------------------------------------------------------------
 
 def load_config(path: str = "config.json") -> dict:
     if not os.path.exists(path):
         raise FileNotFoundError(f"{path} bulunamadi!")
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return json.load(f)
 
-def _cfg_has_creds(cfg: dict) -> bool:
+def _has_creds(cfg: dict) -> bool:
     c = cfg.get("credentials", {})
-    return bool(c.get("api_key") and c.get("private_key") and c.get("private_key") not in ("0x", ""))
+    pk = c.get("private_key", "")
+    return bool(c.get("api_key") and pk and pk not in ("", "0x"))
 
-def _parse_clob_token_ids(raw) -> list:
-    if isinstance(raw, list): return raw
+def _parse_token_ids(raw) -> list:
+    if isinstance(raw, list):
+        return raw
     if isinstance(raw, str):
         try:
             res = json.loads(raw)
             return res if isinstance(res, list) else []
-        except: return []
+        except Exception:
+            return []
     return []
 
-def _safe_price(p: float) -> float:
+# ---------------------------------------------------------------------------
+# Yardımcı fonksiyonlar
+# ---------------------------------------------------------------------------
+
+def _clamp_price(p: float) -> float:
     return round(max(0.01, min(0.99, float(p))), 4)
 
 def _safe_amounts(price: float, stake: float) -> Tuple[float, float]:
-    price_r = round(max(0.01, min(0.99, float(price))), 2)
-    raw_shares = stake / price_r
-    shares_int = float(int(round(raw_shares, 4)))
-    return price_r, shares_int
+    pr = round(max(0.01, min(0.99, float(price))), 2)
+    shares = float(int(round(stake / pr, 4)))
+    return pr, shares
 
 def _fee_shares(price: float, raw_shares: float) -> float:
     p = max(0.01, min(0.99, price))
     return raw_shares * 0.25 * (p * (1.0 - p)) ** 2
 
+# ---------------------------------------------------------------------------
+# Veri yapıları
+# ---------------------------------------------------------------------------
+
 @dataclass
-class LiveTrade:
+class Trade:
     market_id:      str
     token_id:       str
-    side:           str
+    side:           str          # "YES" ya da "NO"
     entry_price:    float
     raw_shares:     float
     net_shares:     float
     stake:          float
-    entry_asset_px: float
+    entry_btc_px:   float
     order_id:       str = ""
     entry_time:     datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
 
 class MarketState:
     def __init__(self, mid: str, question: str, end_time: datetime,
                  yes_id: str = "", no_id: str = "", horizon_min: int = 5):
-        self.mid        = mid
-        self.question   = question
-        self.end_time   = end_time
-        self.yes_id     = yes_id
-        self.no_id      = no_id
-        self.horizon_min = horizon_min
-        self.start_time  = end_time - timedelta(minutes=horizon_min)
-        self.best_ask:  float = 0.5
-        self.best_bid:  float = 0.5
-        self.signal:    str   = "BEKLE"
-        self.active_trade: Optional[LiveTrade] = None
-        self.has_traded:    bool  = False
-        self.sl_strikes:    int   = 0
-        self.last_buy_attempt: float = 0.0
-        self.ref_chainlink:    float = 0.0
-        self.ref_chainlink_ts: Optional[datetime] = None
+        self.mid          = mid
+        self.question     = question
+        self.end_time     = end_time
+        self.yes_id       = yes_id
+        self.no_id        = no_id
+        self.horizon_min  = horizon_min
+        self.start_time   = end_time - timedelta(minutes=horizon_min)
+
+        self.best_ask: float = 0.5
+        self.best_bid: float = 0.5
+        self.signal:   str   = "BEKLE"
+
+        self.active_trade:      Optional[Trade] = None
+        self.has_traded:        bool  = False
+        self.sl_strikes:        int   = 0
+        self.last_buy_ts:       float = 0.0
+        self.ref_chainlink:     float = 0.0
+        self.ref_chainlink_ts:  Optional[datetime] = None
 
     @property
     def secs_left(self) -> float:
@@ -113,127 +129,178 @@ class MarketState:
 
     @property
     def short_name(self) -> str:
-        return (self.question[:34] + "...") if len(self.question) > 35 else self.question
+        return (self.question[:34] + "…") if len(self.question) > 35 else self.question
+
+# ---------------------------------------------------------------------------
+# Emir yöneticisi
+# ---------------------------------------------------------------------------
 
 class OrderManager:
     def __init__(self, cfg: dict, live_mode: bool):
-        self.cfg        = cfg
-        self.live_mode  = live_mode
-        self._client    = None
-        self._executor  = ThreadPoolExecutor(max_workers=3)
-        self._paper_seq = 0
+        self.cfg       = cfg
+        self.live_mode = live_mode
+        self._client: Optional["ClobClient"] = None
+        self._pool     = ThreadPoolExecutor(max_workers=3)
+        self._seq      = 0
 
-    def _client_or_raise(self) -> "ClobClient":
+    def _get_client(self) -> "ClobClient":
         if self._client is None:
-            creds       = self.cfg["credentials"]
-            funder_addr = creds.get("wallet_address", "")
+            cr = self.cfg["credentials"]
+            funder = cr.get("wallet_address", "") or None
             self._client = ClobClient(
-                host=self.cfg["network"]["clob_url"], chain_id=self.cfg["network"]["chain_id"],
-                key=creds["private_key"], creds=ApiCreds(api_key=creds["api_key"], api_secret=creds["api_secret"], api_passphrase=creds["api_passphrase"]),
-                funder=funder_addr if funder_addr else None, signature_type=1 if funder_addr else 0,
+                host=self.cfg["network"]["clob_url"],
+                chain_id=self.cfg["network"]["chain_id"],
+                key=cr["private_key"],
+                creds=ApiCreds(
+                    api_key=cr["api_key"],
+                    api_secret=cr["api_secret"],
+                    api_passphrase=cr["api_passphrase"],
+                ),
+                funder=funder,
+                signature_type=1 if funder else 0,
             )
         return self._client
 
-    async def place_buy(self, token_id: str, price: float, shares: float) -> str:
+    def _paper_id(self, prefix: str = "BUY") -> str:
+        self._seq += 1
+        return f"PAPER-{prefix}-{self._seq:04d}"
+
+    async def _run(self, fn):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._pool, fn)
+
+    async def place_buy(self, token_id: str, price: float, stake: float) -> str:
         if not self.live_mode:
-            self._paper_seq += 1
-            return f"PAPER-{self._paper_seq:04d}"
+            return self._paper_id("BUY")
+
         def _do():
             try:
-                client = self._client_or_raise()
-                price_r, shares_r = _safe_amounts(price, shares * price)
-                args = OrderArgs(price=price_r, size=shares_r, side=BUY, token_id=token_id)
-                signed = client.create_order(args)
-                resp   = client.post_order(signed, OrderType.FOK)
-                return (resp.get("orderID") or resp.get("order_id") or resp.get("id", ""))
-            except Exception as e: return f"ERR:{e}"
-        return await asyncio.get_running_loop().run_in_executor(self._executor, _do)
+                pr, shares = _safe_amounts(price, stake)
+                args   = OrderArgs(price=pr, size=shares, side=BUY, token_id=token_id)
+                signed = self._get_client().create_order(args)
+                resp   = self._get_client().post_order(signed, OrderType.FOK)
+                return resp.get("orderID") or resp.get("order_id") or resp.get("id", "")
+            except Exception as e:
+                return f"ERR:{e}"
+
+        return await self._run(_do)
 
     async def place_sell(self, token_id: str, price: float, shares: float) -> str:
         if not self.live_mode:
-            self._paper_seq += 1
-            return f"PAPER-SELL-{self._paper_seq:04d}"
+            return self._paper_id("SELL")
+
         def _do():
             try:
-                client = self._client_or_raise()
-                price_r, shares_r = _safe_amounts(price, shares * price)
-                args = OrderArgs(price=price_r, size=shares_r, side=SELL, token_id=token_id)
-                signed = client.create_order(args)
-                resp   = client.post_order(signed, OrderType.GTC)
-                return (resp.get("orderID") or resp.get("order_id") or resp.get("id", ""))
-            except Exception as e: return f"ERR:{e}"
-        return await asyncio.get_running_loop().run_in_executor(self._executor, _do)
+                pr, sh = _safe_amounts(price, shares * price)
+                args   = OrderArgs(price=pr, size=sh, side=SELL, token_id=token_id)
+                signed = self._get_client().create_order(args)
+                resp   = self._get_client().post_order(signed, OrderType.GTC)
+                return resp.get("orderID") or resp.get("order_id") or resp.get("id", "")
+            except Exception as e:
+                return f"ERR:{e}"
 
-    async def approve_token(self, token_id: str) -> str:
-        if not self.live_mode: return "PAPER"
+        return await self._run(_do)
+
+    async def approve_collateral(self) -> str:
+        if not self.live_mode:
+            return "PAPER"
+
         def _do():
+            import time as _t
             try:
                 from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
-                client = self._client_or_raise()
-                resp = client.update_balance_allowance(params=BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id))
-                return f"OK:{resp}"
-            except Exception as e: return f"ERR:{e}"
-        return await asyncio.get_running_loop().run_in_executor(self._executor, _do)
-
-    async def ensure_approvals(self) -> str:
-        if not self.live_mode: return "PAPER"
-        def _do():
-            import time as _time
-            client = self._client_or_raise()
-            results = []
-            try:
-                from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                client  = self._get_client()
+                results = []
                 for label, at in [("COLLATERAL", AssetType.COLLATERAL), ("CONDITIONAL", AssetType.CONDITIONAL)]:
                     try:
                         resp = client.get_balance_allowance(params=BalanceAllowanceParams(asset_type=at))
-                        allowance = int(resp.get("allowance", "0") or "0") if isinstance(resp, dict) else 0
+                        allowance = int((resp or {}).get("allowance", "0") or "0")
                         if allowance == 0:
                             client.update_balance_allowance(params=BalanceAllowanceParams(asset_type=at))
-                            _time.sleep(5.0)
+                            _t.sleep(4)
                             results.append(f"{label}:SET")
                         else:
                             results.append(f"{label}:OK")
-                    except Exception as e: results.append(f"{label}:ERR:{e}")
-            except ImportError: return "IMPORT_ERR"
-            return ",".join(results)
-        return await asyncio.get_running_loop().run_in_executor(self._executor, _do)
+                    except Exception as e:
+                        results.append(f"{label}:ERR:{e}")
+                return ",".join(results)
+            except ImportError:
+                return "IMPORT_ERR"
+
+        return await self._run(_do)
 
     async def cancel_all(self) -> None:
-        if not self.live_mode: return
+        if not self.live_mode:
+            return
+
         def _do():
-            try: self._client_or_raise().cancel_all_orders()
-            except: pass
-        await asyncio.get_running_loop().run_in_executor(self._executor, _do)
+            try:
+                self._get_client().cancel_all_orders()
+            except Exception:
+                pass
 
-class KrajekisSniperBot:
-    def __init__(self, config: dict):
-        self.cfg       = config
-        self.risk      = config["risk"]
-        self.strat     = config["strategy"]
-        self.net       = config["network"]
+        await self._run(_do)
 
-        self.live_mode = False if self.strat.get("paper_only", True) else (CLOB_OK and _cfg_has_creds(config))
+# ---------------------------------------------------------------------------
+# Ana bot
+# ---------------------------------------------------------------------------
+
+_CHAINLINK_RPCS = [
+    "https://polygon-rpc.com",
+    "https://rpc.ankr.com/polygon",
+    "https://polygon.llamarpc.com",
+    "https://1rpc.io/matic",
+]
+_CHAINLINK_CONTRACT = "0xc907E116054Ad103354f2D350FD2514433D57F6f"
+_CHAINLINK_DATA     = "0xfeaf968c"
+
+
+class SniperBot:
+    def __init__(self, cfg: dict):
+        self.cfg   = cfg
+        self.risk  = cfg["risk"]
+        self.strat = cfg["strategy"]
+        self.net   = cfg["network"]
+
+        self.live_mode = (
+            not self.strat.get("paper_only", True)
+            and CLOB_OK
+            and _has_creds(cfg)
+        )
 
         self.console   = Console()
-        self.order_mgr = OrderManager(config, self.live_mode)
-        self.markets:      Dict[str, MarketState] = {}
-        self.logs:         deque = deque(maxlen=14)
+        self.orders    = OrderManager(cfg, self.live_mode)
+        self.markets:  Dict[str, MarketState] = {}
+        self.logs:     deque = deque(maxlen=14)
 
-        self.prices:       Dict[str, float] = {"BTC_BINANCE": 0.0, "BTC_CHAINLINK": 0.0}
-        self.ta_data:      Dict[str, dict]  = {}
+        self.btc_binance:   float = 0.0
+        self.btc_chainlink: float = 0.0
+        self.ta:            dict  = {}
 
-        self.trades:       int   = 0
-        self.wins:         int   = 0
-        self.losses:       int   = 0
-        self.session_pnl:  float = 0.0
-        self.daily_pnl:    float = 0.0
-        self._daily_reset: datetime = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-        self._running: bool = True
+        self.trades:      int   = 0
+        self.wins:        int   = 0
+        self.losses:      int   = 0
+        self.session_pnl: float = 0.0
+        self.daily_pnl:   float = 0.0
+        self._next_reset  = (
+            datetime.now(timezone.utc)
+            .replace(hour=0, minute=0, second=0, microsecond=0)
+            + timedelta(days=1)
+        )
+        self._running = True
+
+    # ------------------------------------------------------------------
+    # Loglama
+    # ------------------------------------------------------------------
 
     def _log(self, msg: str, level: str = "INFO") -> None:
         ts = datetime.now().strftime("%H:%M:%S")
-        colors = {"INFO": "cyan", "TRADE": "bold green", "WARNING": "yellow", "ERROR": "bold red", "LIVE": "bold green", "PAPER": "dim cyan"}
-        c = colors.get(level, "white")
+        color_map = {
+            "INFO": "cyan", "TRADE": "bold green",
+            "WARNING": "yellow", "ERROR": "bold red",
+            "LIVE": "bold green", "PAPER": "dim cyan",
+        }
+        c = color_map.get(level, "white")
         self.logs.append(f"[{c}][{ts}] {level}[/] {msg}")
         try:
             with open("debug.log", "a", encoding="utf-8") as f:
@@ -241,11 +308,15 @@ class KrajekisSniperBot:
         except Exception:
             pass
 
+    # ------------------------------------------------------------------
+    # Günlük limit
+    # ------------------------------------------------------------------
+
     def _check_daily_reset(self) -> None:
-        if datetime.now(timezone.utc) >= self._daily_reset:
+        if datetime.now(timezone.utc) >= self._next_reset:
             self.daily_pnl = 0.0
-            self._daily_reset += timedelta(days=1)
-            self._log("Gunluk PnL sifirlandi", "INFO")
+            self._next_reset += timedelta(days=1)
+            self._log("Gunluk PnL sifirlandi")
 
     @property
     def _daily_limit_hit(self) -> bool:
@@ -255,460 +326,596 @@ class KrajekisSniperBot:
     def _open_positions(self) -> int:
         return sum(1 for m in self.markets.values() if m.active_trade)
 
-    async def _update_markets(self, session: aiohttp.ClientSession) -> None:
-        now = int(datetime.now(timezone.utc).timestamp())
-        base_5m = (now // 300) * 300
-        base_15m = (now // 900) * 900
-        sluglar = []
+    # ------------------------------------------------------------------
+    # Piyasa keşfi
+    # ------------------------------------------------------------------
+
+    async def _update_markets(self, sess: aiohttp.ClientSession) -> None:
+        now     = int(datetime.now(timezone.utc).timestamp())
+        base5   = (now // 300) * 300
+        base15  = (now // 900) * 900
+        slugs   = []
         for i in range(-1, 4):
-            sluglar.append(f"btc-updown-5m-{base_5m + (i * 300)}")
-            sluglar.append(f"btc-updown-15m-{base_15m + (i * 900)}")
+            slugs.append(f"btc-updown-5m-{base5  + i * 300}")
+            slugs.append(f"btc-updown-15m-{base15 + i * 900}")
 
-        for slug in sluglar:
+        for slug in slugs:
             try:
-                async with session.get(f"{self.net['gamma_url']}/events", params={"slug": slug}, timeout=aiohttp.ClientTimeout(total=5)) as r:
-                    if r.status == 200:
-                        data = await r.json()
-                        for ev in (data if isinstance(data, list) else [data]):
-                            if not ev or not isinstance(ev, dict): continue
-                            for m in ev.get("markets", []):
-                                self._process_market(m, ev)
-            except Exception: pass
+                url = f"{self.net['gamma_url']}/events"
+                async with sess.get(url, params={"slug": slug},
+                                    timeout=aiohttp.ClientTimeout(total=5)) as r:
+                    if r.status != 200:
+                        continue
+                    data = await r.json()
+                    for ev in (data if isinstance(data, list) else [data]):
+                        if not isinstance(ev, dict):
+                            continue
+                        for m in ev.get("markets", []):
+                            self._register_market(m, ev)
+            except Exception:
+                pass
 
-    def _process_market(self, m: dict, ev: dict) -> int:
-        if not isinstance(m, dict) or m.get("closed") or m.get("active") is False: return 0
-        mid = m.get("id")
-        end_str = m.get("endDate") or ""
-        try: end_t = datetime.fromisoformat(end_str.replace("Z", "+00:00")).replace(tzinfo=timezone.utc)
-        except Exception: return 0
+    def _register_market(self, m: dict, ev: dict) -> None:
+        if not isinstance(m, dict) or m.get("closed") or m.get("active") is False:
+            return
+        mid     = m.get("id")
+        end_str = m.get("endDate", "")
+        try:
+            end_t = datetime.fromisoformat(
+                end_str.replace("Z", "+00:00")
+            ).replace(tzinfo=timezone.utc)
+        except Exception:
+            return
 
-        if (end_t - datetime.now(timezone.utc)).total_seconds() < -60: return 0
-        cids   = _parse_clob_token_ids(m.get("clobTokenIds", []))
+        if (end_t - datetime.now(timezone.utc)).total_seconds() < -60:
+            return
+
+        cids   = _parse_token_ids(m.get("clobTokenIds", []))
         yes_id = cids[0] if len(cids) > 0 else ""
         no_id  = cids[1] if len(cids) > 1 else ""
 
-        if mid not in self.markets:
-            question = m.get("question") or ev.get("title") or "BTC Up/Down"
-            slug = m.get("slug", "") + question
-            horizon_min = 15 if "15m" in slug.lower() or "15 min" in slug.lower() else 5
-            ms_new = MarketState(mid, question, end_t, yes_id, no_id, horizon_min)
-            self.markets[mid] = ms_new
-            self._log(f"Radar [{horizon_min}m]: {question[:40]} Eklendi.", "INFO")
-            return 1
-        return 0
+        if mid in self.markets:
+            return
 
-    async def _fetch_chainlink_btc(self, session: aiohttp.ClientSession) -> float:
-        # V15.3 4x RPC Redundancy
-        _RPC_ENDPOINTS = [
-            "https://polygon-rpc.com",
-            "https://rpc.ankr.com/polygon",
-            "https://polygon.llamarpc.com",
-            "https://1rpc.io/matic"
-        ]
+        question    = m.get("question") or ev.get("title") or "BTC Up/Down"
+        slug_txt    = m.get("slug", "") + question
+        horizon_min = 15 if "15m" in slug_txt.lower() else 5
+        ms          = MarketState(mid, question, end_t, yes_id, no_id, horizon_min)
+        self.markets[mid] = ms
+        self._log(f"Radar [{horizon_min}m]: {question[:40]}", "INFO")
+
+    # ------------------------------------------------------------------
+    # Fiyat & TA
+    # ------------------------------------------------------------------
+
+    async def _fetch_chainlink(self, sess: aiohttp.ClientSession) -> float:
         payload = {
-            "jsonrpc": "2.0", "method": "eth_call",
-            "params": [{"to": "0xc907E116054Ad103354f2D350FD2514433D57F6f", "data": "0xfeaf968c"}, "latest"],
-            "id": int(time.time() * 1000)
+            "jsonrpc": "2.0",
+            "method":  "eth_call",
+            "params":  [{"to": _CHAINLINK_CONTRACT, "data": _CHAINLINK_DATA}, "latest"],
+            "id":      int(time.time() * 1000),
         }
-        for endpoint in _RPC_ENDPOINTS:
+        for rpc in _CHAINLINK_RPCS:
             try:
-                async with session.post(endpoint, json=payload, timeout=aiohttp.ClientTimeout(total=3)) as r:
+                async with sess.post(
+                    rpc, json=payload,
+                    timeout=aiohttp.ClientTimeout(total=3),
+                    ssl=False,
+                ) as r:
                     if r.status == 200:
-                        res = await r.json()
+                        res = await r.json(content_type=None)
                         hex_val = res.get("result", "")
                         if hex_val and len(hex_val) >= 130:
                             return int(hex_val[66:130], 16) / 1e8
-            except Exception: continue
+            except Exception:
+                continue
         return 0.0
 
-    async def _fetch_prices_and_ta(self, session: aiohttp.ClientSession) -> None:
-        cl_price = await self._fetch_chainlink_btc(session)
-        now_utc = datetime.now(timezone.utc)
-
-        if cl_price > 0:
-            self.prices["BTC_CHAINLINK"] = cl_price
-
+    async def _fetch_binance_klines(self, sess: aiohttp.ClientSession) -> None:
         try:
-            async with session.get(
-                "https://api.binance.com/api/v3/klines", params={"symbol": "BTCUSDT", "interval": "1m", "limit": "100"}, timeout=aiohttp.ClientTimeout(total=5)
+            params = {"symbol": "BTCUSDT", "interval": "1m", "limit": "100"}
+            async with sess.get(
+                "https://api.binance.com/api/v3/klines",
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=6),
+                ssl=False,
             ) as r:
-                if r.status == 200:
-                    df = pd.DataFrame(await r.json(), columns=['ts', 'open', 'high', 'low', 'close', 'vol', 'ct', 'qav', 'nt', 'tbv', 'tqv', 'ig'])
-                    for col in ("close", "high", "low", "vol"): df[col] = df[col].astype(float)
-                    self.prices["BTC_BINANCE"] = df['close'].iloc[-1]
+                if r.status != 200:
+                    return
+                raw = await r.json(content_type=None)
+                df  = pd.DataFrame(
+                    raw,
+                    columns=["ts","open","high","low","close","vol",
+                             "ct","qav","nt","tbv","tqv","ig"],
+                )
+                for col in ("close", "high", "low", "vol"):
+                    df[col] = df[col].astype(float)
 
-                    # BINANCE LOCK Fallback
-                    if self.prices["BTC_CHAINLINK"] == 0.0:
-                        self.prices["BTC_CHAINLINK"] = self.prices["BTC_BINANCE"]
+                self.btc_binance = float(df["close"].iloc[-1])
 
-                    df['EMA_21'] = df['close'].ewm(span=21, adjust=False).mean()
-                    df['EMA_50'] = df['close'].ewm(span=50, adjust=False).mean()
-                    delta = df['close'].diff()
-                    gain = delta.where(delta > 0, 0).ewm(alpha=1/14, adjust=False).mean()
-                    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
-                    df['RSI_14'] = 100 - (100 / (1 + gain / loss))
-                    tp = (df['high'] + df['low'] + df['close']) / 3
-                    df['VWAP'] = (df['vol'] * tp).cumsum() / df['vol'].cumsum()
-                    ema12 = df['close'].ewm(span=12, adjust=False).mean()
-                    ema26 = df['close'].ewm(span=26, adjust=False).mean()
-                    ml = ema12 - ema26
-                    df['MACD_Hist'] = ml - ml.ewm(span=9, adjust=False).mean()
+                # Chainlink gelmemişse Binance ile doldur
+                if self.btc_chainlink == 0.0:
+                    self.btc_chainlink = self.btc_binance
+                    self._log("BINANCE LOCK devrede (Chainlink 0)", "WARNING")
 
-                    last = df.iloc[-1]
-                    self.ta_data["BTC"] = {
-                        "vwap": float(last['VWAP']), "rsi": float(last['RSI_14']),
-                        "ema21": float(last['EMA_21']), "ema50": float(last['EMA_50']), "macd": float(last['MACD_Hist'])
-                    }
-        except Exception: pass
+                # Teknik analiz
+                df["EMA21"] = df["close"].ewm(span=21, adjust=False).mean()
+                df["EMA50"] = df["close"].ewm(span=50, adjust=False).mean()
 
-        # SETTLEMENT KILIDI
-        cl_now = self.prices["BTC_CHAINLINK"]
-        if cl_now > 0:
+                delta = df["close"].diff()
+                gain  = delta.where(delta > 0, 0).ewm(alpha=1/14, adjust=False).mean()
+                loss  = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
+                df["RSI"] = 100 - (100 / (1 + gain / loss))
+
+                tp           = (df["high"] + df["low"] + df["close"]) / 3
+                df["VWAP"]   = (df["vol"] * tp).cumsum() / df["vol"].cumsum()
+
+                ema12       = df["close"].ewm(span=12, adjust=False).mean()
+                ema26       = df["close"].ewm(span=26, adjust=False).mean()
+                macd_line   = ema12 - ema26
+                df["MACD"]  = macd_line - macd_line.ewm(span=9, adjust=False).mean()
+
+                last = df.iloc[-1]
+                self.ta = {
+                    "vwap":  float(last["VWAP"]),
+                    "rsi":   float(last["RSI"]),
+                    "ema21": float(last["EMA21"]),
+                    "ema50": float(last["EMA50"]),
+                    "macd":  float(last["MACD"]),
+                }
+        except Exception:
+            pass
+
+    async def _update_prices(self, sess: aiohttp.ClientSession) -> None:
+        cl = await self._fetch_chainlink(sess)
+        if cl > 0:
+            self.btc_chainlink = cl
+
+        await self._fetch_binance_klines(sess)
+
+        # Chainlink referans kilidi
+        now = datetime.now(timezone.utc)
+        if self.btc_chainlink > 0:
             for ms in list(self.markets.values()):
                 if ms.ref_chainlink == 0.0 and ms.secs_left > 0:
-                    lag_secs = (now_utc - ms.start_time).total_seconds()
-                    if lag_secs >= 0:
-                        ms.ref_chainlink = cl_now
-                        ms.ref_chainlink_ts = now_utc
-                        msg = "BINANCE LOCK" if cl_now == self.prices.get("BTC_BINANCE") else "REF LOCK"
-                        self._log(f"{msg} [{ms.horizon_min}m] | CL=${cl_now:,.0f}", "INFO")
+                    if (now - ms.start_time).total_seconds() >= 0:
+                        ms.ref_chainlink    = self.btc_chainlink
+                        ms.ref_chainlink_ts = now
+                        src = "BINANCE-LOCK" if self.btc_chainlink == self.btc_binance else "CHAINLINK"
+                        self._log(f"REF KILIT [{ms.horizon_min}m] {src} ${self.btc_chainlink:,.0f}", "INFO")
 
-        tasks = [self._fetch_book(session, ms) for ms in list(self.markets.values()) if ms.secs_left > 0 and ms.yes_id]
-        if tasks: await asyncio.gather(*tasks, return_exceptions=True)
+        # Order book
+        tasks = [
+            self._fetch_book(sess, ms)
+            for ms in self.markets.values()
+            if ms.secs_left > 0 and ms.yes_id
+        ]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _fetch_book(self, session: aiohttp.ClientSession, ms: MarketState) -> None:
+    async def _fetch_book(self, sess: aiohttp.ClientSession, ms: MarketState) -> None:
         try:
-            async with session.get(f"{self.net['clob_url']}/book", params={"token_id": ms.yes_id}, timeout=aiohttp.ClientTimeout(total=3)) as r:
-                if r.status == 200:
-                    d = await r.json()
-                    bids = sorted(d.get("bids", []), key=lambda x: float(x.get("price", 0)), reverse=True)
-                    asks = sorted(d.get("asks", []), key=lambda x: float(x.get("price", 0)))
-                    if bids and asks:
-                        ms.best_bid = float(bids[0]["price"])
-                        ms.best_ask = float(asks[0]["price"])
-        except Exception: pass
+            url = f"{self.net['clob_url']}/book"
+            async with sess.get(
+                url, params={"token_id": ms.yes_id},
+                timeout=aiohttp.ClientTimeout(total=3),
+                ssl=False,
+            ) as r:
+                if r.status != 200:
+                    return
+                d    = await r.json(content_type=None)
+                bids = sorted(d.get("bids", []), key=lambda x: float(x.get("price", 0)), reverse=True)
+                asks = sorted(d.get("asks", []), key=lambda x: float(x.get("price", 0)))
+                if bids and asks:
+                    ms.best_bid = float(bids[0]["price"])
+                    ms.best_ask = float(asks[0]["price"])
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Sinyal üretimi
+    # ------------------------------------------------------------------
 
     def _signal(self, ms: MarketState) -> str:
-        if ms.secs_left <= 0: return "BEKLE"
+        if ms.secs_left <= 0:
+            return "BITTI"
+        if not self.ta or pd.isna(self.ta.get("vwap", float("nan"))):
+            return "TA BEKLENIYOR"
 
-        ta = self.ta_data.get("BTC")
-        if not ta or pd.isna(ta["vwap"]): return "TA BEKLENIYOR"
-
-        px, vwap, rsi = self.prices["BTC_BINANCE"], ta["vwap"], ta["rsi"]
-        ema21, ema50, macd = ta["ema21"], ta["ema50"], ta["macd"]
-        cl_now = self.prices.get("BTC_CHAINLINK", px)
-
-        # Ortak Makas (Spread) Kontrolu
-        if ms.best_ask - ms.best_bid > float(self.strat.get("max_spread", 0.04)):
+        spread = ms.best_ask - ms.best_bid
+        if spread > float(self.strat.get("max_spread", 0.04)):
             return "GENIS MAKAS"
 
-        is_15m = ms.horizon_min == 15
+        px   = self.btc_binance
+        vwap = self.ta["vwap"]
+        rsi  = self.ta["rsi"]
+        e21  = self.ta["ema21"]
+        e50  = self.ta["ema50"]
+        macd = self.ta["macd"]
+        cl   = self.btc_chainlink
 
-        # --- BRAIN 1: YES (YUKARI) TREND ---
-        st_yes = float(self.strat.get("sweet_spot_15m_start" if is_15m else "sweet_spot_5m_start", 10.0))
-        en_yes = float(self.strat.get("sweet_spot_15m_end" if is_15m else "sweet_spot_5m_end", 5.0))
+        is_15m = (ms.horizon_min == 15)
 
-        if (en_yes <= ms.mins_left <= st_yes):
-            # V15.3 3/4 TA Skor Sistemi
-            up_score = 0
-            if px > vwap: up_score += 1
-            if ema21 > ema50: up_score += 1
-            if rsi < float(self.strat.get("rsi_overbought", 70)): up_score += 1
-            if macd > 0: up_score += 1
+        # --- Brain 1: YES (YUKARI) ---
+        yes_start = float(self.strat.get("sweet_spot_15m_start" if is_15m else "sweet_spot_5m_start", 10.0))
+        yes_end   = float(self.strat.get("sweet_spot_15m_end"   if is_15m else "sweet_spot_5m_end",    5.0))
 
-            min_score = int(self.strat.get("min_signal_score", 3))
-
-            if up_score >= min_score:
+        if yes_end <= ms.mins_left <= yes_start:
+            score = sum([
+                px > vwap,
+                e21 > e50,
+                rsi < float(self.strat.get("rsi_overbought", 70)),
+                macd > 0,
+            ])
+            if score >= int(self.strat.get("min_signal_score", 3)):
                 return "UP (LONG)"
 
-        # --- BRAIN 2: NO (ASAGI) LATE CONVERGENCE ---
-        no_st = float(self.strat.get("no_window_secs_start", 150.0)) / 60.0
-        no_en = float(self.strat.get("no_window_secs_end", 30.0)) / 60.0
+        # --- Brain 2: NO (ASAGI) ---
+        no_start_s = float(self.strat.get("no_window_secs_start", 150.0))
+        no_end_s   = float(self.strat.get("no_window_secs_end",    30.0))
+        no_start_m = no_start_s / 60.0
+        no_end_m   = no_end_s   / 60.0
 
-        if (no_en <= ms.mins_left <= no_st):
-            open_px = ms.ref_chainlink
-            if open_px > 0:
-                req_drop = float(self.strat.get("no_min_btc_drop_15m" if is_15m else "no_min_btc_drop_5m", 150.0 if is_15m else 80.0))
-                if (open_px - cl_now) >= req_drop:
-                    no_price = 1.0 - ms.best_bid
-                    if no_price <= float(self.strat.get("max_entry_no", 0.83)):
+        if no_end_m <= ms.mins_left <= no_start_m:
+            ref = ms.ref_chainlink
+            if ref > 0:
+                req_drop = float(self.strat.get(
+                    "no_min_btc_drop_15m" if is_15m else "no_min_btc_drop_5m",
+                    100.0 if is_15m else 60.0,
+                ))
+                if (ref - cl) >= req_drop:
+                    no_px = 1.0 - ms.best_bid
+                    if no_px <= float(self.strat.get("max_entry_no", 0.83)):
                         return "DN (LATE-SHORT)"
-                    else:
-                        return "PAHALI (NO)"
+                    return "PAHALI (NO)"
 
-        return "YAPI BOZUK"
+        return "BEKLE"
+
+    # ------------------------------------------------------------------
+    # Çıkış kontrolü
+    # ------------------------------------------------------------------
 
     def _check_exit(self, ms: MarketState) -> Tuple[bool, str, float, float]:
         t = ms.active_trade
-        if not t: return False, "", 0.0, 0.0
+        if not t:
+            return False, "", 0.0, 0.0
 
-        cur_poly = _safe_price(ms.best_bid if t.side == "YES" else 1.0 - ms.best_ask)
-        poly_move_pct = (cur_poly - t.entry_price) / t.entry_price
+        cur_poly = _clamp_price(ms.best_bid if t.side == "YES" else 1.0 - ms.best_ask)
+        move_pct = (cur_poly - t.entry_price) / t.entry_price
 
-        # --- BRAIN 1 (YES) ICIN CIKIS ---
         if t.side == "YES":
-            tp = float(self.strat.get("tp_pct_gain", 0.20))
-            sl = float(self.strat.get("sl_pct_loss", 0.15))
-            hard_sl = float(self.strat.get("hard_sl_pct", 0.25))
+            tp       = float(self.strat.get("tp_pct_gain",  0.20))
+            sl       = float(self.strat.get("sl_pct_loss",  0.15))
+            hard_sl  = float(self.strat.get("hard_sl_pct",  0.25))
 
-            if poly_move_pct >= tp:
-                pnl = (t.net_shares * cur_poly) - (t.raw_shares * t.entry_price)
+            if move_pct >= tp:
+                pnl = t.net_shares * cur_poly - t.raw_shares * t.entry_price
                 ms.sl_strikes = 0
                 return True, "TAKE_PROFIT", round(pnl, 4), cur_poly
 
-            if poly_move_pct <= -hard_sl:
-                pnl = (t.net_shares * cur_poly) - (t.raw_shares * t.entry_price)
+            if move_pct <= -hard_sl:
+                pnl = t.net_shares * cur_poly - t.raw_shares * t.entry_price
                 ms.sl_strikes = 0
                 return True, "STOP_LOSS", round(pnl, 4), cur_poly
 
-            if poly_move_pct <= -sl:
+            if move_pct <= -sl:
                 ms.sl_strikes += 1
                 if ms.sl_strikes >= 3:
-                    pnl = (t.net_shares * cur_poly) - (t.raw_shares * t.entry_price)
+                    pnl = t.net_shares * cur_poly - t.raw_shares * t.entry_price
                     ms.sl_strikes = 0
                     return True, "STOP_LOSS", round(pnl, 4), cur_poly
             else:
                 ms.sl_strikes = 0
 
-        # --- BRAIN 2 (NO) ICIN CIKIS ---
         elif t.side == "NO":
-            # Wick'lerden korunmak icin NO isleminde STOP-LOSS YOKTUR!
+            # NO pozisyonunda stop-loss yok (wick koruması)
             tp_no = 0.18
-            if poly_move_pct >= tp_no:
-                pnl = (t.net_shares * cur_poly) - (t.raw_shares * t.entry_price)
+            if move_pct >= tp_no:
+                pnl = t.net_shares * cur_poly - t.raw_shares * t.entry_price
                 return True, "TAKE_PROFIT (NO)", round(pnl, 4), cur_poly
 
         return False, "", 0.0, 0.0
+
+    # ------------------------------------------------------------------
+    # Analiz & emir
+    # ------------------------------------------------------------------
 
     async def _analyze(self, ms: MarketState) -> None:
         if self._daily_limit_hit:
             ms.signal = "GUNLUK LIMIT"
             return
 
-        if ms.has_traded and not ms.active_trade: return
-
+        # Açık pozisyon çıkış kontrolü
         if ms.active_trade:
             ok, reason, pnl, exit_px = self._check_exit(ms)
             if ok:
-                await self.order_mgr.place_sell(ms.active_trade.token_id, exit_px, ms.active_trade.net_shares)
-                self._record(ms, pnl, reason, exit_px, btc_ref_used=ms.ref_chainlink, ref_src="MARKET_OPEN" if ms.ref_chainlink > 0 else "NONE")
+                await self.orders.place_sell(ms.active_trade.token_id, exit_px, ms.active_trade.net_shares)
+                self._record(ms, pnl, reason, exit_px)
+                self._log(f"CIKIS | {reason} | PnL: ${pnl:+.3f}", "TRADE")
                 ms.has_traded = True
-                self._log(f"CIKIS | {reason} | Net PnL: ${pnl:+.3f}", "TRADE")
+            return
+
+        # Zaten işlem yapıldıysa tekrar girme
+        if ms.has_traded:
             return
 
         ms.signal = self._signal(ms)
-        if "UP" not in ms.signal and "DN" not in ms.signal: return
+        if "UP" not in ms.signal and "DN" not in ms.signal:
+            return
 
+        # Pozisyon limiti
         max_pos = int(self.risk.get("max_open_positions", 2))
         if self._open_positions >= max_pos:
             ms.signal = "POS DOLU"
             return
 
-        side = "YES" if "UP" in ms.signal else "NO"
+        side     = "YES" if "UP" in ms.signal else "NO"
         token_id = ms.yes_id if side == "YES" else ms.no_id
-        entry = ms.best_ask if side == "YES" else 1.0 - ms.best_bid
+        entry    = ms.best_ask if side == "YES" else 1.0 - ms.best_bid
 
-        min_e = float(self.strat.get("min_entry_price", 0.65))
+        min_e = float(self.strat.get("min_entry_price", 0.52))
         max_e = float(self.strat.get("max_entry_yes" if side == "YES" else "max_entry_no", 0.87))
-        if entry < min_e or entry > max_e or not token_id: return
+        if not (min_e <= entry <= max_e) or not token_id:
+            return
 
-        now_ts = datetime.now(timezone.utc).timestamp()
+        # FOK cooldown
+        now_ts = time.time()
         fok_cd = float(self.strat.get("fok_cooldown", 20))
-        if now_ts - ms.last_buy_attempt < fok_cd: return
+        if now_ts - ms.last_buy_ts < fok_cd:
+            return
 
-        stake = float(self.risk["stake_usd"])
-        _, raw_shares = _safe_amounts(entry, stake)
-        net_shares = raw_shares - _fee_shares(entry, raw_shares)
+        stake      = float(self.risk["stake_usd"])
+        _, raw_sh  = _safe_amounts(entry, stake)
+        net_sh     = raw_sh - _fee_shares(entry, raw_sh)
 
-        ms.last_buy_attempt = now_ts
-        oid = await self.order_mgr.place_buy(token_id, entry, raw_shares)
+        ms.last_buy_ts = now_ts
+        oid = await self.orders.place_buy(token_id, entry, stake)
+
         if oid and not oid.startswith("ERR:"):
-            chainlink_px = self.prices.get("BTC_CHAINLINK", self.prices.get("BTC_BINANCE", 0.0))
-            ms.active_trade = LiveTrade(
-                market_id=ms.mid, token_id=token_id, side=side,
-                entry_price=entry, raw_shares=raw_shares, net_shares=net_shares,
-                stake=stake, entry_asset_px=chainlink_px, order_id=oid
+            ms.active_trade = Trade(
+                market_id  = ms.mid,
+                token_id   = token_id,
+                side       = side,
+                entry_price= entry,
+                raw_shares = raw_sh,
+                net_shares = net_sh,
+                stake      = stake,
+                entry_btc_px = self.btc_chainlink,
+                order_id   = oid,
             )
-            self._log(f"SNIPE ({side}) | Fiyat: {entry:.3f} | Ref Link: ${chainlink_px:,.0f}", "PAPER" if not self.live_mode else "LIVE")
-            appr = await self.order_mgr.approve_token(token_id)
-            if appr not in ("PAPER",): self._log(f"Approval: {appr[:60]}", "INFO")
+            mode = "PAPER" if not self.live_mode else "LIVE"
+            self._log(
+                f"SNIPE ({side}) | {entry:.3f} | BTC ${self.btc_chainlink:,.0f} | {oid}",
+                mode,
+            )
         else:
-            self._log(f"FOK iptal ({int(fok_cd)}s bekle) | {oid}", "WARNING")
+            self._log(f"FOK iptal (cd:{fok_cd:.0f}s) | {oid}", "WARNING")
+
+    # ------------------------------------------------------------------
+    # Kapanış
+    # ------------------------------------------------------------------
 
     async def _settle(self, mid: str) -> None:
         ms = self.markets.get(mid)
-        if not ms: return
+        if not ms:
+            return
+
         if ms.active_trade:
-            t = ms.active_trade
-            btc_now = self.prices.get("BTC_CHAINLINK", 0.0)
-            btc_ref = ms.ref_chainlink if ms.ref_chainlink > 0 else t.entry_asset_px
-
-            if btc_now > 0 and abs(btc_now - btc_ref) < 0.01:
-                self._log(f"UYARI: Chainlink stale olabilir! ref={btc_ref:,.2f} exit={btc_now:,.2f}", "WARNING")
-
-            ref_src = "MARKET_OPEN" if ms.ref_chainlink > 0 else "ENTRY_FALLBACK"
+            t       = ms.active_trade
+            btc_now = self.btc_chainlink
+            btc_ref = ms.ref_chainlink or t.entry_btc_px
 
             if btc_ref > 0 and btc_now > 0:
                 btc_up = btc_now >= btc_ref
-                won = (btc_up and t.side == "YES") or (not btc_up and t.side == "NO")
+                won    = (btc_up and t.side == "YES") or (not btc_up and t.side == "NO")
             else:
-                cur_poly = _safe_price(ms.best_bid if t.side == "YES" else 1.0 - ms.best_ask)
-                won = cur_poly > t.entry_price
-                ref_src = "ORDERBOOK_FALLBACK"
+                cur_poly = _clamp_price(ms.best_bid if t.side == "YES" else 1.0 - ms.best_ask)
+                won      = cur_poly > t.entry_price
 
             if won:
-                pnl = round(t.net_shares * 1.0 - t.raw_shares * t.entry_price, 4)
+                pnl    = round(t.net_shares * 1.0 - t.raw_shares * t.entry_price, 4)
                 reason = "SETTL_WIN"
             else:
-                pnl = round(-(t.raw_shares * t.entry_price), 4)
+                pnl    = round(-(t.raw_shares * t.entry_price), 4)
                 reason = "SETTL_LOSS"
 
             exit_px = 1.0 if won else 0.0
-            self._record(ms, pnl, reason, exit_px, btc_ref, ref_src)
-            self._log(f"HAKEM KARARI ({t.side}) | {reason} | Net PnL: ${pnl:+.3f}", "TRADE" if won else "WARNING")
+            self._record(ms, pnl, reason, exit_px)
+            self._log(
+                f"HAKEM ({t.side}) | {reason} | PnL: ${pnl:+.3f}",
+                "TRADE" if won else "WARNING",
+            )
 
         del self.markets[mid]
 
-    def _record(self, ms: MarketState, pnl: float, rtype: str, exit_px: float, btc_ref_used: float = 0.0, ref_src: str = "") -> None:
+    # ------------------------------------------------------------------
+    # İşlem kaydı
+    # ------------------------------------------------------------------
+
+    def _record(self, ms: MarketState, pnl: float, rtype: str, exit_px: float) -> None:
         t = ms.active_trade
-        if not t: return
+        if not t:
+            return
 
         self.session_pnl += pnl
-        self.daily_pnl += pnl
+        self.daily_pnl   += pnl
         self.trades += 1
-        if pnl > 0: self.wins += 1
-        else: self.losses += 1
+        if pnl > 0:
+            self.wins += 1
+        else:
+            self.losses += 1
 
-        log_data = {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "mid": ms.mid,
-            "side": t.side,
-            "horizon_min": ms.horizon_min,
-            "entry_price": t.entry_price,
-            "exit_price": exit_px,
-            "raw_shares": t.raw_shares,
-            "net_shares": t.net_shares,
-            "pnl": round(pnl, 4),
-            "result": rtype,
-            "btc_chainlink_market_open": ms.ref_chainlink,
-            "btc_chainlink_entry": t.entry_asset_px,
-            "btc_chainlink_ref_used": btc_ref_used,
-            "ref_source": ref_src
+        row = {
+            "ts":           datetime.now(timezone.utc).isoformat(),
+            "mid":          ms.mid,
+            "side":         t.side,
+            "horizon_min":  ms.horizon_min,
+            "entry_price":  t.entry_price,
+            "exit_price":   exit_px,
+            "raw_shares":   t.raw_shares,
+            "net_shares":   t.net_shares,
+            "pnl":          pnl,
+            "result":       rtype,
+            "btc_ref":      ms.ref_chainlink,
+            "btc_entry":    t.entry_btc_px,
         }
         try:
-            with open(self.cfg.get("memory_file", "trades_paper.jsonl"), "a", encoding="utf-8") as f:
-                f.write(json.dumps(log_data) + "\n")
-        except: pass
+            mem = self.cfg.get("memory_file", "trades_paper.jsonl")
+            with open(mem, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row) + "\n")
+        except Exception:
+            pass
 
         ms.active_trade = None
 
+    # ------------------------------------------------------------------
+    # Ekran
+    # ------------------------------------------------------------------
+
     def _render(self) -> Layout:
-        lay = Layout()
-        lay.split_column(Layout(name="h", size=3), Layout(name="b", ratio=1), Layout(name="l", size=14))
-        lay["b"].split_row(Layout(name="mt", ratio=4), Layout(name="s", size=38))
+        wr = (self.wins / self.trades * 100) if self.trades else 0.0
 
-        btc_binance = self.prices.get("BTC_BINANCE", 0.0)
-        btc_chainlink = self.prices.get("BTC_CHAINLINK", 0.0)
-        ta_btc = self.ta_data.get("BTC", {})
-        vwap = ta_btc.get("vwap", 0.0)
-        rsi = ta_btc.get("rsi", 0.0)
-
-        wr = (self.wins / self.trades * 100) if self.trades > 0 else 0.0
-
+        # Başlık
         hdr = (
-            f"[bold white]KRAJEKIS V15.3 (ULTIMATE HYBRID)[/bold white] "
+            f"[bold white]KRAJEKIS V16.0[/] "
             f"{'[bold red]CANLI[/bold red]' if self.live_mode else '[dim]PAPER[/dim]'} | "
-            f"Link:[bold green]${btc_chainlink:,.0f}[/bold green] (Bin:[cyan]${btc_binance:,.0f}[/cyan]) | "
-            f"Net PnL:[{'green' if self.session_pnl >= 0 else 'red'}]${self.session_pnl:+.3f}[/] | "
-            f"W/L:[green]{self.wins}[/green]/[red]{self.losses}[/red]({wr:.0f}%)"
+            f"ChainLink:[bold green]${self.btc_chainlink:,.0f}[/] "
+            f"(Bin:[cyan]${self.btc_binance:,.0f}[/cyan]) | "
+            f"PnL:[{'green' if self.session_pnl >= 0 else 'red'}]${self.session_pnl:+.3f}[/] | "
+            f"W/L:[green]{self.wins}[/]/[red]{self.losses}[/]({wr:.0f}%)"
         )
+
+        lay = Layout()
+        lay.split_column(
+            Layout(name="h", size=3),
+            Layout(name="b", ratio=1),
+            Layout(name="l", size=14),
+        )
+        lay["b"].split_row(Layout(name="mt", ratio=4), Layout(name="s", size=38))
         lay["h"].update(Panel(Text.from_markup(hdr), border_style="cyan"))
 
+        # Piyasa tablosu
         tbl = Table(box=box.MINIMAL_DOUBLE_HEAD, expand=True)
         for col in ["Zaman", "BTC Pazar", "YES", "NO", "Sinyal", "Pozisyon"]:
             tbl.add_column(col, no_wrap=True)
 
         for ms in sorted(self.markets.values(), key=lambda x: x.secs_left):
-            if ms.secs_left <= 0: continue
-
-            pos_str = ""
-            row_style = "white"
+            if ms.secs_left <= 0:
+                continue
+            pos_str    = ""
+            row_style  = "white"
             if ms.active_trade:
-                t = ms.active_trade
-                pos_str = f"{t.side}@{t.entry_price:.2f}"
+                t         = ms.active_trade
+                pos_str   = f"{t.side}@{t.entry_price:.2f}"
                 row_style = "green"
             elif ms.has_traded:
-                pos_str = "[dim]KAPANDI[/dim]"
+                pos_str   = "[dim]KAPANDI[/dim]"
                 row_style = "dim"
 
-            time_str = f"[{ms.horizon_min}m] {int(ms.mins_left)}m {int(ms.secs_left%60)}s"
-
+            time_str = f"[{ms.horizon_min}m] {int(ms.mins_left)}m {int(ms.secs_left % 60)}s"
             tbl.add_row(
                 time_str, ms.short_name,
-                f"{ms.best_ask:.2f}", f"{1.0-ms.best_bid:.2f}",
-                ms.signal, pos_str, style=row_style
+                f"{ms.best_ask:.2f}", f"{1.0 - ms.best_bid:.2f}",
+                ms.signal, pos_str,
+                style=row_style,
             )
 
-        lay["mt"].update(Panel(tbl, title="Aktif Radar Pazarlari (5m & 15m)", border_style="cyan"))
+        lay["mt"].update(Panel(tbl, title="Aktif Radar Pazarlari", border_style="cyan"))
 
-        stat = (
-            f"[bold cyan]HYBRID BEYIN (V15.3)[/bold cyan]\n"
-            f"  [green]YES (YUKARI):[/green] Erken Gir, TP Al\n"
-            f"  TA Skoru: En az {self.strat.get('min_signal_score', 3)}/4 Onay\n"
-            f"  [red]NO (ASAGI):[/red] Late Gir, Max 0.83\n"
-            f"  NO Stop-Loss: KAPALI (Wick Korumasi)\n\n"
-            f"[bold cyan]ORACLE (Chainlink)[/bold cyan]\n"
-            f"  Chainlink: ${btc_chainlink:,.0f}\n"
-            f"  Binance:   ${btc_binance:,.0f}\n"
-            f"  Fark: ${abs(btc_chainlink - btc_binance):,.0f}\n\n"
-            f"[bold red]KORUMA ZIRHI[/bold red]\n"
-            f"  Makas Limit: {self.strat.get('max_spread', 0.04)*100:.0f} Cent\n"
-            f"  4x RPC: AKTIF\n\n"
+        # Sağ panel
+        ta    = self.ta
+        vwap  = ta.get("vwap", 0.0)
+        rsi   = ta.get("rsi",  0.0)
+        stat  = (
+            f"[bold cyan]HYBRID BEYIN (V16.0)[/bold cyan]\n"
+            f"  [green]YES:[/green] Erken Gir / TA {self.strat.get('min_signal_score',3)}/4\n"
+            f"  [red]NO:[/red]  Late Gir / No SL\n\n"
+            f"[bold cyan]ORACLE[/bold cyan]\n"
+            f"  Chainlink: ${self.btc_chainlink:,.0f}\n"
+            f"  Binance:   ${self.btc_binance:,.0f}\n"
+            f"  Fark: ${abs(self.btc_chainlink - self.btc_binance):,.0f}\n"
+            f"  VWAP: ${vwap:,.0f}  RSI: {rsi:.1f}\n\n"
             f"[bold cyan]KASA[/bold cyan]\n"
             f"  Gunluk: [{'green' if self.daily_pnl>=0 else 'red'}]${self.daily_pnl:+.3f}[/]\n"
-            f"  Toplam: {self.trades} islem | WR: [green]{wr:.1f}%[/green]"
+            f"  Toplam: {self.trades} islem | WR: {wr:.1f}%"
         )
-        lay["s"].update(Panel(Text.from_markup(stat), title="Krajekis Analiz", border_style="yellow"))
-        lay["l"].update(Panel(Text.from_markup("\n".join(list(self.logs))), title="Sistem Log [V15.3]", border_style="cyan"))
+        lay["s"].update(Panel(Text.from_markup(stat), title="Analiz", border_style="yellow"))
+        lay["l"].update(Panel(
+            Text.from_markup("\n".join(self.logs)),
+            title="Sistem Logu",
+            border_style="cyan",
+        ))
         return lay
 
-    async def main_run(self) -> None:
-        connector = aiohttp.TCPConnector(limit=20, resolver=aiohttp.ThreadedResolver(), family=socket.AF_INET)
-        async with aiohttp.ClientSession(connector=connector) as session:
+    # ------------------------------------------------------------------
+    # Ana döngü
+    # ------------------------------------------------------------------
 
+    async def run(self) -> None:
+        ssl_ctx   = ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode    = ssl.CERT_NONE
+
+        connector = aiohttp.TCPConnector(
+            family=socket.AF_INET,
+            ssl=ssl_ctx,
+            limit=20,
+            resolver=aiohttp.ThreadedResolver(),
+        )
+
+        async with aiohttp.ClientSession(connector=connector) as sess:
             if self.live_mode:
-                appr_result = await self.order_mgr.ensure_approvals()
-                self._log(f"Live Onay Kontrolu: {appr_result}", "INFO")
+                appr = await self.orders.approve_collateral()
+                self._log(f"Onay Kontrolu: {appr}", "INFO")
 
-            self._log("V15.3 ULTIMATE Hybrid Basliyor...", "PAPER" if not self.live_mode else "LIVE")
+            mode = "PAPER" if not self.live_mode else "LIVE"
+            self._log("V16.0 basliyor...", mode)
+
             with Live(self._render(), refresh_per_second=2, screen=True) as live:
                 cycle = 0
                 while self._running:
                     self._check_daily_reset()
-                    if cycle % 15 == 0: await self._update_markets(session)
-                    await self._fetch_prices_and_ta(session)
+
+                    if cycle % 15 == 0:
+                        await self._update_markets(sess)
+
+                    await self._update_prices(sess)
 
                     for ms in list(self.markets.values()):
-                        if ms.secs_left > 0: await self._analyze(ms)
-                        else: await self._settle(ms.mid)
+                        if ms.secs_left > 0:
+                            await self._analyze(ms)
+                        else:
+                            await self._settle(ms.mid)
 
                     live.update(self._render())
                     await asyncio.sleep(2)
                     cycle += 1
 
         if self.live_mode:
-            await self.order_mgr.cancel_all()
+            await self.orders.cancel_all()
 
+
+# ---------------------------------------------------------------------------
+# Giriş
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     cfg_path = sys.argv[1] if len(sys.argv) > 1 else "config.json"
-    try: cfg = load_config(cfg_path)
-    except FileNotFoundError: sys.exit(1)
+    try:
+        cfg = load_config(cfg_path)
+    except FileNotFoundError as e:
+        print(e)
+        sys.exit(1)
 
-    bot = KrajekisSniperBot(cfg)
+    bot = SniperBot(cfg)
+
     if bot.live_mode:
-        ans = input("CANLI PARA modunda. Devam? [evet/hayir]: ").strip().lower()
+        ans = input("CANLI PARA modu! Devam etmek istiyor musun? [evet/hayir]: ").strip().lower()
         if ans not in ("evet", "e", "yes", "y"):
+            print("Iptal edildi.")
             sys.exit(0)
-    try: asyncio.run(bot.main_run())
-    except KeyboardInterrupt: pass
+
+    try:
+        asyncio.run(bot.run())
+    except KeyboardInterrupt:
+        pass
