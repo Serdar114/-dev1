@@ -525,7 +525,11 @@ class KrajekisSniperBot:
         backoff = 1.0
         logged  = False
 
-        connector = aiohttp.TCPConnector(family=socket.AF_INET, limit=4)
+        connector = aiohttp.TCPConnector(
+            family=socket.AF_INET,
+            resolver=aiohttp.ThreadedResolver(),
+            limit=4,
+        )
 
         async with aiohttp.ClientSession(connector=connector) as sess:
             while self._running:
@@ -572,7 +576,11 @@ class KrajekisSniperBot:
         _DATA     = "0xfeaf968c"
         backoff   = 1.0
 
-        connector = aiohttp.TCPConnector(family=socket.AF_INET, limit=4)
+        connector = aiohttp.TCPConnector(
+            family=socket.AF_INET,
+            resolver=aiohttp.ThreadedResolver(),
+            limit=4,
+        )
 
         async with aiohttp.ClientSession(connector=connector) as sess:
             while self._running:
