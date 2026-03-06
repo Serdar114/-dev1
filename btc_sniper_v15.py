@@ -1,31 +1,43 @@
 #!/usr/bin/env python3
 """
-Polymarket Krajekis Auto-Sniper V15.5 (RTDS EDITION)
-=====================================================
-  V15.5 değişiklikleri (Adım 1 — RTDS WebSocket Entegrasyonu):
-  + _rtds_binance_ws():   Binance aggTrade WebSocket — main_run'u BLOKLAMAZ,
-                          asyncio background task olarak çalışır, auto-reconnect
-                          (exp. backoff 1s→60s). BTC fiyatını self.prices["BTC_BINANCE"]
-                          ve ts_src_ms'yi self.prices_ts["BTC_BINANCE_ts_src_ms"] a yazar.
-  + _rtds_chainlink_ws(): Polygon eth_subscribe/logs (AnswerUpdated event) —
-                          self.prices["BTC_CHAINLINK"] ve ts_src_ms anlık güncelleme,
-                          auto-reconnect + multi-endpoint fallback.
-  + prices_ts dict:       Her fiyat güncellemesinde ts_src_ms (kaynak zaman damgası, ms)
-                          saklanır — Adım 4 senkronizasyon testi için gerekli.
-  + _record():            ts_src_ms_chainlink_entry, ts_src_ms_chainlink_exit,
-                          ts_src_ms_binance_exit alanları JSONL log kaydına eklendi.
-  + LiveTrade:            entry_ts_src_ms alanı eklendi.
-  + _fetch_prices_and_ta(): RTDS'den taze veri varsa (< 30s) HTTP Chainlink/Binance
-                            fiyatı üzerine YAZMAz; TA kline verisi hâlâ HTTP'den çekilir.
-  + _render():            RTDS bağlantı durumu (BN/CL ✓/✗) header'a eklendi.
+Polymarket Krajekis Auto-Sniper V15.6 (R/R + SYNC EDITION)
+===========================================================
+  V15.6 değişiklikleri (Adım 2/3/4):
+
+  ADIM 2 — Fee Kalibrasyonu:
+  + _calc_fee_usd(): Her trade için gerçek fee maliyetini USD olarak hesaplar.
+  + _validate_entry_edge(): Giriş öncesi minimum net kâr kontrolü (fee dahil).
+    min_edge_usd config param'ı ile kontrol edilir (default $0.25).
+  + _record(): fee_usd, net_profit_if_tp alanları JSONL kaydına eklendi.
+
+  ADIM 3 — Risk/Ödül Düzeltmesi (kritik):
+  + _check_exit(): NO tradelerine SL eklendi — hard_sl_no_pct (default 0.30).
+    Önceki sürümde NO tradeleri ASLA erken kapanmıyordu → SETTL_LOSS = full stake.
+    Artık NO trade %30 aleyhte hareket ederse kesilir (max kayıp ~$1.5 vs -$4.95).
+  + "Let YES Settle" modu: let_yes_settle_secs (default 45s) — YES trade kârlıyken
+    ve settlement'a yakınsa TP almaz, 1.0'da settle olmasını bekler.
+    TP=$1.0 yerine SETTL_WIN=$3.5+ hedeflenir.
+  + R/R kalite kontrolü: min_rr_ratio (default 0.35) — beklenen kâr/max kayıp oranı
+    bu eşiğin altındaysa trade reddedilir.
+
+  ADIM 4 — Senkronizasyon Testi (ts_src_ms kullanımı):
+  + _validate_price_sync(): Giriş öncesi çalışır. Şunları kontrol eder:
+    1. Chainlink fiyatı Binance'den max_cl_deviation_pct (%6) fazla sapıyorsa
+       reddet (87492 anomalisi gibi hatalı Chainlink verisini engeller).
+    2. Chainlink ts_src_ms max_cl_staleness_ms (30s) eskiyse reddet.
+    3. BN-CL timestamp farkı > 60s ise uyar (senkronizasyon sorunu).
+  + _record(): ts_latency_ms (BN-CL kaynak zaman damgası farkı), sync_ok, cl_deviation_pct
+    alanları JSONL kaydına eklendi — Step 4 analizi için.
+
+  V15.5 değişiklikleri (Adım 1 — RTDS WebSocket):
+  + _rtds_binance_ws() / _rtds_chainlink_ws(): background task, auto-reconnect.
+  + prices_ts dict: ts_src_ms kaynak zaman damgaları.
+  + _fetch_prices_and_ta(): RTDS taze ise HTTP fiyatını ezmez.
 
   V15.4 değişiklikleri:
   + BRAIN 1 (YES): Skor tabanli sinyal — 4 TA kosulundan en az 3'u zorunlu
-  + BRAIN 1 (YES): Son 3 mumun hepsinin yukselis (close>open) sart — momentum filtresi
-  + BRAIN 2 (NO):  Oncelik kazandi — ayni anda YES de yaniyorsa NO alinir
-  + Brain 2 NO esikleri dusuruldu: 5m $80->$60 | 15m $150->$100 (daha fazla NO firsati)
-  + max_open_positions: 1->3 (saatte 5-7 giris hedefi)
-  + min_signal_score: 2->3 (YES icin daha yuksek kalite bari)
+  + BRAIN 2 (NO):  Oncelik kazandi, NO esikleri dusuruldu
+  + max_open_positions: 3 | min_signal_score: 3
 """
 import sys
 import asyncio
@@ -93,8 +105,28 @@ def _safe_amounts(price: float, stake: float) -> Tuple[float, float]:
 
 
 def _calculate_fee_shares(price: float, raw_shares: float) -> float:
+    """Polymarket CLOB taker fee: fee_shares = raw * 0.25 * (p*(1-p))^2"""
     p = max(0.01, min(0.99, price))
     return raw_shares * 0.25 * (p * (1.0 - p)) ** 2
+
+
+def _calc_fee_usd(price: float, raw_shares: float) -> float:
+    """
+    ADIM 2 — Fee USD maliyeti.
+    Fee share'ler settlement'ta 1.0 değerinde ödendiği için fee_usd = fee_shares * 1.0.
+    """
+    return _calculate_fee_shares(price, raw_shares)
+
+
+def _calc_net_profit_if_tp(entry: float, raw_shares: float, tp_pct: float) -> float:
+    """
+    ADIM 2 — TP'ye ulaşıldığında fee sonrası net kâr.
+    exit_price = entry * (1 + tp_pct)
+    pnl = net_shares * exit_price - raw_shares * entry
+    """
+    net_shares = raw_shares - _calculate_fee_shares(entry, raw_shares)
+    exit_price = min(0.99, entry * (1.0 + tp_pct))
+    return net_shares * exit_price - raw_shares * entry
 
 
 @dataclass
@@ -818,6 +850,93 @@ class KrajekisSniperBot:
 
         return True
 
+    # ------------------------------------------------------------------ ADIM 2: fee / edge
+
+    def _validate_entry_edge(self, entry: float, raw_shares: float, side: str) -> bool:
+        """
+        ADIM 2 — Fee sonrası minimum net kâr kontrolü.
+        TP hedefine ulaşıldığında fee dahil kâr < min_edge_usd ise reddeder.
+        """
+        min_edge  = float(self.strat.get("min_edge_usd", 0.25))
+        tp_yes    = float(self.strat.get("tp_pct_gain", 0.20))
+        tp_no     = float(self.strat.get("tp_pct_gain_no", tp_yes))
+        tp        = tp_no if side == "NO" else tp_yes
+        net_pnl   = _calc_net_profit_if_tp(entry, raw_shares, tp)
+        if net_pnl < min_edge:
+            self._log(
+                f"EDGE RED: entry={entry:.3f} tp_pnl=${net_pnl:.3f} < min ${min_edge:.2f}",
+                "WARNING",
+            )
+            return False
+        return True
+
+    # ------------------------------------------------------------------ ADIM 4: sync
+
+    def _validate_price_sync(self) -> Tuple[bool, str]:
+        """
+        ADIM 4 — Giriş öncesi fiyat senkronizasyon kontrolü.
+        Şunları reddeder:
+          1. Chainlink fiyatı Binance'den sapıyorsa (87492 anomalisi gibi).
+          2. Chainlink ts_src_ms çok eskiyse (stale data).
+        Döner: (geçerli_mi, red_nedeni)
+        """
+        cl    = self.prices.get("BTC_CHAINLINK", 0.0)
+        bn    = self.prices.get("BTC_BINANCE",   0.0)
+        now_ms = time.time() * 1000
+
+        if cl <= 0 or bn <= 0:
+            return True, ""   # veri yoksa geç — diğer filtreler yakalar
+
+        # 1. Fiyat sapması kontrolü (87492 anomalisi gibi hatalı CL verisini engeller)
+        max_dev = float(self.strat.get("max_cl_deviation_pct", 0.06))
+        deviation = abs(cl - bn) / bn
+        if deviation > max_dev:
+            msg = f"SYNC RED: CL=${cl:,.0f} BN=${bn:,.0f} sapma=%{deviation*100:.1f}"
+            self._log(msg, "WARNING")
+            return False, msg
+
+        # 2. Chainlink ts_src_ms tazelik kontrolü
+        cl_ts_ms  = self.prices_ts.get("BTC_CHAINLINK_ts_src_ms", 0)
+        max_stale = float(self.strat.get("max_cl_staleness_ms", 30_000))
+        cl_age_ms = now_ms - cl_ts_ms if cl_ts_ms > 0 else 999_999
+        if cl_ts_ms > 0 and cl_age_ms > max_stale:
+            msg = f"SYNC RED: CL veri eskimiş ({cl_age_ms/1000:.0f}s)"
+            self._log(msg, "WARNING")
+            return False, msg
+
+        # 3. BN-CL timestamp farkı uyarısı (kayıt için, red değil)
+        bn_ts_ms = self.prices_ts.get("BTC_BINANCE_ts_src_ms", 0)
+        if bn_ts_ms > 0 and cl_ts_ms > 0:
+            latency = abs(bn_ts_ms - cl_ts_ms)
+            if latency > 60_000:
+                self._log(f"SYNC UYARI: BN-CL timestamp farki {latency/1000:.0f}s", "WARNING")
+
+        return True, ""
+
+    # ------------------------------------------------------------------ ADIM 3: R/R
+
+    def _calc_rr_ratio(self, entry: float, raw_shares: float, side: str) -> float:
+        """
+        ADIM 3 — Beklenen R/R oranı hesabı.
+        R/R = net_profit_at_tp / max_loss_at_sl
+        """
+        tp_yes = float(self.strat.get("tp_pct_gain",     0.20))
+        tp_no  = float(self.strat.get("tp_pct_gain_no",  tp_yes))
+        sl_yes = float(self.strat.get("hard_sl_pct",     0.25))
+        sl_no  = float(self.strat.get("hard_sl_no_pct",  0.30))
+
+        tp = tp_no   if side == "NO" else tp_yes
+        sl = sl_no   if side == "NO" else sl_yes
+
+        net_shares = raw_shares - _calculate_fee_shares(entry, raw_shares)
+        profit = _calc_net_profit_if_tp(entry, raw_shares, tp)
+
+        exit_sl  = max(0.01, entry * (1.0 - sl))
+        max_loss = abs(net_shares * exit_sl - raw_shares * entry)
+        if max_loss <= 0:
+            return 99.0
+        return profit / max_loss
+
     # ------------------------------------------------------------------ cikis
 
     def _check_exit(self, ms: MarketState) -> Tuple[bool, str, float, float]:
@@ -825,21 +944,49 @@ class KrajekisSniperBot:
         if not t:
             return False, "", 0.0, 0.0
 
-        tp      = float(self.strat.get("tp_pct_gain", 0.20))
-        sl      = float(self.strat.get("sl_pct_loss", 0.15))
-        hard_sl = float(self.strat.get("hard_sl_pct", 0.25))
+        tp_yes     = float(self.strat.get("tp_pct_gain",       0.20))
+        tp_no      = float(self.strat.get("tp_pct_gain_no",    tp_yes))
+        sl         = float(self.strat.get("sl_pct_loss",       0.15))
+        hard_sl    = float(self.strat.get("hard_sl_pct",       0.25))
+        # ADIM 3: NO icin ayri (daha genis) hard SL esigi
+        hard_sl_no = float(self.strat.get("hard_sl_no_pct",    0.30))
+
+        tp = tp_no if t.side == "NO" else tp_yes
 
         cur_poly = _safe_price(ms.best_bid if t.side == "YES" else 1.0 - ms.best_ask)
         move_pct = (cur_poly - t.entry_price) / t.entry_price
 
+        # --- ADIM 3: "Let YES Settle" modu ---
+        # YES trade karliyla settlement'a cok yakinsa TP almaz, 1.0'da settle olur.
+        let_settle_secs    = float(self.strat.get("let_yes_settle_secs",           45.0))
+        let_settle_min_pct = float(self.strat.get("let_yes_settle_min_profit_pct", 0.15))
+        if (t.side == "YES"
+                and let_settle_secs > 0
+                and ms.secs_left < let_settle_secs
+                and move_pct >= let_settle_min_pct):
+            return False, "", 0.0, 0.0
+
+        # --- Take Profit ---
         if move_pct >= tp:
             pnl = (t.net_shares * cur_poly) - (t.raw_shares * t.entry_price)
             ms.sl_strikes = 0
             return True, "TAKE_PROFIT", round(pnl, 4), cur_poly
 
+        # --- ADIM 3: NO Stop Loss (KRITIK — onceki versiyonda yoktu!) ---
+        # SETTL_LOSS'ta -$4.95 kaybetmek yerine SL ile ~-$1.5 kaybeder.
         if t.side == "NO":
+            if move_pct <= -hard_sl_no:
+                pnl = (t.net_shares * cur_poly) - (t.raw_shares * t.entry_price)
+                ms.sl_strikes = 0
+                self._log(
+                    f"NO SL ({hard_sl_no*100:.0f}%) | cur={cur_poly:.3f} "
+                    f"entry={t.entry_price:.3f} | pnl=${pnl:+.3f}",
+                    "WARNING",
+                )
+                return True, "STOP_LOSS", round(pnl, 4), cur_poly
             return False, "", 0.0, 0.0
 
+        # --- YES Stop Loss ---
         if move_pct <= -hard_sl:
             pnl = (t.net_shares * cur_poly) - (t.raw_shares * t.entry_price)
             ms.sl_strikes = 0
@@ -913,6 +1060,25 @@ class KrajekisSniperBot:
         _, raw_shares = _safe_amounts(entry, stake)
         net_shares    = raw_shares - _calculate_fee_shares(entry, raw_shares)
 
+        # ADIM 4: Fiyat senkronizasyon kontrolu (87492 anomalisi gibi outlier'lari engeller)
+        sync_ok, sync_reason = self._validate_price_sync()
+        if not sync_ok:
+            ms.signal = "SYNC RED"
+            return
+
+        # ADIM 3: R/R kalite kontrolu
+        min_rr = float(self.strat.get("min_rr_ratio", 0.35))
+        rr     = self._calc_rr_ratio(entry, raw_shares, side)
+        if rr < min_rr:
+            ms.signal = f"RR RED {rr:.2f}"
+            self._log(f"RR RED: {side} entry={entry:.3f} rr={rr:.2f} < {min_rr:.2f}", "WARNING")
+            return
+
+        # ADIM 2: Fee sonrasi minimum net kar kontrolu
+        if not self._validate_entry_edge(entry, raw_shares, side):
+            ms.signal = "EDGE RED"
+            return
+
         ms.last_buy_attempt = now_ts
         oid = await self.order_mgr.place_buy(token_id, entry, raw_shares)
 
@@ -920,18 +1086,24 @@ class KrajekisSniperBot:
             self._log(f"FOK iptal ({int(fok_cd)}s bekle) | {oid}", "WARNING")
             return
 
-        cl_now        = self.prices["BTC_CHAINLINK"]
-        cl_ts_src     = self.prices_ts.get("BTC_CHAINLINK_ts_src_ms", 0)
+        cl_now    = self.prices["BTC_CHAINLINK"]
+        cl_ts_src = self.prices_ts.get("BTC_CHAINLINK_ts_src_ms", 0)
+        fee_usd   = _calc_fee_usd(entry, raw_shares)
         ms.active_trade = LiveTrade(
             market_id=ms.mid, token_id=token_id, side=side,
             entry_price=entry, raw_shares=raw_shares, net_shares=net_shares,
             stake=stake, entry_asset_px=cl_now, order_id=oid,
             entry_ts_src_ms=cl_ts_src,
         )
+        tp_yes = float(self.strat.get("tp_pct_gain", 0.20))
+        tp_no  = float(self.strat.get("tp_pct_gain_no", tp_yes))
+        tp_used = tp_no if side == "NO" else tp_yes
+        net_pnl_tp = _calc_net_profit_if_tp(entry, raw_shares, tp_used)
         self._log(
             f"{'LIVE' if self.live_mode else 'PAPER'} SNIPE ({side}) [{ms.horizon_min}m] | "
-            f"{entry:.3f} | {raw_shares:.0f} hisse (net:{net_shares:.2f}) | "
-            f"Link:${cl_now:,.0f} ts_src={cl_ts_src}",
+            f"entry={entry:.3f} shares={raw_shares:.0f}(net:{net_shares:.2f}) | "
+            f"fee=${fee_usd:.3f} tp_pnl=${net_pnl_tp:.3f} rr={rr:.2f} | "
+            f"CL=${cl_now:,.0f}",
             "LIVE" if self.live_mode else "PAPER",
         )
         appr = await self.order_mgr.approve_token(token_id)
@@ -1027,12 +1199,32 @@ class KrajekisSniperBot:
             "ref_source":                 ref_src,
             "btc_binance":                self.prices.get("BTC_BINANCE", 0.0),
             "live":                       self.live_mode,
-            # --- RTDS zaman damgaları (Adım 4 senkronizasyon testi için) ---
+            # --- ADIM 4: RTDS zaman damgaları ve senkronizasyon metrikleri ---
             "ts_src_ms_chainlink_entry":  t.entry_ts_src_ms,
             "ts_src_ms_chainlink_exit":   self.prices_ts.get("BTC_CHAINLINK_ts_src_ms", 0),
             "ts_src_ms_binance_exit":     self.prices_ts.get("BTC_BINANCE_ts_src_ms", 0),
             "rtds_binance_live":          self._rtds_binance_ok,
             "rtds_chainlink_live":        self._rtds_chainlink_ok,
+            # ADIM 4: BN-CL kaynak timestamp farki (ms) — latency analizi icin
+            "ts_latency_ms": abs(
+                self.prices_ts.get("BTC_BINANCE_ts_src_ms", 0) -
+                self.prices_ts.get("BTC_CHAINLINK_ts_src_ms", 0)
+            ),
+            # ADIM 4: CL-BN fiyat sapma yuzdesi — outlier tespiti icin
+            "cl_deviation_pct": round(
+                abs(self.prices.get("BTC_CHAINLINK", 0) - self.prices.get("BTC_BINANCE", 1)) /
+                max(self.prices.get("BTC_BINANCE", 1), 1) * 100, 4
+            ),
+            # ADIM 2: Gercek fee maliyeti ve TP'deki beklenen net kar
+            "fee_usd":          round(_calc_fee_usd(t.entry_price, t.raw_shares), 4),
+            "net_profit_if_tp": round(
+                _calc_net_profit_if_tp(
+                    t.entry_price, t.raw_shares,
+                    float(self.strat.get(
+                        "tp_pct_gain_no" if t.side == "NO" else "tp_pct_gain", 0.20
+                    ))
+                ), 4
+            ),
         }
         try:
             mem = self.cfg.get("memory_file", "trades_v15_paper.jsonl")
@@ -1067,7 +1259,7 @@ class KrajekisSniperBot:
         rtds_str = f"RTDS:{bn_rtds}/{cl_rtds}"
 
         hdr = (
-            f"[bold white]KRAJEKIS V15.5 RTDS[/bold white] "
+            f"[bold white]KRAJEKIS V15.6 R/R+SYNC[/bold white] "
             f"{'[bold red]CANLI[/bold red]' if self.live_mode else '[dim]PAPER[/dim]'} | "
             f"{rtds_str} | "
             f"Link:[bold green]${cl:,.0f}[/bold green] "
@@ -1128,7 +1320,8 @@ class KrajekisSniperBot:
             f"[bold cyan]ORACLE (Chainlink)[/bold cyan]\n"
             f"  Fiyat: [bold green]${cl:,.0f}[/bold green] ({cl_age}s once)\n"
             f"  Fark:  ${abs(cl-bn):,.1f}\n"
-            f"  RTDS:  {('OK' if self._rtds_chainlink_ok else 'HTTP fallback')}\n\n"
+            f"  RTDS:  {('OK' if self._rtds_chainlink_ok else 'HTTP fallback')}\n"
+            f"  Dev:   max {self.strat.get('max_cl_deviation_pct',0.06)*100:.0f}% | stale <{int(self.strat.get('max_cl_staleness_ms',30000)/1000)}s\n\n"
             f"[bold cyan]FILTRELER[/bold cyan]\n"
             f"  Makas: max {self.strat.get('max_spread', 0.04):.2f}\n"
             f"  [cyan]Brain1 YES[/cyan]: max {self.strat.get('max_entry_yes', 0.87):.2f}\n"
@@ -1145,12 +1338,12 @@ class KrajekisSniperBot:
         )
         lay["s"].update(Panel(
             Text.from_markup(stat),
-            title="Krajekis V15.5 RTDS",
+            title="Krajekis V15.6 R/R+SYNC",
             border_style="yellow",
         ))
         lay["l"].update(Panel(
             Text.from_markup("\n".join(list(self.logs))),
-            title="Sistem Log [V15.5 RTDS | Brain1=YES-TA Brain2=NO-Late]",
+            title="Sistem Log [V15.6 | Brain1=YES-TA Brain2=NO-SL | RTDS+SYNC]",
             border_style="cyan",
         ))
         return lay
