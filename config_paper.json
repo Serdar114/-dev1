@@ -13,19 +13,19 @@
     "binance_symbol": "BTCUSDT"
   },
   "risk": {
-    "stake_usd": 5.0,
+    "stake_usd": 10.0,
     "max_daily_loss_usd": 50.0,
-    "max_open_positions": 5
+    "max_open_positions": 3
   },
   "strategy": {
     "paper_only": true,
 
-    "conv_ev_threshold_usd": 0.08,
+    "conv_ev_threshold_usd": 0.12,
     "conv_use_ta_filter": false,
     "conv_require_drop_filter": false,
     "conv_require_direction_agreement": true,
 
-    "min_entry_price": 0.55,
+    "min_entry_price": 0.62,
     "max_entry_yes": 0.87,
     "max_entry_no":  0.83,
 
@@ -41,17 +41,17 @@
     "no_min_btc_drop_5m":   60.0,
     "no_min_btc_drop_15m": 120.0,
 
-    "tp_pct_gain":    0.20,
-    "tp_pct_gain_no": 0.20,
-    "sl_pct_loss":    0.15,
-    "hard_sl_pct":    0.25,
-    "hard_sl_no_pct": 0.30,
+    "tp_pct_gain":    0.40,
+    "tp_pct_gain_no": 0.30,
+    "sl_pct_loss":    0.12,
+    "hard_sl_pct":    0.20,
+    "hard_sl_no_pct": 0.25,
 
-    "let_yes_settle_secs":           45.0,
-    "let_yes_settle_min_profit_pct": 0.15,
+    "let_yes_settle_secs":           90.0,
+    "let_yes_settle_min_profit_pct": 0.05,
 
     "min_rr_ratio":  0.20,
-    "min_edge_usd":  0.08,
+    "min_edge_usd":  0.10,
 
     "max_cl_staleness_ms":  30000,
     "max_cl_deviation_pct": 0.06,
@@ -61,10 +61,10 @@
     "rsi_oversold":     30,
     "min_signal_score": 2,
 
-    "sl_aggr_ticks":          2,
-    "tp_maker_timeout_s":    15,
-    "sl_cancel_timeout_s":    5,
-    "let_settle_fallback_secs": 30
+    "sl_aggr_ticks":            2,
+    "tp_maker_timeout_s":      15,
+    "sl_cancel_timeout_s":      5,
+    "let_settle_fallback_secs": 60
   },
   "memory_file": "trades_paper.jsonl"
 }
