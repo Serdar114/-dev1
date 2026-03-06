@@ -519,148 +519,109 @@ class KrajekisSniperBot:
     # ------------------------------------------------------------------ RTDS: Binance WS
 
     async def _rtds_binance_ws(self) -> None:
-        """Background task — Binance aggTrade WebSocket, auto-reconnect."""
-        _URL    = "wss://stream.binance.com:443/ws/btcusdt@aggTrade"
+        """Background task — Binance REST polling (1s), WebSocket yerine HTTP kullanır."""
+        _URL    = "https://api.binance.com/api/v3/ticker/price"
+        _PARAMS = {"symbol": "BTCUSDT"}
         backoff = 1.0
+        logged  = False
 
-        while self._running:
-            try:
-                connector = aiohttp.TCPConnector(family=socket.AF_INET, ssl=False)
-                async with aiohttp.ClientSession(connector=connector) as ws_sess:
-                    async with ws_sess.ws_connect(
-                        _URL,
-                        heartbeat=30,
-                        timeout=aiohttp.ClientTimeout(total=None, connect=10),
-                        ssl=False,
-                    ) as ws:
-                        self._rtds_binance_ok = True
-                        self._log("RTDS Binance WS baglandi (aggTrade)", "INFO")
-                        backoff = 1.0
+        ssl_ctx = ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode    = ssl.CERT_NONE
+        connector = aiohttp.TCPConnector(family=socket.AF_INET, ssl=ssl_ctx, limit=4)
 
-                        async for msg in ws:
-                            if not self._running:
-                                break
-                            if msg.type == aiohttp.WSMsgType.TEXT:
-                                try:
-                                    data   = json.loads(msg.data)
-                                    price  = float(data.get("p", 0))
-                                    ts_src = int(data.get("T", time.time() * 1000))
-                                    if price > 0:
-                                        self.prices["BTC_BINANCE"]              = price
-                                        self.prices_ts["BTC_BINANCE_ts_src_ms"] = ts_src
-                                except Exception:
-                                    pass
-                            elif msg.type in (
-                                aiohttp.WSMsgType.CLOSE,
-                                aiohttp.WSMsgType.CLOSED,
-                                aiohttp.WSMsgType.ERROR,
-                            ):
-                                break
+        async with aiohttp.ClientSession(connector=connector) as sess:
+            while self._running:
+                try:
+                    async with sess.get(
+                        _URL, params=_PARAMS,
+                        timeout=aiohttp.ClientTimeout(total=3),
+                        ssl=ssl_ctx,
+                    ) as r:
+                        if r.status == 200:
+                            data  = await r.json(content_type=None)
+                            price = float(data.get("price", 0))
+                            if price > 0:
+                                self.prices["BTC_BINANCE"]              = price
+                                self.prices_ts["BTC_BINANCE_ts_src_ms"] = int(time.time() * 1000)
+                                if not self._rtds_binance_ok:
+                                    self._rtds_binance_ok = True
+                                    self._log("RTDS Binance REST polling basladi (1s)", "INFO")
+                                    logged = True
+                            backoff = 1.0
+                    await asyncio.sleep(1.0)
 
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                self._rtds_binance_ok = False
-                if self._running:
-                    log_level = "DEBUG" if backoff >= 60.0 else "WARNING"
-                    self._log(
-                        f"RTDS Binance koptu: {str(e)[:50]} — {backoff:.0f}s sonra",
-                        log_level,
-                    )
-                    await asyncio.sleep(backoff)
-                    backoff = min(backoff * 2, 60.0)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    self._rtds_binance_ok = False
+                    if self._running:
+                        self._log(f"RTDS Binance HTTP hata: {str(e)[:50]} — {backoff:.0f}s", "WARNING")
+                        await asyncio.sleep(backoff)
+                        backoff = min(backoff * 2, 30.0)
 
         self._rtds_binance_ok = False
 
     # ------------------------------------------------------------------ RTDS: Chainlink WS
 
     async def _rtds_chainlink_ws(self) -> None:
-        """Background task — Polygon eth_subscribe/logs AnswerUpdated, auto-reconnect."""
-        _CL_CONTRACT    = "0xc907E116054Ad103354f2D350FD2514433D57F6f"
-        _ANSWER_UPDATED = "0x0559884fd3a460db3073b7fc896cc77986f16e378210ded43186175bf646fc5f"
-        _WSS_ENDPOINTS  = [
-            "wss://polygon-bor-rpc.publicnode.com",
-            "wss://rpc.ankr.com/polygon/ws",
-            "wss://polygon.llamarpc.com",
+        """Background task — Chainlink REST polling (5s), WebSocket yerine HTTP kullanır."""
+        _RPC_ENDPOINTS = [
+            "https://polygon-rpc.com",
+            "https://rpc.ankr.com/polygon",
+            "https://polygon.llamarpc.com",
+            "https://1rpc.io/matic",
         ]
-        _SUB_MSG = json.dumps({
-            "jsonrpc": "2.0",
-            "id":      1,
-            "method":  "eth_subscribe",
-            "params":  ["logs", {
-                "address": _CL_CONTRACT,
-                "topics":  [_ANSWER_UPDATED],
-            }],
-        })
+        _CONTRACT = "0xc907E116054Ad103354f2D350FD2514433D57F6f"
+        _DATA     = "0xfeaf968c"
+        backoff   = 1.0
 
-        backoff = 1.0
-        ep_idx  = 0
+        ssl_ctx = ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode    = ssl.CERT_NONE
+        connector = aiohttp.TCPConnector(family=socket.AF_INET, ssl=ssl_ctx, limit=4)
 
-        while self._running:
-            endpoint = _WSS_ENDPOINTS[ep_idx % len(_WSS_ENDPOINTS)]
-            try:
-                connector = aiohttp.TCPConnector(family=socket.AF_INET, ssl=False)
-                async with aiohttp.ClientSession(connector=connector) as ws_sess:
-                    async with ws_sess.ws_connect(
-                        endpoint,
-                        heartbeat=20,
-                        timeout=aiohttp.ClientTimeout(total=None, connect=10),
-                        ssl=False,
-                    ) as ws:
-                        await ws.send_str(_SUB_MSG)
-                        self._rtds_chainlink_ok = True
-                        ep_label = endpoint.split("//")[-1].split("/")[0][:20]
-                        self._log(f"RTDS Chainlink WS baglandi ({ep_label})", "INFO")
-                        backoff = 1.0
+        async with aiohttp.ClientSession(connector=connector) as sess:
+            while self._running:
+                payload = {
+                    "jsonrpc": "2.0", "method": "eth_call",
+                    "params": [{"to": _CONTRACT, "data": _DATA}, "latest"],
+                    "id": int(time.time() * 1000),
+                }
+                got = False
+                for rpc in _RPC_ENDPOINTS:
+                    try:
+                        async with sess.post(
+                            rpc, json=payload,
+                            timeout=aiohttp.ClientTimeout(total=4),
+                            ssl=ssl_ctx,
+                        ) as r:
+                            if r.status == 200:
+                                res     = await r.json(content_type=None)
+                                hex_val = res.get("result", "")
+                                if hex_val and len(hex_val) >= 130:
+                                    price = int(hex_val[66:130], 16) / 1e8
+                                    if 10_000 < price < 1_000_000:
+                                        self.prices["BTC_CHAINLINK"]              = price
+                                        self.prices_ts["BTC_CHAINLINK_ts_src_ms"] = int(time.time() * 1000)
+                                        if not self._rtds_chainlink_ok:
+                                            self._rtds_chainlink_ok = True
+                                            self._log("RTDS Chainlink REST polling basladi (5s)", "INFO")
+                                        got = True
+                                        backoff = 1.0
+                                        break
+                    except Exception:
+                        continue
 
-                        async for msg in ws:
-                            if not self._running:
-                                break
-                            if msg.type == aiohttp.WSMsgType.TEXT:
-                                try:
-                                    data = json.loads(msg.data)
-                                    if "result" in data and isinstance(data["result"], str):
-                                        continue
-                                    if "params" in data:
-                                        log    = data["params"]["result"]
-                                        topics = log.get("topics", [])
-                                        if len(topics) >= 2:
-                                            raw = int(topics[1], 16)
-                                            if raw >= (1 << 255):
-                                                raw -= (1 << 256)
-                                            price = raw / 1e8
-                                            raw_data = log.get("data", "")
-                                            if raw_data and len(raw_data) >= 66:
-                                                updated_at = int(raw_data[2:66], 16)
-                                                ts_src_ms  = updated_at * 1000
-                                            else:
-                                                ts_src_ms = int(time.time() * 1000)
-                                            if 10_000 < price < 1_000_000:
-                                                self.prices["BTC_CHAINLINK"]              = price
-                                                self.prices_ts["BTC_CHAINLINK_ts_src_ms"] = ts_src_ms
-                                except Exception:
-                                    pass
-                            elif msg.type in (
-                                aiohttp.WSMsgType.CLOSE,
-                                aiohttp.WSMsgType.CLOSED,
-                                aiohttp.WSMsgType.ERROR,
-                            ):
-                                break
+                if not got:
+                    self._rtds_chainlink_ok = False
 
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                self._rtds_chainlink_ok = False
-                if self._running:
-                    ep_label = endpoint.split("//")[-1].split("/")[0][:15]
-                    log_level = "DEBUG" if backoff >= 60.0 else "WARNING"
-                    self._log(
-                        f"RTDS CL koptu ({ep_label}): {str(e)[:40]} — {backoff:.0f}s",
-                        log_level,
-                    )
-                    await asyncio.sleep(backoff)
-                    backoff  = min(backoff * 2, 60.0)
-                    ep_idx  += 1
+                try:
+                    await asyncio.sleep(5.0 if got else backoff)
+                    if not got:
+                        backoff = min(backoff * 2, 30.0)
+                except asyncio.CancelledError:
+                    raise
 
         self._rtds_chainlink_ok = False
 
