@@ -1,8 +1,25 @@
 #!/usr/bin/env python3
 """
-Polymarket Krajekis Auto-Sniper V15.4 (HYBRID EDITION)
-=======================================================
-  V15.4 degisiklikleri:
+Polymarket Krajekis Auto-Sniper V15.5 (RTDS EDITION)
+=====================================================
+  V15.5 değişiklikleri (Adım 1 — RTDS WebSocket Entegrasyonu):
+  + _rtds_binance_ws():   Binance aggTrade WebSocket — main_run'u BLOKLAMAZ,
+                          asyncio background task olarak çalışır, auto-reconnect
+                          (exp. backoff 1s→60s). BTC fiyatını self.prices["BTC_BINANCE"]
+                          ve ts_src_ms'yi self.prices_ts["BTC_BINANCE_ts_src_ms"] a yazar.
+  + _rtds_chainlink_ws(): Polygon eth_subscribe/logs (AnswerUpdated event) —
+                          self.prices["BTC_CHAINLINK"] ve ts_src_ms anlık güncelleme,
+                          auto-reconnect + multi-endpoint fallback.
+  + prices_ts dict:       Her fiyat güncellemesinde ts_src_ms (kaynak zaman damgası, ms)
+                          saklanır — Adım 4 senkronizasyon testi için gerekli.
+  + _record():            ts_src_ms_chainlink_entry, ts_src_ms_chainlink_exit,
+                          ts_src_ms_binance_exit alanları JSONL log kaydına eklendi.
+  + LiveTrade:            entry_ts_src_ms alanı eklendi.
+  + _fetch_prices_and_ta(): RTDS'den taze veri varsa (< 30s) HTTP Chainlink/Binance
+                            fiyatı üzerine YAZMAz; TA kline verisi hâlâ HTTP'den çekilir.
+  + _render():            RTDS bağlantı durumu (BN/CL ✓/✗) header'a eklendi.
+
+  V15.4 değişiklikleri:
   + BRAIN 1 (YES): Skor tabanli sinyal — 4 TA kosulundan en az 3'u zorunlu
   + BRAIN 1 (YES): Son 3 mumun hepsinin yukselis (close>open) sart — momentum filtresi
   + BRAIN 2 (NO):  Oncelik kazandi — ayni anda YES de yaniyorsa NO alinir
@@ -22,7 +39,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, List, Tuple
 from rich.console import Console
 from rich.table import Table
 from rich.live import Live
@@ -82,16 +99,17 @@ def _calculate_fee_shares(price: float, raw_shares: float) -> float:
 
 @dataclass
 class LiveTrade:
-    market_id:      str
-    token_id:       str
-    side:           str
-    entry_price:    float
-    raw_shares:     float
-    net_shares:     float
-    stake:          float
-    entry_asset_px: float
-    order_id:       str = ""
-    entry_time:     datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    market_id:        str
+    token_id:         str
+    side:             str
+    entry_price:      float
+    raw_shares:       float
+    net_shares:       float
+    stake:            float
+    entry_asset_px:   float
+    order_id:         str      = ""
+    entry_time:       datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    entry_ts_src_ms:  int      = 0   # Chainlink kaynak zaman damgası entry anında (ms)
 
 
 class MarketState:
@@ -262,10 +280,16 @@ class KrajekisSniperBot:
         self.markets:  Dict[str, MarketState] = {}
         self.logs:     deque = deque(maxlen=14)
 
-        self.prices:   Dict[str, float] = {
+        self.prices: Dict[str, float] = {
             "BTC_BINANCE":   0.0,
             "BTC_CHAINLINK": 0.0,
         }
+        # RTDS: kaynak zaman damgaları (ms cinsinden Unix timestamp)
+        self.prices_ts: Dict[str, int] = {
+            "BTC_BINANCE_ts_src_ms":   0,
+            "BTC_CHAINLINK_ts_src_ms": 0,
+        }
+
         self.ta_data:  Dict[str, dict] = {}
 
         self.trades:      int   = 0
@@ -280,6 +304,13 @@ class KrajekisSniperBot:
             + timedelta(days=1)
         )
         self._running: bool = True
+
+        # RTDS durum bayrakları (UI için)
+        self._rtds_binance_ok:   bool = False
+        self._rtds_chainlink_ok: bool = False
+        self._rtds_tasks:        List[asyncio.Task] = []
+
+    # ------------------------------------------------------------------ log
 
     def _log(self, msg: str, level: str = "INFO") -> None:
         ts = datetime.now().strftime("%H:%M:%S")
@@ -313,11 +344,186 @@ class KrajekisSniperBot:
     def _open_positions(self) -> int:
         return sum(1 for m in self.markets.values() if m.active_trade)
 
+    # ------------------------------------------------------------------ RTDS: yardımcı
+
+    def _rtds_fresh(self, key_ts: str, max_age_s: float = 30.0) -> bool:
+        """RTDS fiyatının taze olup olmadığını kontrol eder (< max_age_s saniye)."""
+        ts_ms = self.prices_ts.get(key_ts, 0)
+        if ts_ms == 0:
+            return False
+        return (time.time() * 1000 - ts_ms) < max_age_s * 1000
+
+    # ------------------------------------------------------------------ RTDS: Binance WS
+
+    async def _rtds_binance_ws(self) -> None:
+        """
+        Background task — Binance aggTrade WebSocket.
+        main_run'u BLOKLAMAZ. Kopma anında exponential backoff ile yeniden bağlanır.
+        Her trade mesajında:
+          self.prices["BTC_BINANCE"]             <- güncel fiyat
+          self.prices_ts["BTC_BINANCE_ts_src_ms"] <- Binance trade timestamp (ms)
+        """
+        _URL = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade"
+        backoff = 1.0
+
+        while self._running:
+            try:
+                connector = aiohttp.TCPConnector(family=socket.AF_INET)
+                async with aiohttp.ClientSession(connector=connector) as ws_sess:
+                    async with ws_sess.ws_connect(
+                        _URL,
+                        heartbeat=30,
+                        timeout=aiohttp.ClientTimeout(total=None, connect=10),
+                    ) as ws:
+                        self._rtds_binance_ok = True
+                        self._log("RTDS Binance WS baglandi (aggTrade)", "INFO")
+                        backoff = 1.0  # basarili baglantida sifirla
+
+                        async for msg in ws:
+                            if not self._running:
+                                break
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                try:
+                                    data     = json.loads(msg.data)
+                                    price    = float(data.get("p", 0))
+                                    # "T": trade time in milliseconds (Binance kaynak damgasi)
+                                    ts_src   = int(data.get("T", time.time() * 1000))
+                                    if price > 0:
+                                        self.prices["BTC_BINANCE"]             = price
+                                        self.prices_ts["BTC_BINANCE_ts_src_ms"] = ts_src
+                                except Exception:
+                                    pass
+                            elif msg.type in (
+                                aiohttp.WSMsgType.CLOSE,
+                                aiohttp.WSMsgType.CLOSED,
+                                aiohttp.WSMsgType.ERROR,
+                            ):
+                                break
+
+            except asyncio.CancelledError:
+                raise  # task iptal edildi, propagate et
+            except Exception as e:
+                self._rtds_binance_ok = False
+                if self._running:
+                    self._log(
+                        f"RTDS Binance WS koptu: {str(e)[:50]} — {backoff:.0f}s sonra yeniden",
+                        "WARNING",
+                    )
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 60.0)
+
+        self._rtds_binance_ok = False
+
+    # ------------------------------------------------------------------ RTDS: Chainlink WS
+
+    async def _rtds_chainlink_ws(self) -> None:
+        """
+        Background task — Polygon eth_subscribe/logs (AnswerUpdated event).
+        Chainlink BTC/USD Polygon feed kontratını dinler, her on-chain güncelleme anında:
+          self.prices["BTC_CHAINLINK"]              <- güncel fiyat (8 decimals)
+          self.prices_ts["BTC_CHAINLINK_ts_src_ms"] <- on-chain updatedAt * 1000 (ms)
+        Kopma anında multi-endpoint fallback + exponential backoff ile yeniden bağlanır.
+        """
+        # Chainlink BTC/USD feed — Polygon mainnet
+        _CL_CONTRACT = "0xc907E116054Ad103354f2D350FD2514433D57F6f"
+        # keccak256("AnswerUpdated(int256,uint256,uint256)")
+        _ANSWER_UPDATED = "0x0559884fd3a460db3073b7fc896cc77986f16e378210ded43186175bf646fc5f"
+        # WSS RPC endpointleri — biri düşerse diğerine geçer
+        _WSS_ENDPOINTS = [
+            "wss://polygon-bor-rpc.publicnode.com",
+            "wss://rpc.ankr.com/polygon/ws",
+            "wss://polygon.llamarpc.com",
+        ]
+        _SUB_MSG = json.dumps({
+            "jsonrpc": "2.0",
+            "id":      1,
+            "method":  "eth_subscribe",
+            "params":  ["logs", {
+                "address": _CL_CONTRACT,
+                "topics":  [_ANSWER_UPDATED],
+            }],
+        })
+
+        backoff  = 1.0
+        ep_idx   = 0
+
+        while self._running:
+            endpoint = _WSS_ENDPOINTS[ep_idx % len(_WSS_ENDPOINTS)]
+            try:
+                connector = aiohttp.TCPConnector(family=socket.AF_INET)
+                async with aiohttp.ClientSession(connector=connector) as ws_sess:
+                    async with ws_sess.ws_connect(
+                        endpoint,
+                        heartbeat=20,
+                        timeout=aiohttp.ClientTimeout(total=None, connect=10),
+                    ) as ws:
+                        await ws.send_str(_SUB_MSG)
+                        self._rtds_chainlink_ok = True
+                        ep_label = endpoint.split("//")[-1].split("/")[0][:20]
+                        self._log(f"RTDS Chainlink WS baglandi ({ep_label})", "INFO")
+                        backoff = 1.0  # basarili baglantida sifirla
+
+                        async for msg in ws:
+                            if not self._running:
+                                break
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                try:
+                                    data = json.loads(msg.data)
+                                    # Abonelik onay mesajı — atla
+                                    if "result" in data and isinstance(data["result"], str):
+                                        continue
+                                    # Log event bildirimi
+                                    if "params" in data:
+                                        log = data["params"]["result"]
+                                        topics = log.get("topics", [])
+                                        if len(topics) >= 2:
+                                            # topics[1] = int256 indexed current (fiyat)
+                                            raw = int(topics[1], 16)
+                                            if raw >= (1 << 255):
+                                                raw -= (1 << 256)  # signed int256
+                                            price = raw / 1e8
+
+                                            # data alanı: updatedAt (uint256, Unix saniye)
+                                            raw_data = log.get("data", "")
+                                            if raw_data and len(raw_data) >= 66:
+                                                updated_at = int(raw_data[2:66], 16)
+                                                ts_src_ms  = updated_at * 1000
+                                            else:
+                                                ts_src_ms = int(time.time() * 1000)
+
+                                            # Basit sanity check (BTC $10k-$1M arası)
+                                            if 10_000 < price < 1_000_000:
+                                                self.prices["BTC_CHAINLINK"]             = price
+                                                self.prices_ts["BTC_CHAINLINK_ts_src_ms"] = ts_src_ms
+                                except Exception:
+                                    pass
+                            elif msg.type in (
+                                aiohttp.WSMsgType.CLOSE,
+                                aiohttp.WSMsgType.CLOSED,
+                                aiohttp.WSMsgType.ERROR,
+                            ):
+                                break
+
+            except asyncio.CancelledError:
+                raise  # task iptal edildi, propagate et
+            except Exception as e:
+                self._rtds_chainlink_ok = False
+                if self._running:
+                    ep_label = endpoint.split("//")[-1].split("/")[0][:15]
+                    self._log(
+                        f"RTDS CL WS koptu ({ep_label}): {str(e)[:40]} — {backoff:.0f}s",
+                        "WARNING",
+                    )
+                    await asyncio.sleep(backoff)
+                    backoff  = min(backoff * 2, 60.0)
+                    ep_idx  += 1  # bir sonraki endpoint'i dene
+
+        self._rtds_chainlink_ok = False
+
     # ------------------------------------------------------------------ pazar radar
 
     async def _update_markets(self, session: aiohttp.ClientSession) -> None:
         now      = int(datetime.now(timezone.utc).timestamp())
-        # V15.1: Hem 5m hem 15m pazarlar izleniyor
         base_5m  = (now // 300) * 300
         base_15m = (now // 900) * 900
         sluglar  = []
@@ -376,20 +582,20 @@ class KrajekisSniperBot:
     # ------------------------------------------------------------------ fiyat + TA
 
     async def _fetch_chainlink_btc(self, session: aiohttp.ClientSession) -> Optional[float]:
-        # Birden fazla ücretsiz Polygon RPC endpoint — biri çökerse diğeri devreye girer
+        """HTTP fallback — RTDS taze değilse çağrılır."""
         _RPC_ENDPOINTS = [
             "https://polygon-rpc.com",
             "https://rpc.ankr.com/polygon",
             "https://polygon.llamarpc.com",
             "https://1rpc.io/matic",
         ]
-        req_id = int(time.time() * 1000)
+        req_id  = int(time.time() * 1000)
         payload = {
             "jsonrpc": "2.0",
             "method":  "eth_call",
             "params":  [{
                 "to":   "0xc907E116054Ad103354f2D350FD2514433D57F6f",
-                "data": "0xfeaf968c"
+                "data": "0xfeaf968c",
             }, "latest"],
             "id": req_id,
         }
@@ -410,24 +616,35 @@ class KrajekisSniperBot:
         return None
 
     async def _fetch_prices_and_ta(self, session: aiohttp.ClientSession) -> None:
-        cl_price = await self._fetch_chainlink_btc(session)
-        now_utc  = datetime.now(timezone.utc)
+        now_utc = datetime.now(timezone.utc)
+        now_ms  = time.time() * 1000
 
+        # --- CHAINLINK: RTDS taze ise HTTP'yi atla ---
+        rtds_cl_fresh = self._rtds_fresh("BTC_CHAINLINK_ts_src_ms", max_age_s=30.0)
+        if not rtds_cl_fresh:
+            cl_price = await self._fetch_chainlink_btc(session)
+            if cl_price:
+                self.prices["BTC_CHAINLINK"]             = cl_price
+                self.prices_ts["BTC_CHAINLINK_ts_src_ms"] = int(now_ms)
+        # cl_price her zaman güncel değerden alınır
+        cl_price = self.prices.get("BTC_CHAINLINK", 0.0) or None
+
+        # Pazar referans fiyat kilitleme (kaynak fark etmez, her döngüde çalışır)
         if cl_price:
-            self.prices["BTC_CHAINLINK"] = cl_price
             for ms in list(self.markets.values()):
                 if ms.ref_chainlink == 0.0 and ms.secs_left > 0:
                     lag_secs = (now_utc - ms.start_time).total_seconds()
                     if lag_secs >= 0:
                         ms.ref_chainlink    = cl_price
                         ms.ref_chainlink_ts = now_utc
+                        src_tag = "[RTDS]" if rtds_cl_fresh else "[HTTP]"
                         self._log(
                             f"ORACLE LOCK [{ms.horizon_min}m] {ms.short_name[:20]}... "
-                            f"| CL=${cl_price:,.0f} | +{int(lag_secs)}s gecikmeli",
-                            "INFO"
+                            f"| CL=${cl_price:,.0f} | +{int(lag_secs)}s {src_tag}",
+                            "INFO",
                         )
         else:
-            # Chainlink alinamazsa Binance ile ref_chainlink'i doldur (ENTRY_FALLBACK engeli)
+            # Chainlink yoksa Binance ile yedek kilitle
             bn_now = self.prices.get("BTC_BINANCE", 0.0)
             if bn_now > 0:
                 for ms in list(self.markets.values()):
@@ -439,9 +656,12 @@ class KrajekisSniperBot:
                             self._log(
                                 f"BINANCE LOCK [{ms.horizon_min}m] {ms.short_name[:20]}... "
                                 f"| BN=${bn_now:,.0f} | +{int(lag_secs)}s (CL yok)",
-                                "WARNING"
+                                "WARNING",
                             )
 
+        # --- BINANCE KLINES: TA için her zaman çek ---
+        # RTDS < 5s taze ise kline kapanış fiyatı self.prices["BTC_BINANCE"]'ı ezmez
+        rtds_bn_fresh = self._rtds_fresh("BTC_BINANCE_ts_src_ms", max_age_s=5.0)
         try:
             async with session.get(
                 "https://api.binance.com/api/v3/klines",
@@ -457,11 +677,14 @@ class KrajekisSniperBot:
                     for col in ("open", "close", "high", "low", "vol"):
                         df[col] = df[col].astype(float)
 
-                    self.prices["BTC_BINANCE"] = df["close"].iloc[-1]
+                    # RTDS taze değilse kline kapanışından güncelle
+                    if not rtds_bn_fresh:
+                        self.prices["BTC_BINANCE"] = df["close"].iloc[-1]
 
                     if not cl_price:
                         self.prices["BTC_CHAINLINK"] = self.prices["BTC_BINANCE"]
 
+                    # TA hesaplamaları
                     df["EMA_21"] = df["close"].ewm(span=21, adjust=False).mean()
                     df["EMA_50"] = df["close"].ewm(span=50, adjust=False).mean()
 
@@ -479,17 +702,16 @@ class KrajekisSniperBot:
                     df["MACD_Hist"] = ml - ml.ewm(span=9, adjust=False).mean()
 
                     last = df.iloc[-1]
-                    # Son 3 mumun hepsi yukselis mi (close > open)?
                     last3_bullish = all(
                         df["close"].iloc[i] > df["open"].iloc[i]
                         for i in [-3, -2, -1]
                     )
                     self.ta_data["BTC"] = {
-                        "vwap":         float(last["VWAP"]),
-                        "rsi":          float(last["RSI_14"]),
-                        "ema21":        float(last["EMA_21"]),
-                        "ema50":        float(last["EMA_50"]),
-                        "macd":         float(last["MACD_Hist"]),
+                        "vwap":          float(last["VWAP"]),
+                        "rsi":           float(last["RSI_14"]),
+                        "ema21":         float(last["EMA_21"]),
+                        "ema50":         float(last["EMA_50"]),
+                        "macd":          float(last["MACD_Hist"]),
                         "last3_bullish": last3_bullish,
                     }
         except Exception:
@@ -550,22 +772,15 @@ class KrajekisSniperBot:
         ema50 = ta["ema50"]
         macd  = ta["macd"]
 
-        # V15.1: Spread 0.04 (0.03'ten biraz genis, daha fazla giris)
         max_spread = float(self.strat.get("max_spread", 0.04))
         if ms.best_ask - ms.best_bid > max_spread:
             return "GENIS MAKAS"
 
-        # Brain 1: YES sinyali — skor tabanlı (min_signal_score) + son 3 mum momentum
-        # Her TA koşulu 1 puan; minimum 3/4 GEREKLİ
         score = 0
-        if px > vwap:
-            score += 1
-        if ema21 > ema50:
-            score += 1
-        if rsi < float(self.strat.get("rsi_overbought", 70)):
-            score += 1
-        if macd > 0:
-            score += 1
+        if px > vwap:  score += 1
+        if ema21 > ema50:  score += 1
+        if rsi < float(self.strat.get("rsi_overbought", 70)):  score += 1
+        if macd > 0:  score += 1
 
         min_score     = int(self.strat.get("min_signal_score", 3))
         last3_bullish = ta.get("last3_bullish", False)
@@ -578,23 +793,17 @@ class KrajekisSniperBot:
     # ------------------------------------------------------------------ Brain 2: NO
 
     def _signal_no_late(self, ms: MarketState) -> bool:
-        """
-        Brain 2 (NO): TA kullanmaz. Son 30-150 saniyede, BTC pazar acilisindan
-        yeterince asagidaysa NO al. Stop-Loss yok, settlement'a kadar bekle.
-        """
-        secs = ms.secs_left
+        secs      = ms.secs_left
         win_start = float(self.strat.get("no_window_secs_start", 150.0))
         win_end   = float(self.strat.get("no_window_secs_end",   30.0))
         if not (win_end <= secs <= win_start):
             return False
 
-        # Pazar acilisindaki BTC fiyati gerekli
         ref = ms.ref_chainlink
         if ref <= 0:
             return False
 
         btc_now = self.prices["BTC_BINANCE"]
-        # 5m ve 15m icin farkli dusus esigi
         if ms.horizon_min == 5:
             drop_needed = float(self.strat.get("no_min_btc_drop_5m", 80.0))
         else:
@@ -603,7 +812,6 @@ class KrajekisSniperBot:
         if btc_now >= ref - drop_needed:
             return False
 
-        # Spread kontrolu
         max_spread = float(self.strat.get("max_spread", 0.04))
         if ms.best_ask - ms.best_bid > max_spread:
             return False
@@ -621,19 +829,17 @@ class KrajekisSniperBot:
         sl      = float(self.strat.get("sl_pct_loss", 0.15))
         hard_sl = float(self.strat.get("hard_sl_pct", 0.25))
 
-        cur_poly  = _safe_price(ms.best_bid if t.side == "YES" else 1.0 - ms.best_ask)
-        move_pct  = (cur_poly - t.entry_price) / t.entry_price
+        cur_poly = _safe_price(ms.best_bid if t.side == "YES" else 1.0 - ms.best_ask)
+        move_pct = (cur_poly - t.entry_price) / t.entry_price
 
         if move_pct >= tp:
             pnl = (t.net_shares * cur_poly) - (t.raw_shares * t.entry_price)
             ms.sl_strikes = 0
             return True, "TAKE_PROFIT", round(pnl, 4), cur_poly
 
-        # Brain 2 (NO): Stop-Loss yok - settlement'a kadar tut
         if t.side == "NO":
             return False, "", 0.0, 0.0
 
-        # Brain 1 (YES): Normal SL mantigi
         if move_pct <= -hard_sl:
             pnl = (t.net_shares * cur_poly) - (t.raw_shares * t.entry_price)
             ms.sl_strikes = 0
@@ -678,7 +884,6 @@ class KrajekisSniperBot:
 
         min_e = float(self.strat.get("min_entry_price", 0.70))
 
-        # Brain 2: NO önce kontrol edilir (arbitraj mantigi — YES'e gore daha güvenli)
         if self._signal_no_late(ms):
             side     = "NO"
             token_id = ms.no_id
@@ -687,8 +892,6 @@ class KrajekisSniperBot:
             ms.signal = f"DN (LATE-NO) ref={ms.ref_chainlink:,.0f}"
             if entry < min_e or entry > max_e or not token_id:
                 return
-
-        # Brain 1: YES — sadece NO sinyali yoksa devreye girer
         else:
             ms.signal = self._signal(ms)
             if "UP" in ms.signal:
@@ -701,7 +904,6 @@ class KrajekisSniperBot:
             else:
                 return
 
-        # FOK cooldown
         now_ts = datetime.now(timezone.utc).timestamp()
         fok_cd = float(self.strat.get("fok_cooldown", 20))
         if now_ts - ms.last_buy_attempt < fok_cd:
@@ -718,17 +920,19 @@ class KrajekisSniperBot:
             self._log(f"FOK iptal ({int(fok_cd)}s bekle) | {oid}", "WARNING")
             return
 
-        cl_now = self.prices["BTC_CHAINLINK"]
+        cl_now        = self.prices["BTC_CHAINLINK"]
+        cl_ts_src     = self.prices_ts.get("BTC_CHAINLINK_ts_src_ms", 0)
         ms.active_trade = LiveTrade(
             market_id=ms.mid, token_id=token_id, side=side,
             entry_price=entry, raw_shares=raw_shares, net_shares=net_shares,
-            stake=stake, entry_asset_px=cl_now, order_id=oid
+            stake=stake, entry_asset_px=cl_now, order_id=oid,
+            entry_ts_src_ms=cl_ts_src,
         )
         self._log(
             f"{'LIVE' if self.live_mode else 'PAPER'} SNIPE ({side}) [{ms.horizon_min}m] | "
             f"{entry:.3f} | {raw_shares:.0f} hisse (net:{net_shares:.2f}) | "
-            f"Link:${cl_now:,.0f}",
-            "LIVE" if self.live_mode else "PAPER"
+            f"Link:${cl_now:,.0f} ts_src={cl_ts_src}",
+            "LIVE" if self.live_mode else "PAPER",
         )
         appr = await self.order_mgr.approve_token(token_id)
         if appr not in ("PAPER",):
@@ -749,7 +953,7 @@ class KrajekisSniperBot:
             if btc_now > 0 and abs(btc_now - btc_ref) < 0.01:
                 self._log(
                     f"UYARI: Chainlink stale! ref={btc_ref:,.2f} exit={btc_now:,.2f}",
-                    "WARNING"
+                    "WARNING",
                 )
 
             if ms.ref_chainlink > 0 and ms.ref_chainlink_ts:
@@ -781,7 +985,7 @@ class KrajekisSniperBot:
                 f"SETTLED | {reason} | [{ref_src}] "
                 f"CL:{btc_ref:,.0f}→{btc_now:,.0f} "
                 f"(Δ${btc_now-btc_ref:+,.0f}) | PnL:${pnl:+.3f}",
-                "TRADE" if won else "WARNING"
+                "TRADE" if won else "WARNING",
             )
 
         del self.markets[mid]
@@ -803,26 +1007,32 @@ class KrajekisSniperBot:
             self.losses += 1
 
         record = {
-            "ts":                        datetime.now(timezone.utc).isoformat(),
-            "mid":                       ms.mid,
-            "question":                  ms.question[:60],
-            "horizon_min":               ms.horizon_min,
-            "market_start_utc":          ms.start_time.isoformat(),
-            "side":                      t.side,
-            "entry":                     t.entry_price,
-            "exit":                      exit_px,
-            "raw_shares":                t.raw_shares,
-            "net_shares":                round(t.net_shares, 4),
-            "stake":                     t.stake,
-            "pnl":                       pnl,
-            "result":                    rtype,
-            "btc_chainlink_market_open": ms.ref_chainlink,
-            "btc_chainlink_entry":       t.entry_asset_px,
-            "btc_chainlink_exit":        self.prices.get("BTC_CHAINLINK", 0.0),
-            "btc_chainlink_ref_used":    btc_ref_used,
-            "ref_source":                ref_src,
-            "btc_binance":               self.prices.get("BTC_BINANCE", 0.0),
-            "live":                      self.live_mode,
+            "ts":                         datetime.now(timezone.utc).isoformat(),
+            "mid":                        ms.mid,
+            "question":                   ms.question[:60],
+            "horizon_min":                ms.horizon_min,
+            "market_start_utc":           ms.start_time.isoformat(),
+            "side":                       t.side,
+            "entry":                      t.entry_price,
+            "exit":                       exit_px,
+            "raw_shares":                 t.raw_shares,
+            "net_shares":                 round(t.net_shares, 4),
+            "stake":                      t.stake,
+            "pnl":                        pnl,
+            "result":                     rtype,
+            "btc_chainlink_market_open":  ms.ref_chainlink,
+            "btc_chainlink_entry":        t.entry_asset_px,
+            "btc_chainlink_exit":         self.prices.get("BTC_CHAINLINK", 0.0),
+            "btc_chainlink_ref_used":     btc_ref_used,
+            "ref_source":                 ref_src,
+            "btc_binance":                self.prices.get("BTC_BINANCE", 0.0),
+            "live":                       self.live_mode,
+            # --- RTDS zaman damgaları (Adım 4 senkronizasyon testi için) ---
+            "ts_src_ms_chainlink_entry":  t.entry_ts_src_ms,
+            "ts_src_ms_chainlink_exit":   self.prices_ts.get("BTC_CHAINLINK_ts_src_ms", 0),
+            "ts_src_ms_binance_exit":     self.prices_ts.get("BTC_BINANCE_ts_src_ms", 0),
+            "rtds_binance_live":          self._rtds_binance_ok,
+            "rtds_chainlink_live":        self._rtds_chainlink_ok,
         }
         try:
             mem = self.cfg.get("memory_file", "trades_v15_paper.jsonl")
@@ -851,9 +1061,15 @@ class KrajekisSniperBot:
         wr  = (self.wins / self.trades * 100) if self.trades else 0.0
         lim = abs(self.risk.get("max_daily_loss_usd", 3.0))
 
+        # RTDS durum göstergesi
+        bn_rtds  = "[bold green]BN✓[/bold green]" if self._rtds_binance_ok   else "[red]BN✗[/red]"
+        cl_rtds  = "[bold green]CL✓[/bold green]" if self._rtds_chainlink_ok else "[red]CL✗[/red]"
+        rtds_str = f"RTDS:{bn_rtds}/{cl_rtds}"
+
         hdr = (
-            f"[bold white]KRAJEKIS V15.4 (Hybrid Edition)[/bold white] "
+            f"[bold white]KRAJEKIS V15.5 RTDS[/bold white] "
             f"{'[bold red]CANLI[/bold red]' if self.live_mode else '[dim]PAPER[/dim]'} | "
+            f"{rtds_str} | "
             f"Link:[bold green]${cl:,.0f}[/bold green] "
             f"(Bin:[cyan]${bn:,.0f}[/cyan] Δ${abs(cl-bn):,.0f}) | "
             f"VWAP:[yellow]${ta.get('vwap',0):,.0f}[/yellow] | "
@@ -897,17 +1113,22 @@ class KrajekisSniperBot:
             border_style="cyan",
         ))
 
+        # RTDS yaşlılık (ms cinsinden son güncelleme)
+        bn_age = int((time.time() * 1000 - self.prices_ts.get("BTC_BINANCE_ts_src_ms", 0)) / 1000)
+        cl_age = int((time.time() * 1000 - self.prices_ts.get("BTC_CHAINLINK_ts_src_ms", 0)) / 1000)
+
         stat = (
             f"[bold cyan]TA (Binance)[/bold cyan]\n"
-            f"  Fiyat: [cyan]${bn:,.0f}[/cyan]\n"
+            f"  Fiyat: [cyan]${bn:,.0f}[/cyan] ({bn_age}s once)\n"
             f"  VWAP:  [yellow]${ta.get('vwap',0):,.0f}[/yellow]\n"
             f"  EMA21: ${ta.get('ema21',0):,.0f}\n"
             f"  EMA50: ${ta.get('ema50',0):,.0f}\n"
             f"  RSI:   [magenta]{rsi:.1f}[/magenta]\n"
             f"  MACD:  {'[green]' if ta.get('macd',0)>0 else '[red]'}{ta.get('macd',0):+.2f}[/]\n\n"
             f"[bold cyan]ORACLE (Chainlink)[/bold cyan]\n"
-            f"  Fiyat: [bold green]${cl:,.0f}[/bold green]\n"
-            f"  Fark:  ${abs(cl-bn):,.1f}\n\n"
+            f"  Fiyat: [bold green]${cl:,.0f}[/bold green] ({cl_age}s once)\n"
+            f"  Fark:  ${abs(cl-bn):,.1f}\n"
+            f"  RTDS:  {('OK' if self._rtds_chainlink_ok else 'HTTP fallback')}\n\n"
             f"[bold cyan]FILTRELER[/bold cyan]\n"
             f"  Makas: max {self.strat.get('max_spread', 0.04):.2f}\n"
             f"  [cyan]Brain1 YES[/cyan]: max {self.strat.get('max_entry_yes', 0.87):.2f}\n"
@@ -922,10 +1143,14 @@ class KrajekisSniperBot:
             f"(limit: -${lim:.2f})\n"
             f"  Toplam: {self.trades} islem | WR: [green]{wr:.1f}%[/green]"
         )
-        lay["s"].update(Panel(Text.from_markup(stat), title="Krajekis V15.4 Hybrid", border_style="yellow"))
+        lay["s"].update(Panel(
+            Text.from_markup(stat),
+            title="Krajekis V15.5 RTDS",
+            border_style="yellow",
+        ))
         lay["l"].update(Panel(
             Text.from_markup("\n".join(list(self.logs))),
-            title="Sistem Log [V15.4 Hybrid | Brain1=YES-TA Brain2=NO-Late]",
+            title="Sistem Log [V15.5 RTDS | Brain1=YES-TA Brain2=NO-Late]",
             border_style="cyan",
         ))
         return lay
@@ -939,30 +1164,50 @@ class KrajekisSniperBot:
             family=socket.AF_INET,
         )
         async with aiohttp.ClientSession(connector=connector) as session:
-            if self.live_mode:
-                appr = await self.order_mgr.ensure_approvals()
-                self._log(f"Live Onay: {appr}", "INFO")
+            # ---- RTDS background taskları başlat (main_run'u BLOKLAMAZ) ----
+            self._rtds_tasks = [
+                asyncio.create_task(
+                    self._rtds_binance_ws(),
+                    name="rtds_binance",
+                ),
+                asyncio.create_task(
+                    self._rtds_chainlink_ws(),
+                    name="rtds_chainlink",
+                ),
+            ]
 
-            self._log(
-                f"V15.4 Hybrid Edition Basladi ({'CANLI' if self.live_mode else 'PAPER'})",
-                "LIVE" if self.live_mode else "PAPER",
-            )
+            try:
+                if self.live_mode:
+                    appr = await self.order_mgr.ensure_approvals()
+                    self._log(f"Live Onay: {appr}", "INFO")
 
-            with Live(self._render(), refresh_per_second=2, screen=True) as live:
-                cycle = 0
-                while self._running:
-                    self._check_daily_reset()
-                    if cycle % 15 == 0:
-                        await self._update_markets(session)
-                    await self._fetch_prices_and_ta(session)
-                    for ms in list(self.markets.values()):
-                        if ms.secs_left > 0:
-                            await self._analyze(ms)
-                        else:
-                            await self._settle(ms.mid)
-                    live.update(self._render())
-                    await asyncio.sleep(2)
-                    cycle += 1
+                self._log(
+                    f"V15.5 RTDS Edition Basladi ({'CANLI' if self.live_mode else 'PAPER'})",
+                    "LIVE" if self.live_mode else "PAPER",
+                )
+
+                with Live(self._render(), refresh_per_second=2, screen=True) as live:
+                    cycle = 0
+                    while self._running:
+                        self._check_daily_reset()
+                        if cycle % 15 == 0:
+                            await self._update_markets(session)
+                        await self._fetch_prices_and_ta(session)
+                        for ms in list(self.markets.values()):
+                            if ms.secs_left > 0:
+                                await self._analyze(ms)
+                            else:
+                                await self._settle(ms.mid)
+                        live.update(self._render())
+                        await asyncio.sleep(2)
+                        cycle += 1
+
+            finally:
+                # Çıkışta RTDS taskları temizle
+                self._running = False
+                for task in self._rtds_tasks:
+                    task.cancel()
+                await asyncio.gather(*self._rtds_tasks, return_exceptions=True)
 
         if self.live_mode:
             await self.order_mgr.cancel_all()
