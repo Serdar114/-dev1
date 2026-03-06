@@ -1755,7 +1755,7 @@ class KrajekisSniperBot:
                     cycle = 0
                     while self._running:
                         self._check_daily_reset()
-                        if cycle % 15 == 0:
+                        if cycle % 30 == 0:   # hâlâ her ~30s market güncelle
                             await self._update_markets(session)
                         await self._fetch_prices_and_ta(session)
                         for ms in list(self.markets.values()):
@@ -1764,7 +1764,7 @@ class KrajekisSniperBot:
                             else:
                                 await self._settle(ms.mid)
                         live.update(self._render())
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(1)   # V15.8.1: 2s→1s — SL gap riski yarıya düşer
                         cycle += 1
 
             finally:
