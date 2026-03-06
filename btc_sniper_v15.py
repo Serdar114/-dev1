@@ -1085,6 +1085,22 @@ class KrajekisSniperBot:
                     f"SYNC UYARI: BN-CL fark {abs(bn_ts_ms-cl_ts_ms)/1000:.0f}s",
                     "WARNING"
                 )
+
+        # V15.8.1: CL–Binance yönsel uyum kontrolü (referans varsa)
+        # CL yukarı, Binance aşağı (veya tam tersi) ise Polymarket CL'ı değil
+        # Binance'ı fiyatlar — sinyal geçersiz.
+        if self.strat.get("conv_require_direction_agreement", True):
+            for ms in self.markets.values():
+                if ms.ref_chainlink > 0 and ms.active_trade is None:
+                    cl_up = cl > ms.ref_chainlink
+                    bn_up = bn > ms.ref_chainlink
+                    if cl_up != bn_up:
+                        msg = (f"DIR RED: CL={'UP' if cl_up else 'DN'} "
+                               f"BN={'UP' if bn_up else 'DN'} ref={ms.ref_chainlink:,.0f}")
+                        self._log(msg, "WARNING")
+                        return False, msg
+                    break   # İlk açık pazar referansını kullan
+
         return True, ""
 
     def _calc_rr_ratio(self, entry: float, raw_shares: float, side: str) -> float:

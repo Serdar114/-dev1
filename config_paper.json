@@ -23,6 +23,7 @@
     "conv_ev_threshold_usd": 0.08,
     "conv_use_ta_filter": false,
     "conv_require_drop_filter": false,
+    "conv_require_direction_agreement": true,
 
     "min_entry_price": 0.55,
     "max_entry_yes": 0.87,
