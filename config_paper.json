@@ -58,7 +58,12 @@
     "fok_cooldown":     10,
     "rsi_overbought":   70,
     "rsi_oversold":     30,
-    "min_signal_score": 2
+    "min_signal_score": 2,
+
+    "sl_aggr_ticks":          2,
+    "tp_maker_timeout_s":    15,
+    "sl_cancel_timeout_s":    5,
+    "let_settle_fallback_secs": 30
   },
   "memory_file": "trades_paper.jsonl"
 }

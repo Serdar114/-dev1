@@ -1,7 +1,39 @@
 #!/usr/bin/env python3
 """
-Polymarket Krajekis Auto-Sniper V15.7 (CONVERGENCE EDITION)
-============================================================
+Polymarket Krajekis Auto-Sniper V15.8 (EXECUTION ARMOR EDITION)
+================================================================
+  V15.8 değişiklikleri (Execution & Exit Armor):
+
+  SL AGGRESSIVE FOK:
+  + OrderManager.place_sell_sl(): FOK emir — anında doldur veya iptal.
+    Fiyat: nominal_px - (sl_aggr_ticks × tick_size). Likidite boşluklarında
+    ghost order riski yoktur.
+
+  TP MAKER GTC + CANCEL/REPLACE:
+  + OrderManager.place_sell_tp(): GTC maker emir (spread içinde) — rebate hedef.
+  + MarketState.pending_sell: dict — {order_id, placed_at, reason, pnl, exit_px,
+    is_sl, attempts}. Bekleyen satış emri takibi.
+  + _handle_pending_sell(): tp_maker_timeout_s (default 15s) sonra emir iptal
+    edilir ve daha agresif fiyatla yenilenir. N deneme sonrası Let Settle.
+
+  LET SETTLE FLAG:
+  + MarketState.letting_settle: bool — YES pozisyonu kârlıyken expiry'ye
+    bırakılır; 1.0 settlement payout beklenir. Timeout veya TP başarısız
+    olduğunda da tetiklenir.
+
+  DEFERRED _record():
+  + Paper modda: eski davranış korunur (anında kayıt).
+  + Live modda: _record() sadece emir fill onaylandıktan sonra çağrılır.
+    Ghost order senaryosunda pozisyon açık kalır, gerçek fill olmadan kapanmaz.
+
+  OrderManager yeni metodlar:
+  + get_order_status(order_id) → "MATCHED" | "OPEN" | "CANCELLED" | "ERR:..."
+  + cancel_order(order_id) → "OK" | "ERR:..."
+
+  Config yeni parametreler:
+    sl_aggr_ticks=2, tp_maker_timeout_s=15, sl_cancel_timeout_s=5,
+    let_settle_fallback_secs=30
+
   V15.7 değişiklikleri (Araştırma Entegrasyonu):
 
   CONVERGENCE MODEL — Ana Sinyal (Araştırma #1):
@@ -186,6 +218,10 @@ class MarketState:
         self.ofi:       float = 0.0    # order flow imbalance [-1, +1]
         self.tick_size: float = 0.01   # güncel tick size
 
+        # V15.8: Execution Armor
+        self.pending_sell:  Optional[dict] = None  # bekleyen satış emri takibi
+        self.letting_settle: bool          = False  # YES pozisyonu settle'a bırakıldı
+
     @property
     def secs_left(self) -> float:
         return max(0.0, (self.end_time - datetime.now(timezone.utc)).total_seconds())
@@ -253,6 +289,83 @@ class OrderManager:
                 signed = client.create_order(args)
                 resp   = client.post_order(signed, OrderType.GTC)
                 return (resp.get("orderID") or resp.get("order_id") or resp.get("id", ""))
+            except Exception as e:
+                return f"ERR:{e}"
+        return await asyncio.get_running_loop().run_in_executor(self._executor, _do)
+
+    async def place_sell_sl(self, token_id: str, price: float, shares: float) -> str:
+        """V15.8: Stop-Loss satışı — FOK (Fill-Or-Kill). Ghost order riski yok."""
+        if not self.live_mode:
+            self._paper_seq += 1
+            return f"PAPER-SL-{self._paper_seq:04d}"
+        def _do():
+            try:
+                client = self._client_or_raise()
+                price_r, shares_r = _safe_amounts(price, shares * price)
+                args   = OrderArgs(price=price_r, size=shares_r, side=SELL, token_id=token_id)
+                signed = client.create_order(args)
+                resp   = client.post_order(signed, OrderType.FOK)
+                return (resp.get("orderID") or resp.get("order_id") or resp.get("id", ""))
+            except Exception as e:
+                return f"ERR:{e}"
+        return await asyncio.get_running_loop().run_in_executor(self._executor, _do)
+
+    async def place_sell_tp(self, token_id: str, price: float, shares: float) -> str:
+        """V15.8: Take-Profit satışı — GTC maker (spread içinde, rebate hedef)."""
+        if not self.live_mode:
+            self._paper_seq += 1
+            return f"PAPER-TP-{self._paper_seq:04d}"
+        def _do():
+            try:
+                client = self._client_or_raise()
+                price_r, shares_r = _safe_amounts(price, shares * price)
+                args   = OrderArgs(price=price_r, size=shares_r, side=SELL, token_id=token_id)
+                signed = client.create_order(args)
+                resp   = client.post_order(signed, OrderType.GTC)
+                return (resp.get("orderID") or resp.get("order_id") or resp.get("id", ""))
+            except Exception as e:
+                return f"ERR:{e}"
+        return await asyncio.get_running_loop().run_in_executor(self._executor, _do)
+
+    async def get_order_status(self, order_id: str) -> str:
+        """V15.8: Emir durumu sorgula. Döndürür: MATCHED | OPEN | CANCELLED | ERR:..."""
+        if not self.live_mode:
+            return "MATCHED"   # paper: her zaman anında dolu
+        if not order_id or order_id.startswith("ERR"):
+            return f"ERR:{order_id}"
+        def _do():
+            try:
+                client = self._client_or_raise()
+                resp   = client.get_order(order_id)
+                status = (resp.get("status") or resp.get("orderStatus") or "UNKNOWN").upper()
+                # Normalize: Polymarket "MATCHED" = dolu, "LIVE"/"OPEN" = açık
+                if status in ("MATCHED", "FILLED", "COMPLETE"):
+                    return "MATCHED"
+                if status in ("LIVE", "OPEN", "ACTIVE"):
+                    return "OPEN"
+                if status in ("CANCELLED", "CANCELED"):
+                    return "CANCELLED"
+                return status
+            except Exception as e:
+                return f"ERR:{e}"
+        return await asyncio.get_running_loop().run_in_executor(self._executor, _do)
+
+    async def cancel_order(self, order_id: str) -> str:
+        """V15.8: Tek emri iptal et."""
+        if not self.live_mode:
+            return "OK"
+        if not order_id or order_id.startswith("ERR"):
+            return f"ERR:invalid_id"
+        def _do():
+            try:
+                client = self._client_or_raise()
+                try:
+                    from py_clob_client.clob_types import OrderCancelParams
+                    resp = client.cancel_order(OrderCancelParams(order_id=order_id))
+                except (ImportError, AttributeError):
+                    # Fallback: bazı versiyonlarda doğrudan dict gönderilir
+                    resp = client.cancel({"orderID": order_id})
+                return "OK"
             except Exception as e:
                 return f"ERR:{e}"
         return await asyncio.get_running_loop().run_in_executor(self._executor, _do)
@@ -990,6 +1103,124 @@ class KrajekisSniperBot:
             return 99.0
         return profit / max_loss
 
+    # ------------------------------------------------------------------ V15.8 armor
+
+    def _sl_aggressive_price(self, ms: MarketState, side: str,
+                              nominal_px: float, extra_ticks: int = 0) -> float:
+        """
+        SL için agresif fiyat hesapla.
+        Nominal fiyattan (sl_aggr_ticks + extra_ticks) × tick_size kadar düşük.
+        Bu sayede emir defterinde az likidite olsa bile FOK dolar.
+        """
+        tick  = ms.tick_size if ms.tick_size > 0 else 0.01
+        ticks = int(self.strat.get("sl_aggr_ticks", 2)) + extra_ticks
+        return _safe_price(nominal_px - tick * ticks)
+
+    def _tp_maker_price(self, ms: MarketState, side: str, nominal_px: float) -> float:
+        """
+        TP için maker fiyat hesapla (spread içinde, rebate hedef).
+        YES: best_ask'ın bir tick altında → emir defterinin en önüne girer.
+        NO:  (1 - best_bid)'nin bir tick altında.
+        Eğer nominal_px daha düşükse nominal_px kullanılır (TP hedefini korum).
+        """
+        tick = ms.tick_size if ms.tick_size > 0 else 0.01
+        if side == "YES":
+            maker_px = ms.best_ask - tick
+        else:
+            maker_px = (1.0 - ms.best_bid) - tick
+        return _safe_price(min(maker_px, nominal_px))
+
+    async def _handle_pending_sell(self, ms: MarketState) -> None:
+        """
+        V15.8: Bekleyen satış emrini takip et.
+        - Fill onayı geldiyse _record() çağır (pozisyonu kapat).
+        - Timeout dolmuşsa: SL → daha agresif FOK; TP → yeniden fiyatla veya Let Settle.
+        """
+        ps = ms.pending_sell
+        if not ps:
+            return
+
+        now     = time.time()
+        elapsed = now - ps["placed_at"]
+        is_sl   = ps.get("is_sl", False)
+        timeout = float(self.strat.get(
+            "sl_cancel_timeout_s" if is_sl else "tp_maker_timeout_s", 15
+        ))
+        oid     = ps.get("order_id", "")
+
+        # --- Doldurulma kontrolü ---
+        status = await self.order_mgr.get_order_status(oid)
+        if status == "MATCHED":
+            self._record(ms, ps["pnl"], ps["reason"], ps["exit_px"])
+            ms.pending_sell = None
+            ms.has_traded   = True
+            self._log(
+                f"CIKIS ONAYLANDI | {ps['reason']} | PnL: ${ps['pnl']:+.3f} | oid={oid}",
+                "TRADE",
+            )
+            return
+
+        # --- Henüz zaman dolmadı ---
+        if elapsed < timeout:
+            return
+
+        # --- Timeout: iptal et ve yeniden dene ---
+        t = ms.active_trade
+        if not t:
+            ms.pending_sell = None
+            return
+
+        if status not in ("CANCELLED",):   # Henüz iptal edilmediyse iptal et
+            cancel_r = await self.order_mgr.cancel_order(oid)
+            self._log(f"EMIR IPTAL | oid={oid} | {cancel_r}", "WARNING")
+
+        attempts = ps.get("attempts", 1)
+
+        if is_sl:
+            # SL retry: her denemede 1 tick daha agresif
+            if attempts >= 3:
+                self._log(
+                    f"SL {attempts} DENEME BASARISIZ — LET SETTLE modu",
+                    "WARNING",
+                )
+                ms.pending_sell  = None
+                ms.letting_settle = True
+                return
+            new_px  = self._sl_aggressive_price(ms, t.side, ps["exit_px"],
+                                                 extra_ticks=attempts)
+            new_oid = await self.order_mgr.place_sell_sl(t.token_id, new_px, t.net_shares)
+            ms.pending_sell = {
+                "order_id":  new_oid,
+                "placed_at": now,
+                "reason":    ps["reason"],
+                "pnl":       ps["pnl"],
+                "exit_px":   new_px,
+                "is_sl":     True,
+                "attempts":  attempts + 1,
+            }
+            self._log(f"SL YENİDEN {attempts+1}. DENEME | px={new_px:.3f}", "WARNING")
+        else:
+            # TP timeout: yakın expiryse Let Settle, değilse yeniden fiyatla
+            let_fb = float(self.strat.get("let_settle_fallback_secs", 30))
+            if t.side == "YES" and ms.secs_left < let_fb:
+                self._log(f"TP TIMEOUT → LET SETTLE ({ms.secs_left:.0f}s kaldi)", "TRADE")
+                ms.pending_sell  = None
+                ms.letting_settle = True
+            else:
+                cur_px  = ms.best_bid if t.side == "YES" else 1.0 - ms.best_ask
+                new_px  = self._tp_maker_price(ms, t.side, cur_px)
+                new_oid = await self.order_mgr.place_sell_tp(t.token_id, new_px, t.net_shares)
+                ms.pending_sell = {
+                    "order_id":  new_oid,
+                    "placed_at": now,
+                    "reason":    ps["reason"],
+                    "pnl":       ps["pnl"],
+                    "exit_px":   new_px,
+                    "is_sl":     False,
+                    "attempts":  attempts + 1,
+                }
+                self._log(f"TP YENİDEN | px={new_px:.3f}", "INFO")
+
     # ------------------------------------------------------------------ çıkış
 
     def _check_exit(self, ms: MarketState) -> Tuple[bool, str, float, float]:
@@ -1063,16 +1294,66 @@ class KrajekisSniperBot:
         if ms.has_traded and not ms.active_trade:
             return
 
-        # Mevcut pozisyon çıkış kontrolü
+        # Mevcut pozisyon çıkış kontrolü (V15.8 Execution Armor)
         if ms.active_trade:
+            # Live modda önce bekleyen emir kontrol et
+            if ms.pending_sell:
+                await self._handle_pending_sell(ms)
+                return
+
+            # Let Settle modundaysa artık çıkış emri gönderme
+            if ms.letting_settle:
+                ms.signal = "LET SETTLE"
+                return
+
             ok, reason, pnl, exit_px = self._check_exit(ms)
             if ok:
-                await self.order_mgr.place_sell(
-                    ms.active_trade.token_id, exit_px, ms.active_trade.net_shares
-                )
-                self._record(ms, pnl, reason, exit_px)
-                ms.has_traded = True
-                self._log(f"CIKIS | {reason} | PnL: ${pnl:+.3f}", "TRADE")
+                t    = ms.active_trade
+                is_sl = (reason == "STOP_LOSS")
+
+                if not self.live_mode:
+                    # Paper modu: anında kaydet (ghost order riski yok)
+                    self._record(ms, pnl, reason, exit_px)
+                    ms.has_traded = True
+                    self._log(f"CIKIS | {reason} | PnL: ${pnl:+.3f}", "TRADE")
+                else:
+                    # Live modu: emir gönder, fill onayı gelince _record()
+                    if is_sl:
+                        aggr_px = self._sl_aggressive_price(ms, t.side, exit_px)
+                        oid     = await self.order_mgr.place_sell_sl(
+                            t.token_id, aggr_px, t.net_shares
+                        )
+                        ms.pending_sell = {
+                            "order_id":  oid,
+                            "placed_at": time.time(),
+                            "reason":    reason,
+                            "pnl":       pnl,
+                            "exit_px":   aggr_px,
+                            "is_sl":     True,
+                            "attempts":  1,
+                        }
+                        self._log(
+                            f"SL FOK GONDERILDI | px={aggr_px:.3f} oid={oid}",
+                            "WARNING",
+                        )
+                    else:
+                        tp_px = self._tp_maker_price(ms, t.side, exit_px)
+                        oid   = await self.order_mgr.place_sell_tp(
+                            t.token_id, tp_px, t.net_shares
+                        )
+                        ms.pending_sell = {
+                            "order_id":  oid,
+                            "placed_at": time.time(),
+                            "reason":    reason,
+                            "pnl":       pnl,
+                            "exit_px":   tp_px,
+                            "is_sl":     False,
+                            "attempts":  1,
+                        }
+                        self._log(
+                            f"TP MAKER GONDERILDI | px={tp_px:.3f} oid={oid}",
+                            "TRADE",
+                        )
             return
 
         # Maksimum pozisyon limiti
@@ -1314,7 +1595,7 @@ class KrajekisSniperBot:
         vol_5m   = ta.get("realized_vol_5m", 0.0)
 
         hdr = (
-            f"[bold white]KRAJEKIS V15.7 CONVERGENCE[/bold white] "
+            f"[bold white]KRAJEKIS V15.8 EXECUTION ARMOR[/bold white] "
             f"{'[bold red]CANLI[/bold red]' if self.live_mode else '[dim]PAPER[/dim]'} | "
             f"RTDS:{bn_rtds}/{cl_rtds} | "
             f"Link:[bold green]${cl:,.0f}[/bold green] "
@@ -1339,9 +1620,17 @@ class KrajekisSniperBot:
                 t        = ms.active_trade
                 cur_poly = _safe_price(ms.best_bid if t.side == "YES" else 1.0 - ms.best_ask)
                 gain     = cur_poly - t.entry_price
+                if ms.letting_settle:
+                    armor_tag = " [yellow]⚓SETTLE[/yellow]"
+                elif ms.pending_sell:
+                    ps = ms.pending_sell
+                    tag = "SL" if ps.get("is_sl") else "TP"
+                    armor_tag = f" [cyan]⏳{tag}#{ps.get('attempts',1)}[/cyan]"
+                else:
+                    armor_tag = ""
                 pos_str  = (
                     f"{t.side}@{t.entry_price:.2f}({gain:+.2f}) "
-                    f"P={t.p_fair:.2f} EV=${t.ev_usd:.2f}"
+                    f"P={t.p_fair:.2f} EV=${t.ev_usd:.2f}{armor_tag}"
                 )
                 row_style = "green" if gain >= 0 else "red"
             elif ms.has_traded:
@@ -1377,12 +1666,15 @@ class KrajekisSniperBot:
             f"  EMA21: ${ta.get('ema21',0):,.0f}  EMA50: ${ta.get('ema50',0):,.0f}\n"
             f"  RSI:   [magenta]{rsi:.1f}[/magenta]  "
             f"MACD: {'[green]' if ta.get('macd',0)>0 else '[red]'}{ta.get('macd',0):+.2f}[/]\n\n"
-            f"[bold cyan]CONVERGENCE (V15.7)[/bold cyan]\n"
+            f"[bold cyan]CONVERGENCE + ARMOR (V15.8)[/bold cyan]\n"
             f"  σ5m:   [yellow]{vol_5m*100:.3f}%[/yellow]  "
             f"σ15m: {ta.get('realized_vol_15m',0)*100:.3f}%\n"
             f"  OFI:   {'[green]' if avg_ofi>=0 else '[red]'}{avg_ofi:+.3f}[/] (ort.)\n"
             f"  EV eşiği: ${self.strat.get('conv_ev_threshold_usd',0.08):.2f}  "
-            f"TA filtre: {'açık' if self.strat.get('conv_use_ta_filter',False) else 'kapalı'}\n\n"
+            f"TA filtre: {'açık' if self.strat.get('conv_use_ta_filter',False) else 'kapalı'}\n"
+            f"  SL ticks: {int(self.strat.get('sl_aggr_ticks',2))}  "
+            f"TP timeout: {int(self.strat.get('tp_maker_timeout_s',15))}s  "
+            f"Let settle: {int(self.strat.get('let_settle_fallback_secs',30))}s\n\n"
             f"[bold cyan]ORACLE (Chainlink)[/bold cyan]\n"
             f"  Fiyat: [bold green]${cl:,.0f}[/bold green] ({cl_age}s)\n"
             f"  Fark:  ${abs(cl-bn):,.1f}  "
@@ -1404,12 +1696,12 @@ class KrajekisSniperBot:
         )
         lay["s"].update(Panel(
             Text.from_markup(stat),
-            title="Krajekis V15.7 CONVERGENCE",
+            title="Krajekis V15.8 EXECUTION ARMOR",
             border_style="yellow",
         ))
         lay["l"].update(Panel(
             Text.from_markup("\n".join(list(self.logs))),
-            title="Sistem Log [V15.7 | CONVERGENCE+OFI+VOL | RTDS+SYNC+SL]",
+            title="Sistem Log [V15.8 | CONVERGENCE+OFI+VOL | FOK-SL+TP-MAKER+CANCEL-REPLACE]",
             border_style="cyan",
         ))
         return lay
@@ -1434,11 +1726,12 @@ class KrajekisSniperBot:
                     self._log(f"Live Onay: {appr}", "INFO")
 
                 self._log(
-                    f"V15.7 CONVERGENCE EDITION Basladi "
+                    f"V15.8 EXECUTION ARMOR Basladi "
                     f"({'CANLI' if self.live_mode else 'PAPER'}) | "
                     f"EV>${self.strat.get('conv_ev_threshold_usd',0.08):.2f} "
-                    f"max_pos={self.risk.get('max_open_positions',5)} "
-                    f"cooldown={int(self.strat.get('fok_cooldown',10))}s",
+                    f"SL_ticks={int(self.strat.get('sl_aggr_ticks',2))} "
+                    f"TP_timeout={int(self.strat.get('tp_maker_timeout_s',15))}s "
+                    f"let_settle_fb={int(self.strat.get('let_settle_fallback_secs',30))}s",
                     "LIVE" if self.live_mode else "PAPER",
                 )
 
