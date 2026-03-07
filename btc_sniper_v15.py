@@ -980,7 +980,7 @@ class KrajekisSniperBot:
         # YES — sweet-spot zaman penceresindeyse
         if self._in_yes_window(ms) and ms.yes_id:
             entry = ms.best_ask
-            max_e = float(self.strat.get("max_entry_yes", 0.87))
+            max_e = float(self.strat.get("max_entry_yes", 0.80))
             if min_e <= entry <= max_e:
                 _, raw = _safe_amounts(entry, stake)
                 if raw > 0:
@@ -992,7 +992,7 @@ class KrajekisSniperBot:
         # NO — son-dakika zaman penceresindeyse
         if self._in_no_window(ms) and ms.no_id:
             entry = 1.0 - ms.best_bid
-            max_e = float(self.strat.get("max_entry_no", 0.83))
+            max_e = float(self.strat.get("max_entry_no", 0.75))
             if min_e <= entry <= max_e:
                 _, raw = _safe_amounts(entry, stake)
                 if raw > 0:
