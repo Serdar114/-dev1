@@ -1245,8 +1245,11 @@ class KrajekisSniperBot:
         )
         ref_btc = float(ms.ref_chainlink) if ms.ref_chainlink else 0.0
         # Veri yoksa (CL geç yüklenebilir, 8-15sn): reversal kanıtlanamaz → hold.
+        # Stale/bozuk fiyat (87492, 67952 gibi) >10% sapma gösterir → hold.
         if cur_btc == 0 or ref_btc == 0:
             btc_confirms = True
+        elif abs(cur_btc - ref_btc) / ref_btc > 0.10:
+            btc_confirms = True  # Stale/bogus CL fiyatı — güvenilmez, hold
         else:
             btc_confirms = (
                 (t.side == "YES" and cur_btc > ref_btc) or
