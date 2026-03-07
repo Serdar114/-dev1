@@ -1393,7 +1393,7 @@ class KrajekisSniperBot:
         signal, side, entry, p_win, ev = self._pick_best_side(ms)
         ms.signal = signal
 
-        min_ev = float(self.strat.get("conv_ev_threshold_usd", 0.08))
+        min_ev = float(self.strat.get("conv_ev_threshold_usd", 1.5))
         if not side or ev < min_ev:
             return
 
