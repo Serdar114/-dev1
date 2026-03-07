@@ -1244,6 +1244,9 @@ class KrajekisSniperBot:
             or 0.0
         )
         ref_btc = float(ms.ref_chainlink) if ms.ref_chainlink else 0.0
+        # Minimum reversal eşiği: BTC ref'ten bu kadar uzaklaşmadan "reversal sayılmaz".
+        # $68k BTC için 0.015% ≈ $10 — $3 gibi gürültü hareketlerini filtreler.
+        noise_pct = float(self.strat.get("btc_reversal_noise_pct", 0.00015))
         # Veri yoksa (CL geç yüklenebilir, 8-15sn): reversal kanıtlanamaz → hold.
         # Stale/bozuk fiyat (87492, 67952 gibi) >10% sapma gösterir → hold.
         if cur_btc == 0 or ref_btc == 0:
@@ -1252,8 +1255,8 @@ class KrajekisSniperBot:
             btc_confirms = True  # Stale/bogus CL fiyatı — güvenilmez, hold
         else:
             btc_confirms = (
-                (t.side == "YES" and cur_btc > ref_btc) or
-                (t.side == "NO"  and cur_btc < ref_btc)
+                (t.side == "YES" and cur_btc >= ref_btc * (1 - noise_pct)) or
+                (t.side == "NO"  and cur_btc <= ref_btc * (1 + noise_pct))
             )
 
         # NO Stop Loss
