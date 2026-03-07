@@ -1244,13 +1244,14 @@ class KrajekisSniperBot:
             or 0.0
         )
         ref_btc = float(ms.ref_chainlink) if ms.ref_chainlink else 0.0
-        btc_confirms = (
-            cur_btc > 0 and ref_btc > 0
-            and (
+        # Veri yoksa (CL geç yüklenebilir, 8-15sn): reversal kanıtlanamaz → hold.
+        if cur_btc == 0 or ref_btc == 0:
+            btc_confirms = True
+        else:
+            btc_confirms = (
                 (t.side == "YES" and cur_btc > ref_btc) or
                 (t.side == "NO"  and cur_btc < ref_btc)
             )
-        )
 
         # NO Stop Loss
         if t.side == "NO":
