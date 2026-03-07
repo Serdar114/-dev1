@@ -1236,9 +1236,32 @@ class KrajekisSniperBot:
             ms.sl_strikes = 0
             return True, "TAKE_PROFIT", round(pnl, 4), cur_poly
 
-        # NO Stop Loss (V15.6 kritik ekleme — SETTL_LOSS önleme)
+        # BTC yön doğrulaması: token likidite gürültüsünü filtrele.
+        # Eğer BTC hâlâ pozisyon yönünü onaylıyorsa SL'yi atla — settlement'a git.
+        cur_btc = float(
+            self.prices.get("BTC_CHAINLINK")
+            or self.prices.get("BTC_BINANCE")
+            or 0.0
+        )
+        ref_btc = float(ms.ref_chainlink) if ms.ref_chainlink else 0.0
+        btc_confirms = (
+            cur_btc > 0 and ref_btc > 0
+            and (
+                (t.side == "YES" and cur_btc > ref_btc) or
+                (t.side == "NO"  and cur_btc < ref_btc)
+            )
+        )
+
+        # NO Stop Loss
         if t.side == "NO":
             if move_pct <= -hard_sl_no:
+                if btc_confirms:
+                    self._log(
+                        f"NO SL ATLATILDI — BTC yön onayliyor "
+                        f"cur={cur_btc:.0f} ref={ref_btc:.0f} | move={move_pct:+.2%}",
+                        "INFO",
+                    )
+                    return False, "", 0.0, 0.0
                 pnl = (t.net_shares * cur_poly) - (t.raw_shares * t.entry_price)
                 ms.sl_strikes = 0
                 self._log(
@@ -1251,11 +1274,21 @@ class KrajekisSniperBot:
 
         # YES Stop Loss
         if move_pct <= -hard_sl:
+            if btc_confirms:
+                self._log(
+                    f"YES SL ATLATILDI — BTC yön onayliyor "
+                    f"cur={cur_btc:.0f} ref={ref_btc:.0f} | move={move_pct:+.2%}",
+                    "INFO",
+                )
+                return False, "", 0.0, 0.0
             pnl = (t.net_shares * cur_poly) - (t.raw_shares * t.entry_price)
             ms.sl_strikes = 0
             return True, "STOP_LOSS", round(pnl, 4), cur_poly
 
         if move_pct <= -sl:
+            if btc_confirms:
+                ms.sl_strikes = 0
+                return False, "", 0.0, 0.0
             ms.sl_strikes += 1
             if ms.sl_strikes >= 3:
                 pnl = (t.net_shares * cur_poly) - (t.raw_shares * t.entry_price)
