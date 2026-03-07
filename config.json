@@ -18,7 +18,7 @@
     "max_open_positions": 3
   },
   "strategy": {
-    "paper_only": true,
+    "paper_only": false,
 
     "min_entry_price": 0.52,
 
@@ -53,5 +53,5 @@
     "rsi_oversold":          30,
     "min_signal_score":      3
   },
-  "memory_file": "trades_paper.jsonl"
+  "memory_file": "trades_live.jsonl"
 }
