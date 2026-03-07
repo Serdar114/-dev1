@@ -1154,7 +1154,9 @@ class KrajekisSniperBot:
         # --- Doldurulma kontrolü ---
         status = await self.order_mgr.get_order_status(oid)
         if status == "MATCHED":
-            self._record(ms, ps["pnl"], ps["reason"], ps["exit_px"])
+            _ref_src_tp = "CHAINLINK_OPEN" if ms.ref_chainlink > 0 else "ENTRY_FALLBACK"
+            self._record(ms, ps["pnl"], ps["reason"], ps["exit_px"],
+                         ms.ref_chainlink, _ref_src_tp)
             ms.pending_sell = None
             ms.has_traded   = True
             self._log(
@@ -1242,6 +1244,30 @@ class KrajekisSniperBot:
         cur_poly = _safe_price(ms.best_bid if t.side == "YES" else 1.0 - ms.best_ask)
         move_pct = (cur_poly - t.entry_price) / t.entry_price
 
+        # BTC yön verileri — settle buffer ve SL kontrolü için erken hesapla
+        cur_btc = float(
+            self.prices.get("BTC_CHAINLINK")
+            or self.prices.get("BTC_BINANCE")
+            or 0.0
+        )
+        ref_btc = float(ms.ref_chainlink) if ms.ref_chainlink else 0.0
+
+        # Settle proximity buffer: expiry yakınında BTC oracle'a çok yakınsa zorla çıkış.
+        # Polymarket kendi oracle zaman damgasını kullanır; fark küçükse yanlış settle riski var.
+        prox_secs = float(self.strat.get("settle_proximity_secs", 60.0))
+        prox_pct  = float(self.strat.get("settle_proximity_pct",  0.0005))  # 0.05% ≈ $34 @$67k
+        if (ms.secs_left < prox_secs
+                and cur_btc > 0 and ref_btc > 0
+                and abs(cur_btc - ref_btc) / ref_btc < prox_pct):
+            pnl = (t.net_shares * cur_poly) - (t.raw_shares * t.entry_price)
+            self._log(
+                f"SETTLE BUFFER → ZORLA ÇIKIŞ | oracle yakın "
+                f"Δ${cur_btc - ref_btc:+.0f} ({abs(cur_btc-ref_btc)/ref_btc:.4%})"
+                f" | secs_left={ms.secs_left:.0f}s",
+                "WARNING",
+            )
+            return True, "FORCED_EXIT_NEAR_ORACLE", round(pnl, 4), cur_poly
+
         # "Let YES Settle" modu
         let_settle_secs    = float(self.strat.get("let_yes_settle_secs",           45.0))
         let_settle_min_pct = float(self.strat.get("let_yes_settle_min_profit_pct", 0.15))
@@ -1259,12 +1285,6 @@ class KrajekisSniperBot:
 
         # BTC yön doğrulaması: token likidite gürültüsünü filtrele.
         # Eğer BTC hâlâ pozisyon yönünü onaylıyorsa SL'yi atla — settlement'a git.
-        cur_btc = float(
-            self.prices.get("BTC_CHAINLINK")
-            or self.prices.get("BTC_BINANCE")
-            or 0.0
-        )
-        ref_btc = float(ms.ref_chainlink) if ms.ref_chainlink else 0.0
         # Minimum reversal eşiği: BTC ref'ten bu kadar uzaklaşmadan "reversal sayılmaz".
         # $68k BTC için 0.015% ≈ $10 — $3 gibi gürültü hareketlerini filtreler.
         noise_pct = float(self.strat.get("btc_reversal_noise_pct", 0.00015))
