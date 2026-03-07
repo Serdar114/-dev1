@@ -571,6 +571,10 @@ class KrajekisSniperBot:
             "https://rpc.ankr.com/polygon",
             "https://polygon.llamarpc.com",
             "https://1rpc.io/matic",
+            "https://polygon.meowrpc.com",
+            "https://polygon.drpc.org",
+            "https://polygon-bor.publicnode.com",
+            "https://polygon.gateway.tenderly.co",
         ]
         _CONTRACT = "0xc907E116054Ad103354f2D350FD2514433D57F6f"
         _DATA     = "0xfeaf968c"
@@ -579,8 +583,25 @@ class KrajekisSniperBot:
         connector = aiohttp.TCPConnector(
             family=socket.AF_INET,
             resolver=aiohttp.ThreadedResolver(),
-            limit=4,
+            limit=len(_RPC_ENDPOINTS),
         )
+
+        async def _query(sess: aiohttp.ClientSession, rpc: str, payload: dict) -> Optional[float]:
+            try:
+                async with sess.post(
+                    rpc, json=payload,
+                    timeout=aiohttp.ClientTimeout(total=3),
+                ) as r:
+                    if r.status == 200:
+                        res     = await r.json(content_type=None)
+                        hex_val = res.get("result", "")
+                        if hex_val and len(hex_val) >= 130:
+                            price = int(hex_val[66:130], 16) / 1e8
+                            if 10_000 < price < 1_000_000:
+                                return price
+            except Exception:
+                pass
+            return None
 
         async with aiohttp.ClientSession(connector=connector) as sess:
             while self._running:
@@ -589,37 +610,27 @@ class KrajekisSniperBot:
                     "params": [{"to": _CONTRACT, "data": _DATA}, "latest"],
                     "id": int(time.time() * 1000),
                 }
-                got = False
-                for rpc in _RPC_ENDPOINTS:
-                    try:
-                        async with sess.post(
-                            rpc, json=payload,
-                            timeout=aiohttp.ClientTimeout(total=4),
-                        ) as r:
-                            if r.status == 200:
-                                res     = await r.json(content_type=None)
-                                hex_val = res.get("result", "")
-                                if hex_val and len(hex_val) >= 130:
-                                    price = int(hex_val[66:130], 16) / 1e8
-                                    if 10_000 < price < 1_000_000:
-                                        self.prices["BTC_CHAINLINK"]              = price
-                                        self.prices_ts["BTC_CHAINLINK_ts_src_ms"] = int(time.time() * 1000)
-                                        if not self._rtds_chainlink_ok:
-                                            self._rtds_chainlink_ok = True
-                                            self._log("RTDS Chainlink REST polling basladi (5s)", "INFO")
-                                        got = True
-                                        backoff = 1.0
-                                        break
-                    except Exception:
-                        continue
+                results = await asyncio.gather(
+                    *[_query(sess, rpc, payload) for rpc in _RPC_ENDPOINTS],
+                    return_exceptions=True,
+                )
+                price = next((r for r in results if isinstance(r, float)), None)
+                got = price is not None
 
-                if not got:
+                if got:
+                    self.prices["BTC_CHAINLINK"]              = price
+                    self.prices_ts["BTC_CHAINLINK_ts_src_ms"] = int(time.time() * 1000)
+                    if not self._rtds_chainlink_ok:
+                        self._rtds_chainlink_ok = True
+                        self._log("RTDS Chainlink REST polling basladi (paralel 5s)", "INFO")
+                    backoff = 1.0
+                else:
                     self._rtds_chainlink_ok = False
 
                 try:
                     await asyncio.sleep(5.0 if got else backoff)
                     if not got:
-                        backoff = min(backoff * 2, 30.0)
+                        backoff = min(backoff * 2, 10.0)
                 except asyncio.CancelledError:
                     raise
 
@@ -687,12 +698,16 @@ class KrajekisSniperBot:
     # ------------------------------------------------------------------ fiyat + TA
 
     async def _fetch_chainlink_btc(self, session: aiohttp.ClientSession) -> Optional[float]:
-        """HTTP fallback — RTDS taze değilse çağrılır."""
+        """HTTP fallback — RTDS taze değilse çağrılır (paralel)."""
         _RPC_ENDPOINTS = [
             "https://polygon-rpc.com",
             "https://rpc.ankr.com/polygon",
             "https://polygon.llamarpc.com",
             "https://1rpc.io/matic",
+            "https://polygon.meowrpc.com",
+            "https://polygon.drpc.org",
+            "https://polygon-bor.publicnode.com",
+            "https://polygon.gateway.tenderly.co",
         ]
         payload = {
             "jsonrpc": "2.0",
@@ -701,20 +716,26 @@ class KrajekisSniperBot:
                          "data": "0xfeaf968c"}, "latest"],
             "id": int(time.time() * 1000),
         }
-        for endpoint in _RPC_ENDPOINTS:
+
+        async def _query(rpc: str) -> Optional[float]:
             try:
                 async with session.post(
-                    endpoint, json=payload,
-                    timeout=aiohttp.ClientTimeout(total=5)
+                    rpc, json=payload,
+                    timeout=aiohttp.ClientTimeout(total=3)
                 ) as r:
                     if r.status == 200:
-                        res     = await r.json()
+                        res     = await r.json(content_type=None)
                         hex_val = res.get("result", "")
                         if hex_val and len(hex_val) >= 130:
-                            return int(hex_val[66:130], 16) / 1e8
+                            price = int(hex_val[66:130], 16) / 1e8
+                            if 10_000 < price < 1_000_000:
+                                return price
             except Exception:
-                continue
-        return None
+                pass
+            return None
+
+        results = await asyncio.gather(*[_query(ep) for ep in _RPC_ENDPOINTS], return_exceptions=True)
+        return next((r for r in results if isinstance(r, float)), None)
 
     async def _fetch_prices_and_ta(self, session: aiohttp.ClientSession) -> None:
         now_utc = datetime.now(timezone.utc)
