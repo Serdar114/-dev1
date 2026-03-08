@@ -45,7 +45,8 @@
 
     "tp_pct_no_gain":   0.18,
     "hard_sl_no_pct":   0.25,
-    "force_exit_secs":  45.0,
+    "force_exit_secs":    45.0,
+    "ofi_exit_threshold": 0.5,
 
     "emergency_stop":         0.68,
     "convergence_btc_delta":  15.0,

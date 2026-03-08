@@ -110,6 +110,7 @@ class MarketState:
 
         self.best_ask: float = 0.5
         self.best_bid: float = 0.5
+        self.ofi:      float = 0.0   # Order Flow Imbalance: -1 (sat baskısı) → +1 (alış baskısı)
         self.signal:   str   = "BEKLE"
 
         self.active_trade:      Optional[Trade] = None
@@ -509,6 +510,12 @@ class SniperBot:
                 if bids and asks:
                     ms.best_bid = float(bids[0]["price"])
                     ms.best_ask = float(asks[0]["price"])
+
+                    # OFI: (alış hacmi - satış hacmi) / toplam hacim
+                    bid_vol = sum(float(b.get("size", 0)) for b in bids[:5])
+                    ask_vol = sum(float(a.get("size", 0)) for a in asks[:5])
+                    total   = bid_vol + ask_vol
+                    ms.ofi  = round((bid_vol - ask_vol) / total, 4) if total > 0 else 0.0
         except Exception:
             pass
 
@@ -619,7 +626,14 @@ class SniperBot:
             else:
                 ms.sl_strikes = 0
 
-            # 5) Oracle yaklaşınca zarar eden pozisyonu kapat
+            # 5) OFI — alış baskısı yok ve zarardayız → erken çıkış
+            ofi_thr = float(self.strat.get("ofi_exit_threshold", 0.5))
+            if ms.ofi < -ofi_thr and move_pct < 0.0:
+                pnl = t.net_shares * cur_poly - t.raw_shares * t.entry_price
+                ms.sl_strikes = 0
+                return True, "OFI_EXIT", round(pnl, 4), cur_poly
+
+            # 6) Oracle yaklaşınca zarar eden pozisyonu kapat
             force_secs = float(self.strat.get("force_exit_secs", 45.0))
             if secs < force_secs and move_pct < 0.0:
                 pnl = t.net_shares * cur_poly - t.raw_shares * t.entry_price
@@ -645,7 +659,13 @@ class SniperBot:
                 pnl = t.net_shares * cur_poly - t.raw_shares * t.entry_price
                 return True, "STOP_LOSS", round(pnl, 4), cur_poly
 
-            # 4) Oracle yaklaşınca >%10 zarar eden NO pozisyonunu kapat
+            # 4) OFI — satış baskısı yok (alış baskısı var = NO aleyhine) → erken çıkış
+            ofi_thr = float(self.strat.get("ofi_exit_threshold", 0.5))
+            if ms.ofi > ofi_thr and move_pct < 0.0:
+                pnl = t.net_shares * cur_poly - t.raw_shares * t.entry_price
+                return True, "OFI_EXIT", round(pnl, 4), cur_poly
+
+            # 5) Oracle yaklaşınca >%10 zarar eden NO pozisyonunu kapat
             force_secs = float(self.strat.get("force_exit_secs", 45.0))
             if secs < force_secs and move_pct < -0.10:
                 pnl = t.net_shares * cur_poly - t.raw_shares * t.entry_price
@@ -843,7 +863,7 @@ class SniperBot:
             row_style  = "white"
             if ms.active_trade:
                 t         = ms.active_trade
-                pos_str   = f"{t.side}@{t.entry_price:.2f}"
+                pos_str   = f"{t.side}@{t.entry_price:.2f} OFI:{ms.ofi:+.2f}"
                 row_style = "green"
             elif ms.has_traded:
                 pos_str   = "[dim]KAPANDI[/dim]"
