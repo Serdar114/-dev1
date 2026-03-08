@@ -547,7 +547,12 @@ class SniperBot:
         yes_start = float(self.strat.get("sweet_spot_15m_start" if is_15m else "sweet_spot_5m_start", 10.0))
         yes_end   = float(self.strat.get("sweet_spot_15m_end"   if is_15m else "sweet_spot_5m_end",    5.0))
 
+        ofi_filter = float(self.strat.get("ofi_entry_filter", 0.30))
+
         if yes_end <= ms.mins_left <= yes_start:
+            # OFI filtresi: güçlü satış baskısı varsa YES'e girme
+            if ms.ofi < -ofi_filter:
+                return "OFI KARSI (YES)"
             score = sum([
                 px > vwap,
                 e21 > e50,
@@ -564,6 +569,9 @@ class SniperBot:
         no_end_m   = no_end_s   / 60.0
 
         if no_end_m <= ms.mins_left <= no_start_m:
+            # OFI filtresi: güçlü alış baskısı varsa NO'ya girme
+            if ms.ofi > ofi_filter:
+                return "OFI KARSI (NO)"
             ref = ms.ref_chainlink
             if ref > 0:
                 req_drop = float(self.strat.get(
@@ -633,42 +641,62 @@ class SniperBot:
                 ms.sl_strikes = 0
                 return True, "OFI_EXIT", round(pnl, 4), cur_poly
 
-            # 6) Oracle yaklaşınca zarar eden pozisyonu kapat
-            force_secs = float(self.strat.get("force_exit_secs", 45.0))
-            if secs < force_secs and move_pct < 0.0:
+            # 6) Oracle yaklaşınca SADECE OFI aleyhte + kayıp yeterliyse çık
+            force_secs     = float(self.strat.get("force_exit_secs", 15.0))
+            force_min_loss = float(self.strat.get("force_exit_min_loss_pct", 0.05))
+            force_ofi      = float(self.strat.get("force_exit_ofi_confirm", 0.15))
+            if secs < force_secs and move_pct < -force_min_loss and ms.ofi < -force_ofi:
                 pnl = t.net_shares * cur_poly - t.raw_shares * t.entry_price
                 ms.sl_strikes = 0
                 return True, "FORCED_EXIT_NEAR_ORACLE", round(pnl, 4), cur_poly
 
         elif t.side == "NO":
             tp_no      = float(self.strat.get("tp_pct_no_gain", 0.18))
+            sl_no      = float(self.strat.get("sl_pct_loss_no", 0.15))
             hard_sl_no = float(self.strat.get("hard_sl_no_pct", 0.25))
 
-            # 1) Absolute price floor — NO için de geçerli
+            # 1) Absolute price floor
             if cur_poly <= abs_min:
                 pnl = t.net_shares * cur_poly - t.raw_shares * t.entry_price
+                ms.sl_strikes = 0
                 return True, "STOP_LOSS", round(pnl, 4), cur_poly
 
             # 2) TP
             if move_pct >= tp_no:
                 pnl = t.net_shares * cur_poly - t.raw_shares * t.entry_price
+                ms.sl_strikes = 0
                 return True, "TAKE_PROFIT", round(pnl, 4), cur_poly
 
-            # 3) Hard stop — NO pozisyonu artık korumalı
+            # 3) Hard stop
             if move_pct <= -hard_sl_no:
                 pnl = t.net_shares * cur_poly - t.raw_shares * t.entry_price
+                ms.sl_strikes = 0
                 return True, "STOP_LOSS", round(pnl, 4), cur_poly
 
-            # 4) OFI — satış baskısı yok (alış baskısı var = NO aleyhine) → erken çıkış
+            # 4) Soft stop 3-strike (YES ile simetrik)
+            if move_pct <= -sl_no:
+                ms.sl_strikes += 1
+                if ms.sl_strikes >= 3:
+                    pnl = t.net_shares * cur_poly - t.raw_shares * t.entry_price
+                    ms.sl_strikes = 0
+                    return True, "STOP_LOSS", round(pnl, 4), cur_poly
+            else:
+                ms.sl_strikes = 0
+
+            # 5) OFI — alış baskısı güçlü VE zarardayız → erken çık
             ofi_thr = float(self.strat.get("ofi_exit_threshold", 0.5))
             if ms.ofi > ofi_thr and move_pct < 0.0:
                 pnl = t.net_shares * cur_poly - t.raw_shares * t.entry_price
+                ms.sl_strikes = 0
                 return True, "OFI_EXIT", round(pnl, 4), cur_poly
 
-            # 5) Oracle yaklaşınca >%10 zarar eden NO pozisyonunu kapat
-            force_secs = float(self.strat.get("force_exit_secs", 45.0))
-            if secs < force_secs and move_pct < -0.10:
+            # 6) Oracle yaklaşınca SADECE OFI aleyhte + kayıp yeterliyse çık
+            force_secs     = float(self.strat.get("force_exit_secs", 15.0))
+            force_min_loss = float(self.strat.get("force_exit_min_loss_pct", 0.05))
+            force_ofi      = float(self.strat.get("force_exit_ofi_confirm", 0.15))
+            if secs < force_secs and move_pct < -force_min_loss and ms.ofi > force_ofi:
                 pnl = t.net_shares * cur_poly - t.raw_shares * t.entry_price
+                ms.sl_strikes = 0
                 return True, "FORCED_EXIT_NEAR_ORACLE", round(pnl, 4), cur_poly
 
         return False, "", 0.0, 0.0
