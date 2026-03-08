@@ -38,10 +38,14 @@
     "no_min_btc_drop_5m":   60.0,
     "no_min_btc_drop_15m": 100.0,
 
-    "tp_pct_gain":  0.20,
-    "sl_pct_loss":  0.15,
-    "hard_sl_pct":  0.25,
+    "tp_pct_gain":      0.20,
+    "sl_pct_loss":      0.15,
+    "hard_sl_pct":      0.25,
     "abs_min_poly_stop": 0.18,
+
+    "tp_pct_no_gain":   0.18,
+    "hard_sl_no_pct":   0.25,
+    "force_exit_secs":  45.0,
 
     "emergency_stop":         0.68,
     "convergence_btc_delta":  15.0,

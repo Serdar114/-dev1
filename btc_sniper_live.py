@@ -582,22 +582,34 @@ class SniperBot:
 
         cur_poly = _clamp_price(ms.best_bid if t.side == "YES" else 1.0 - ms.best_ask)
         move_pct = (cur_poly - t.entry_price) / t.entry_price
+        abs_min  = float(self.strat.get("abs_min_poly_stop", 0.18))
+        secs     = ms.secs_left
 
         if t.side == "YES":
-            tp       = float(self.strat.get("tp_pct_gain",  0.20))
-            sl       = float(self.strat.get("sl_pct_loss",  0.15))
-            hard_sl  = float(self.strat.get("hard_sl_pct",  0.25))
+            tp       = float(self.strat.get("tp_pct_gain", 0.20))
+            sl       = float(self.strat.get("sl_pct_loss", 0.15))
+            hard_sl  = float(self.strat.get("hard_sl_pct", 0.25))
 
+            # 1) Absolute price floor — önce kontrol et, her durumda geçerli
+            #    (FORCED_EXIT_NEAR_ORACLE 0.05/0.04 felaketini önler)
+            if cur_poly <= abs_min:
+                pnl = t.net_shares * cur_poly - t.raw_shares * t.entry_price
+                ms.sl_strikes = 0
+                return True, "STOP_LOSS", round(pnl, 4), cur_poly
+
+            # 2) TP
             if move_pct >= tp:
                 pnl = t.net_shares * cur_poly - t.raw_shares * t.entry_price
                 ms.sl_strikes = 0
                 return True, "TAKE_PROFIT", round(pnl, 4), cur_poly
 
+            # 3) Hard stop
             if move_pct <= -hard_sl:
                 pnl = t.net_shares * cur_poly - t.raw_shares * t.entry_price
                 ms.sl_strikes = 0
                 return True, "STOP_LOSS", round(pnl, 4), cur_poly
 
+            # 4) Soft stop (3-strike)
             if move_pct <= -sl:
                 ms.sl_strikes += 1
                 if ms.sl_strikes >= 3:
@@ -607,12 +619,37 @@ class SniperBot:
             else:
                 ms.sl_strikes = 0
 
+            # 5) Oracle yaklaşınca zarar eden pozisyonu kapat
+            force_secs = float(self.strat.get("force_exit_secs", 45.0))
+            if secs < force_secs and move_pct < 0.0:
+                pnl = t.net_shares * cur_poly - t.raw_shares * t.entry_price
+                ms.sl_strikes = 0
+                return True, "FORCED_EXIT_NEAR_ORACLE", round(pnl, 4), cur_poly
+
         elif t.side == "NO":
-            # NO pozisyonunda stop-loss yok (wick koruması)
-            tp_no = 0.18
+            tp_no      = float(self.strat.get("tp_pct_no_gain", 0.18))
+            hard_sl_no = float(self.strat.get("hard_sl_no_pct", 0.25))
+
+            # 1) Absolute price floor — NO için de geçerli
+            if cur_poly <= abs_min:
+                pnl = t.net_shares * cur_poly - t.raw_shares * t.entry_price
+                return True, "STOP_LOSS", round(pnl, 4), cur_poly
+
+            # 2) TP
             if move_pct >= tp_no:
                 pnl = t.net_shares * cur_poly - t.raw_shares * t.entry_price
-                return True, "TAKE_PROFIT (NO)", round(pnl, 4), cur_poly
+                return True, "TAKE_PROFIT", round(pnl, 4), cur_poly
+
+            # 3) Hard stop — NO pozisyonu artık korumalı
+            if move_pct <= -hard_sl_no:
+                pnl = t.net_shares * cur_poly - t.raw_shares * t.entry_price
+                return True, "STOP_LOSS", round(pnl, 4), cur_poly
+
+            # 4) Oracle yaklaşınca >%10 zarar eden NO pozisyonunu kapat
+            force_secs = float(self.strat.get("force_exit_secs", 45.0))
+            if secs < force_secs and move_pct < -0.10:
+                pnl = t.net_shares * cur_poly - t.raw_shares * t.entry_price
+                return True, "FORCED_EXIT_NEAR_ORACLE", round(pnl, 4), cur_poly
 
         return False, "", 0.0, 0.0
 
