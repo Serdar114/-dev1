@@ -1101,6 +1101,21 @@ class KrajekisSniperV16:
             ms.signal = "FIYAT HATALI"
             return
 
+        # ELITE SNIPER: Market timing penceresi
+        # Kısa piyasalar (< 30dk): sadece %20-%60 ömür bandında gir
+        #   → İlk %20: aşırı whipsaw; son %40: likidite sığ + 4000ms ölümcül
+        # Uzun piyasalar (≥ 30dk): bu kısıt uygulanmaz (gecikme ihmal edilebilir)
+        total_secs = ms.duration_hours * 3600.0
+        secs_left  = ms.secs_left
+        if total_secs < 1800:   # 30 dakikadan kısa piyasa
+            elapsed_pct = (total_secs - secs_left) / total_secs if total_secs > 0 else 0
+            if elapsed_pct < 0.20:
+                ms.signal = f"TOO EARLY {elapsed_pct:.0%}<20%"
+                return
+            if elapsed_pct > 0.60:
+                ms.signal = f"TOO LATE {elapsed_pct:.0%}>60% (likidite yok)"
+                return
+
         # FIX 2: Latency filtresi — stale veri kontrolü
         stale_limit_ms = float(self.strat.get("stale_data_limit_ms", 3000))
         ofi_age_ms     = self._ofi_buf.data_age_ms

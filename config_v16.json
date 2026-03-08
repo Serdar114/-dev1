@@ -33,8 +33,8 @@
     "_comment_positions": "Max 2 eş zamanlı pozisyon (araştırma önerisi).",
     "max_open_positions": 2,
 
-    "_comment_sl": "FIX 1: Polymarket market price SL. Oracle'ı beklemeden, piyasa fiyatı bu eşiğin altına düşerse acil çıkış.",
-    "sl_market_price_threshold": 0.18,
+    "_comment_sl": "FIX 1 REVİZE: Phantom SL kaldırıldı (4000ms gecikmeyle 0.18 likidite hayalet).",
+    "sl_market_price_threshold": 0.04,
 
     "_comment_survival": "FIX 3: Survival mode. Kasa bu eşiğin altındayken stake hard-cap uygulanır.",
     "survival_bankroll_threshold": 50.0,
@@ -52,19 +52,19 @@
     "min_market_duration_hours": 1.0,
     "max_market_duration_days":  7.0,
 
-    "_comment_price_band": "Fiyat bandı: 0.30-0.45 VEYA 0.55-0.70.",
-    "price_band_low_min":   0.30,
-    "price_band_low_max":   0.45,
-    "price_band_high_min":  0.55,
-    "price_band_high_max":  0.70,
+    "_comment_price_band": "Elite Sniper bandı: giriş 0.20-0.35 (YES) veya 0.65-0.80 (NO). Avg 0.785'ten 0.275'e iner → break-even %78.5'ten %27.5'e düşer → EV POZİTİF.",
+    "price_band_low_min":   0.20,
+    "price_band_low_max":   0.35,
+    "price_band_high_min":  0.65,
+    "price_band_high_max":  0.80,
 
     "_comment_liquidity": "Minimum $1000 açık faiz.",
     "min_liquidity_usd": 1000.0,
 
-    "_comment_ofi": "OFI kalibrasyon: 15dk lookback, 3:1 oran eşiği, Z-skor ≥ 2.0",
+    "_comment_ofi": "Elite Sniper: Z-skor 3.0'a yükseltildi. 4000ms'lik kör uçuşu kompanse eder — bu seviyede momentum 4sn içinde dönmez.",
     "ofi_lookback_minutes": 15,
     "ofi_ratio_threshold":   3.0,
-    "ofi_z_threshold":       2.0,
+    "ofi_z_threshold":       3.0,
 
     "_comment_ev": "Minimum beklenen değer eşiği (USD).",
     "min_ev_threshold": 0.05,
