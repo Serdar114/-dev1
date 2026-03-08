@@ -1320,6 +1320,18 @@ class KrajekisSniperBot:
                 return True, "STOP_LOSS", round(pnl, 4), cur_poly
             return False, "", 0.0, 0.0
 
+        # Mutlak fiyat tabanı — BTC yönünden bağımsız, her zaman çık
+        abs_floor = float(self.strat.get("abs_min_poly_stop", 0.18))
+        if cur_poly <= abs_floor:
+            pnl = (t.net_shares * cur_poly) - (t.raw_shares * t.entry_price)
+            ms.sl_strikes = 0
+            self._log(
+                f"ABS FLOOR STOP | cur_poly={cur_poly:.3f} <= floor={abs_floor:.2f} "
+                f"| pnl=${pnl:+.3f}",
+                "WARNING",
+            )
+            return True, "STOP_LOSS", round(pnl, 4), cur_poly
+
         # YES Stop Loss
         if move_pct <= -hard_sl:
             if btc_confirms:
