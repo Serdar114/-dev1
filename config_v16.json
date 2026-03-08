@@ -1,0 +1,79 @@
+{
+  "credentials": {
+    "private_key":      "0x3eea5d7836eb5a7f38b1b6ebeefd1e3afc0bc9217a523681e358a4835d689893",
+    "wallet_address":   "0xa131947e8f1404806b278765c314590c7ce51d0e",
+    "api_key":          "560b86bb-cae7-52b5-d400-e4542b88f288",
+    "api_secret":       "xAh_Bb_re_P0jxS5OuyMuYwdOzOHWqjU728WBb9x-VU=",
+    "api_passphrase":   "5d75a8cd9a291c1bbaa8168c0387312389007cb562d918e732b1984302830030"
+  },
+  "network": {
+    "clob_url":      "https://clob.polymarket.com",
+    "gamma_url":     "https://gamma-api.polymarket.com",
+    "chain_id":      137,
+    "binance_symbol": "BTCUSDT"
+  },
+  "risk": {
+    "_comment_bankroll": "Başlangıç kasası. Her işlem sonrası otomatik güncellenir.",
+    "bankroll_usd":       30.0,
+
+    "_comment_kelly": "Araştırma önerisi: Half-Kelly (0.50). Full-Kelly ruin %61.4.",
+    "kelly_fraction":     0.50,
+
+    "_comment_stake": "Polymarket minimum $2.50. Max %50 bankroll per işlem.",
+    "min_stake_usd":      2.50,
+    "max_stake_pct":      0.50,
+
+    "_comment_loss": "Günlük %30 kayıp limiti. Araştırma: çok sıkı limit büyümeyi durdurur.",
+    "max_daily_loss_pct": 0.30,
+    "max_daily_loss_usd": 9.0,
+
+    "_comment_positions": "Max 2 eş zamanlı pozisyon (araştırma önerisi).",
+    "max_open_positions": 2,
+
+    "_comment_target": "Monte Carlo hedefi (45 gün, $30→$900).",
+    "target_bankroll":    900.0,
+    "target_days":        45
+  },
+  "strategy": {
+    "_comment_mode": "false=CANLI, true=PAPER (kağıt) işlem",
+    "paper_only": false,
+
+    "_comment_market_filter": "Piyasa seçim kriterleri (V16 yeni).",
+    "min_market_duration_hours": 1.0,
+    "max_market_duration_days":  7.0,
+
+    "_comment_price_band": "Fiyat bandı: 0.30-0.45 VEYA 0.55-0.70.",
+    "price_band_low_min":   0.30,
+    "price_band_low_max":   0.45,
+    "price_band_high_min":  0.55,
+    "price_band_high_max":  0.70,
+
+    "_comment_liquidity": "Minimum $1000 açık faiz.",
+    "min_liquidity_usd": 1000.0,
+
+    "_comment_ofi": "OFI kalibrasyon: 15dk lookback, 3:1 oran eşiği, Z-skor ≥ 2.0",
+    "ofi_lookback_minutes": 15,
+    "ofi_ratio_threshold":   3.0,
+    "ofi_z_threshold":       2.0,
+
+    "_comment_ev": "Minimum beklenen değer eşiği (USD).",
+    "min_ev_threshold": 0.05,
+
+    "_comment_winrate": "Monte Carlo ve Kelly hesabında kullanılan hedef win rate.",
+    "target_win_rate": 0.65,
+
+    "_comment_fee": "Polymarket dinamik ücret formülü (Mart 2026 güncellemesi).",
+    "fee_rate_bps":  0.25,
+    "fee_exponent":  2,
+
+    "_comment_scan": "Gamma API tarama aralığı (saniye). 300 = her 5 dakikada.",
+    "scan_interval_secs": 300,
+
+    "_comment_cooldown": "Aynı piyasada tekrar işlem için bekleme (saniye).",
+    "fok_cooldown": 60,
+
+    "_comment_trades_per_day": "Monte Carlo simülasyonu için günlük işlem tahmini.",
+    "trades_per_day": 3
+  },
+  "memory_file": "trades_v16.jsonl"
+}
