@@ -33,6 +33,13 @@
     "_comment_positions": "Max 2 eş zamanlı pozisyon (araştırma önerisi).",
     "max_open_positions": 2,
 
+    "_comment_sl": "FIX 1: Polymarket market price SL. Oracle'ı beklemeden, piyasa fiyatı bu eşiğin altına düşerse acil çıkış.",
+    "sl_market_price_threshold": 0.18,
+
+    "_comment_survival": "FIX 3: Survival mode. Kasa bu eşiğin altındayken stake hard-cap uygulanır.",
+    "survival_bankroll_threshold": 50.0,
+    "survival_max_stake_usd":      2.50,
+
     "_comment_target": "Monte Carlo hedefi (45 gün, $30→$900).",
     "target_bankroll":    900.0,
     "target_days":        45
@@ -75,8 +82,13 @@
     "_comment_cooldown": "Aynı piyasada tekrar işlem için bekleme (saniye).",
     "fok_cooldown": 60,
 
+    "_comment_latency": "FIX 2: Stale veri limiti (ms). Bu süre aşılırsa işlem yapılmaz.",
+    "stale_data_limit_ms": 3000,
+
     "_comment_trades_per_day": "Monte Carlo simülasyonu için günlük işlem tahmini.",
     "trades_per_day": 3
   },
+  "_comment_agent_rt": "Agent AI real-time karar modu. Varsayılan KAPALI (latency+maliyet sorunu). Offline analiz için kullan.",
+  "use_agent_realtime": false,
   "memory_file": "trades_v16.jsonl"
 }

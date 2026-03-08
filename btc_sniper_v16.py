@@ -219,6 +219,7 @@ class OFIBuffer:
         self._prev_bid: float = 0.0
         self._prev_ask: float = 0.0
         self._last_snapshot: float = 0.0
+        self._last_data_ts: float = 0.0  # FIX 2: latency izleme
 
     def update(self, bid_depth: float, ask_depth: float) -> None:
         """Yeni depth snapshot ile OFI buffer'ı güncelle."""
@@ -227,7 +228,9 @@ class OFIBuffer:
             return
         self._last_snapshot = now
 
-        # Delta hesaplama
+        # FIX 2: latency izleme — son güncelleme zamanı
+        self._last_data_ts: float = now
+
         bid_delta = bid_depth - self._prev_bid if self._prev_bid > 0 else 0.0
         ask_delta = ask_depth - self._prev_ask if self._prev_ask > 0 else 0.0
         self._prev_bid = bid_depth
@@ -274,6 +277,13 @@ class OFIBuffer:
     @property
     def sample_count(self) -> int:
         return len(self._deltas)
+
+    @property
+    def data_age_ms(self) -> float:
+        """FIX 2: OFI verisinin kaç ms önce güncellendiği."""
+        if self._last_data_ts == 0.0:
+            return 9999.0
+        return (time.time() - self._last_data_ts) * 1000.0
 
     def signal(self, ratio_threshold: float = 3.0, z_threshold: float = 2.0) -> Optional[str]:
         """
@@ -419,6 +429,7 @@ class MarketState:
         self.has_traded:   bool  = False
         self.last_buy_attempt: float = 0.0
         self.liquidity:    float = 0.0   # V16: USD likidite
+        self.last_book_ts: float = 0.0  # FIX 2: son orderbook güncelleme zamanı
 
         # V16: resolved sonuç (settle sonrası)
         self.resolved:     Optional[bool] = None  # True=YES kazandı, False=NO kazandı
@@ -485,6 +496,27 @@ class OrderManager:
                                    side=BUY, token_id=token_id)
                 signed = client.create_order(args)
                 resp   = client.post_order(signed, OrderType.FOK)
+                return (resp.get("orderID") or resp.get("order_id")
+                        or resp.get("id", ""))
+            except Exception as e:
+                return f"ERR:{e}"
+        return await asyncio.get_running_loop().run_in_executor(self._executor, _do)
+
+    async def place_sell(self, token_id: str, price: float, shares: float) -> str:
+        """FIX 1: SL çıkışı için SELL emri (GTC limit, mevcut best_bid fiyatıyla)."""
+        if not self.live_mode:
+            return "PAPER_SELL_OK"
+        if not CLOB_OK:
+            return "ERR:CLOB_IMPORT"
+        def _do():
+            try:
+                client  = self._client_or_raise()
+                price_r = _safe_price(price)
+                # share hesabı: mevcut shares'i sat
+                args    = OrderArgs(price=price_r, size=round(shares, 2),
+                                    side=SELL, token_id=token_id)
+                signed  = client.create_order(args)
+                resp    = client.post_order(signed, OrderType.GTC)
                 return (resp.get("orderID") or resp.get("order_id")
                         or resp.get("id", ""))
             except Exception as e:
@@ -989,6 +1021,7 @@ class KrajekisSniperV16:
                     if bids and asks:
                         ms.best_bid = float(bids[0]["price"])
                         ms.best_ask = float(asks[0]["price"])
+                        ms.last_book_ts = time.time()  # FIX 2: timestamp kaydet
         except Exception:
             pass
 
@@ -1031,12 +1064,26 @@ class KrajekisSniperV16:
             ms.signal = "TAMAMLANDI"
             return
 
-        # Pozisyon let-settle (1H+ binary → kapanışa bırak)
+        # Pozisyon let-settle + FIX 1: Polymarket market price SL
         if ms.active_trade:
+            await self._fetch_book(session, ms)  # anlık fiyatı tazele
+            t       = ms.active_trade
+            yes_mid = (ms.best_bid + ms.best_ask) / 2.0
+            sl_thr  = float(self.risk.get("sl_market_price_threshold", 0.18))
+
+            # Fiyat SL eşiğinin altına düştü mü?
+            price_crashed = (
+                (t.side == "YES" and yes_mid < sl_thr) or
+                (t.side == "NO"  and (1.0 - yes_mid) < sl_thr)
+            )
+            if price_crashed:
+                await self._emergency_sl_exit(ms, session, yes_mid)
+                return
+
             ms.signal = (
                 f"LET SETTLE "
                 f"{ms.hours_left:.1f}h "
-                f"({ms.active_trade.side}@{ms.active_trade.entry_price:.2f})"
+                f"({t.side}@{t.entry_price:.2f} | piyasa={yes_mid:.3f})"
             )
             return
 
@@ -1052,6 +1099,18 @@ class KrajekisSniperV16:
         entry = ms.best_ask
         if entry <= 0.01 or entry >= 0.99:
             ms.signal = "FIYAT HATALI"
+            return
+
+        # FIX 2: Latency filtresi — stale veri kontrolü
+        stale_limit_ms = float(self.strat.get("stale_data_limit_ms", 3000))
+        ofi_age_ms     = self._ofi_buf.data_age_ms
+        book_age_ms    = (time.time() - ms.last_book_ts) * 1000.0
+
+        if ofi_age_ms > stale_limit_ms:
+            ms.signal = f"OFI BAYAT {ofi_age_ms:.0f}ms>{stale_limit_ms:.0f}ms"
+            return
+        if ms.last_book_ts > 0 and book_age_ms > stale_limit_ms:
+            ms.signal = f"BOOK BAYAT {book_age_ms:.0f}ms>{stale_limit_ms:.0f}ms"
             return
 
         # OFI sinyali (global Binance BTC/USDT buffer)
@@ -1110,6 +1169,12 @@ class KrajekisSniperV16:
             ms.signal = "BAKIYE YETERSIZ"
             return
 
+        # FIX 3: Survival mode — küçük kasada stake kısıt
+        survival_thr   = float(self.risk.get("survival_bankroll_threshold", 50.0))
+        survival_stake = float(self.risk.get("survival_max_stake_usd",       2.5))
+        if self.bankroll < survival_thr:
+            stake = min(stake, survival_stake)
+
         # EV hesabı
         fee_rate  = float(self.strat.get("fee_rate_bps", 0.25))
         fee_exp   = int(self.strat.get("fee_exponent",   2))
@@ -1133,10 +1198,13 @@ class KrajekisSniperV16:
         if now_ts - ms.last_buy_attempt < fok_cd:
             return
 
-        # ── AGENT KARARI ──────────────────────────────────────────────────
-        # Tüm hesaplanan veriler Claude'a gönderilir.
-        # Claude: BUY_YES / BUY_NO / WAIT + gerekçe + isteğe bağlı stake.
-        if self._agent_enabled and self.agent_brain is not None:
+        # ── AGENT KARARI (Opsiyonel — varsayılan KAPALI) ─────────────────
+        # NOT: Real-time trading için Agent AI devre dışı bırakıldı.
+        # Sebep: ~5-15s API gecikmesi + API maliyeti küçük kasayı eritir.
+        # Aktif etmek için config'de "use_agent_realtime": true yap.
+        # Agent AI → gelecekte offline piyasa tarama ve strateji analizi için.
+        use_agent_rt = self.cfg.get("use_agent_realtime", False)
+        if use_agent_rt and self._agent_enabled and self.agent_brain is not None:
             ms.signal = "AGENT DÜŞÜNÜYOR..."
             try:
                 decision: TradingDecision = await self.agent_brain.decide(
@@ -1210,7 +1278,7 @@ class KrajekisSniperV16:
                 "INFO",
             )
         else:
-            # Agent devre dışı → kural tabanlı orijinal mantık
+            # Kural tabanlı karar (varsayılan — hızlı, sıfır gecikme)
             trade_side = ofi_signal  # "YES" veya "NO"
             token_id   = ms.yes_id if ofi_signal == "YES" else ms.no_id
         # ── /AGENT KARARI ─────────────────────────────────────────────────
@@ -1259,6 +1327,70 @@ class KrajekisSniperV16:
         )
 
     # ------------------------------------------------------------------ V16: Settle
+
+    # ------------------------------------------------------------------ FIX 1: Emergency SL Exit
+
+    async def _emergency_sl_exit(
+        self, ms: MarketState, session: aiohttp.ClientSession, yes_mid: float
+    ) -> None:
+        """
+        FIX 1: Polymarket piyasa fiyatı SL eşiğinin altına düştüğünde acil çıkış.
+        Chainlink oracle'ını beklemeden, doğrudan piyasa fiyatına bakarak çıkar.
+        Kurtarılan değer: net_shares × mevcut_fiyat (sıfır yerine).
+        """
+        t = ms.active_trade
+        if not t:
+            return
+
+        # Satış fiyatı: best_bid (alıcı ne ödüyor)
+        sell_price = _safe_price(ms.best_bid if t.side == "YES"
+                                 else (1.0 - ms.best_ask))
+        sell_price = max(sell_price, 0.02)  # sıfırın altına inme
+
+        # Paper: simüle et; Live: gerçek satış emri
+        if self.live_mode:
+            oid = await self.order_mgr.place_sell(
+                token_id=ms.yes_id if t.side == "YES" else ms.no_id,
+                price=sell_price,
+                shares=t.net_shares,
+            )
+            sell_ok = bool(oid and not oid.startswith("ERR:"))
+        else:
+            sell_ok = True
+
+        # PnL hesapla: kurtarılan değer − orijinal maliyet
+        recovered = t.net_shares * sell_price if sell_ok else 0.0
+        pnl       = round(recovered - t.stake, 4)
+        reason    = "SL_EXIT" if sell_ok else "SL_EXIT_FAIL"
+
+        self.losses    += 1
+        self.bankroll   = max(0.0, self.bankroll + pnl)
+        self.session_pnl += pnl
+        self.daily_pnl   += pnl
+        self.trades      += 1
+
+        self._record_v16(ms, pnl, reason)
+        self._log(
+            f"🚨 SL ÇIKIŞ ({t.side}) | "
+            f"piyasa={yes_mid:.3f} < eşik={self.risk.get('sl_market_price_threshold',0.18)} | "
+            f"kurtarılan=${recovered:.3f} | PnL: ${pnl:+.3f} | "
+            f"Bankroll: ${self.bankroll:.2f}",
+            "TRADE",
+        )
+
+        # Agent belleğine bildir
+        if self._agent_enabled and self.agent_brain is not None:
+            self.agent_brain.notify_trade_result(
+                market_question=ms.question,
+                action=t.side,
+                pnl_usd=pnl,
+                result_type=reason,
+            )
+
+        ms.active_trade = None
+        ms.has_traded   = True
+        ms.settled      = True
+        ms.signal       = f"SL ÇIKIŞ {pnl:+.2f} (p={yes_mid:.3f})"
 
     async def _settle(self, mid: str,
                        session: aiohttp.ClientSession) -> None:
