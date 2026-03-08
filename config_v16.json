@@ -1,4 +1,7 @@
 {
+  "_comment_agent": "Claude Agent AI. Anahtarı buraya gir VEYA ANTHROPIC_API_KEY ortam değişkeni ayarla.",
+  "anthropic_api_key": "",
+
   "credentials": {
     "private_key":      "0x3eea5d7836eb5a7f38b1b6ebeefd1e3afc0bc9217a523681e358a4835d689893",
     "wallet_address":   "0xa131947e8f1404806b278765c314590c7ce51d0e",
