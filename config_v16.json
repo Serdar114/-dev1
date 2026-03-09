@@ -45,15 +45,15 @@
     "_comment_mode": "false=CANLI, true=PAPER (kağıt) işlem",
     "paper_only": true,
 
-    "_comment_market_filter": "5 DAKİKALIK BTC pazarları. Min=1.2dk kalan süre, Max=5.8dk (=5m pazar penceresi).",
-    "min_market_duration_hours": 0.02,
-    "max_market_duration_days":  0.004,
+    "_comment_market_filter": "V16: Gamma geniş tarama. Min=1 saat, Max=7 gün (kripto 1H-7gün piyasaları).",
+    "min_market_duration_hours": 1.0,
+    "max_market_duration_days":  7.0,
 
-    "_comment_price_band": "Elite Sniper bandı: giriş 0.20-0.35 (YES) veya 0.65-0.80 (NO). Avg 0.785'ten 0.275'e iner → break-even %78.5'ten %27.5'e düşer → EV POZİTİF.",
-    "price_band_low_min":   0.20,
-    "price_band_low_max":   0.35,
-    "price_band_high_min":  0.65,
-    "price_band_high_max":  0.80,
+    "_comment_price_band": "V16 asimetrik sinyal bölgesi: YES giriş 0.30-0.45, NO giriş 0.55-0.70.",
+    "price_band_low_min":   0.30,
+    "price_band_low_max":   0.45,
+    "price_band_high_min":  0.55,
+    "price_band_high_max":  0.70,
 
     "_comment_liquidity": "Minimum $1000 açık faiz.",
     "min_liquidity_usd": 1000.0,
