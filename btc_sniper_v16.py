@@ -82,8 +82,6 @@ try:
 except ImportError:
     CLOB_OK = False
 
-from agent_brain import AgentBrain, TradingDecision
-
 
 # ============================================================ config / utils
 
@@ -635,114 +633,6 @@ class KrajekisSniperV16:
         # V16: Monte Carlo sonuçları (başlangıçta hesaplanır)
         self._mc_results: dict = {}
 
-        # Agent Brain — Claude-powered karar motoru
-        api_key = config.get("anthropic_api_key", "") or os.environ.get("ANTHROPIC_API_KEY", "")
-        try:
-            self.agent_brain = AgentBrain(api_key=api_key or None)
-            self._register_agent_tools()
-            self._agent_enabled = True
-        except ValueError as _e:
-            # API key yoksa kural tabanlı fallback
-            self.agent_brain = None
-            self._agent_enabled = False
-            import warnings
-            warnings.warn(f"AgentBrain devre dışı (API key yok): {_e}")
-
-    # ------------------------------------------------------------------ Agent Tools
-
-    def _register_agent_tools(self) -> None:
-        """Claude'un çağırabileceği araçları AgentBrain'e kaydet."""
-        brain = self.agent_brain
-
-        def _get_ofi_signal():
-            return {
-                "ratio":   round(self._ofi_buf.ratio, 3),
-                "z_score": round(self._ofi_buf.z_score, 3),
-                "signal":  self._ofi_buf.signal(
-                    float(self.strat.get("ofi_ratio_threshold", 3.0)),
-                    float(self.strat.get("ofi_z_threshold", 2.0)),
-                ),
-                "sample_count": self._ofi_buf.sample_count,
-                "cumulative_bid": round(self._ofi_buf.cumulative_bid, 1),
-                "cumulative_ask": round(self._ofi_buf.cumulative_ask, 1),
-            }
-
-        def _get_market_state(market_id: str = ""):
-            ms = self.markets.get(market_id)
-            if not ms:
-                return {"hata": f"Piyasa bulunamadı: {market_id}"}
-            return {
-                "question":     ms.question,
-                "hours_left":   round(ms.hours_left, 2),
-                "yes_price":    round((ms.best_bid + ms.best_ask) / 2, 3),
-                "best_bid":     round(ms.best_bid, 3),
-                "best_ask":     round(ms.best_ask, 3),
-                "liquidity":    round(ms.liquidity, 2),
-                "fees_enabled": ms.fees_enabled,
-                "has_traded":   ms.has_traded,
-                "settled":      ms.settled,
-                "signal":       ms.signal,
-            }
-
-        def _check_open_positions():
-            positions = []
-            for ms in self.markets.values():
-                if ms.active_trade:
-                    t = ms.active_trade
-                    yes_p = (ms.best_bid + ms.best_ask) / 2.0
-                    gain = (yes_p - t.entry_price if t.side == "YES"
-                            else (1 - yes_p) - t.entry_price)
-                    positions.append({
-                        "market":      ms.short_name,
-                        "side":        t.side,
-                        "entry_price": round(t.entry_price, 3),
-                        "stake_usd":   round(t.stake, 2),
-                        "ev_usd":      round(t.ev_usd, 3),
-                        "unrealized":  round(gain, 3),
-                        "hours_left":  round(ms.hours_left, 2),
-                    })
-            return {"acik_pozisyonlar": positions, "toplam": len(positions)}
-
-        def _get_trade_history(n: int = 10):
-            mem_file = self.cfg.get("memory_file", "trades_v16.jsonl")
-            trades = []
-            try:
-                with open(mem_file, "r", encoding="utf-8") as f:
-                    lines = f.readlines()
-                for line in reversed(lines[-max(n, 1) * 2:]):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                        trades.append({
-                            "zaman":   rec.get("timestamp", "")[:16],
-                            "soru":    rec.get("market_question", "")[:50],
-                            "taraf":   rec.get("side", ""),
-                            "sonuç":   rec.get("result_type", ""),
-                            "pnl":     rec.get("pnl_usd", 0),
-                            "ev":      rec.get("ev_usd", 0),
-                            "ofi_r":   rec.get("ofi_ratio", 0),
-                        })
-                        if len(trades) >= n:
-                            break
-                    except json.JSONDecodeError:
-                        continue
-            except FileNotFoundError:
-                return {"mesaj": "Henüz işlem geçmişi yok", "işlemler": []}
-            return {
-                "son_islemler":  trades,
-                "toplam_okunan": len(trades),
-                "seans_win":     self.wins,
-                "seans_loss":    self.losses,
-                "seans_pnl":     round(self.session_pnl, 3),
-            }
-
-        brain.register_tool("get_ofi_signal",       _get_ofi_signal)
-        brain.register_tool("get_market_state",      _get_market_state)
-        brain.register_tool("check_open_positions",  _check_open_positions)
-        brain.register_tool("get_trade_history",     _get_trade_history)
-
     # ------------------------------------------------------------------ log
 
     def _log(self, msg: str, level: str = "INFO") -> None:
@@ -1213,90 +1103,9 @@ class KrajekisSniperV16:
         if now_ts - ms.last_buy_attempt < fok_cd:
             return
 
-        # ── AGENT KARARI (Opsiyonel — varsayılan KAPALI) ─────────────────
-        # NOT: Real-time trading için Agent AI devre dışı bırakıldı.
-        # Sebep: ~5-15s API gecikmesi + API maliyeti küçük kasayı eritir.
-        # Aktif etmek için config'de "use_agent_realtime": true yap.
-        # Agent AI → gelecekte offline piyasa tarama ve strateji analizi için.
-        use_agent_rt = self.cfg.get("use_agent_realtime", False)
-        if use_agent_rt and self._agent_enabled and self.agent_brain is not None:
-            ms.signal = "AGENT DÜŞÜNÜYOR..."
-            try:
-                decision: TradingDecision = await self.agent_brain.decide(
-                    market_id=ms.mid,
-                    market_context={
-                        "market_question": ms.question,
-                        "yes_price":       (ms.best_bid + ms.best_ask) / 2.0,
-                        "hours_left":      ms.hours_left,
-                        "liquidity_usd":   ms.liquidity,
-                        "fees_enabled":    ms.fees_enabled,
-                        "ofi_ratio":       ofi_ratio,
-                        "ofi_z":           ofi_z,
-                        "ofi_signal":      ofi_signal,
-                        "kelly_stake":     stake,
-                        "ev_usd":          ev,
-                        "entry_price":     entry_price,
-                        "bankroll":        self.bankroll,
-                        "session_pnl":     self.session_pnl,
-                        "daily_pnl":       self.daily_pnl,
-                        "open_positions":  self._open_positions,
-                        "wins":            self.wins,
-                        "losses":          self.losses,
-                    },
-                )
-                # Bellek sıkıştırma (periyodik)
-                self.agent_brain.compact_history()
-            except Exception as _ae:
-                self._log(f"Agent hatası, kural-tabanlı fallback: {_ae}", "WARNING")
-                decision = TradingDecision(
-                    action="BUY_YES" if ofi_signal == "YES" else "BUY_NO",
-                    reasoning="Agent hatası — kural tabanlı fallback",
-                    confidence=0.5,
-                )
-
-            if decision.action == "WAIT":
-                ms.signal = f"AGENT WAIT: {decision.reasoning}"
-                self._log(
-                    f"Agent WAIT conf={decision.confidence:.0%} | "
-                    f"{decision.reasoning}",
-                    "INFO",
-                )
-                return
-
-            # Hangi taraf? Agent kararına göre belirle
-            if decision.action == "BUY_YES":
-                trade_side   = "YES"
-                token_id     = ms.yes_id
-                entry_price  = _safe_price(ms.best_ask)
-            else:  # BUY_NO
-                trade_side   = "NO"
-                token_id     = ms.no_id
-                entry_price  = _safe_price(1.0 - ms.best_bid)
-
-            # Stake: agent override varsa kullan, yoksa Kelly
-            if decision.stake_override and decision.stake_override > 0:
-                stake = min(
-                    decision.stake_override,
-                    self.bankroll * float(self.risk.get("max_stake_pct", 0.5)),
-                )
-                _, raw_shares = _safe_amounts(entry_price, stake)
-                fee_usd   = _calc_fee_usd_v16(
-                    entry_price, raw_shares, fee_rate, fee_exp, ms.fees_enabled)
-                net_shares = raw_shares - _calc_fee_shares_v16(
-                    entry_price, raw_shares, fee_rate, fee_exp, ms.fees_enabled)
-
-            flag_str = f" [{','.join(decision.flags)}]" if decision.flags else ""
-            self._log(
-                f"Agent KARAR: {decision.action} "
-                f"conf={decision.confidence:.0%}{flag_str} | "
-                f"{decision.reasoning}",
-                "INFO",
-            )
-        else:
-            # Kural tabanlı karar (varsayılan — hızlı, sıfır gecikme)
-            trade_side = ofi_signal  # "YES" veya "NO"
-            token_id   = ms.yes_id if ofi_signal == "YES" else ms.no_id
-        # ── /AGENT KARARI ─────────────────────────────────────────────────
+        # Kural tabanlı karar — sıfır gecikme, saf algo
+        trade_side = ofi_signal  # "YES" veya "NO"
+        token_id   = ms.yes_id if ofi_signal == "YES" else ms.no_id
 
         ms.last_buy_attempt = now_ts
 
@@ -1323,16 +1132,12 @@ class KrajekisSniperV16:
             order_id=oid,
         )
 
-        fee_tag   = "FREE" if not ms.fees_enabled else f"fee=${fee_usd:.3f}"
-        agent_tag = (
-            f"Agent×{self.agent_brain.total_decisions}"
-            if self._agent_enabled else "KuralTabanlı"
-        )
+        fee_tag = "FREE" if not ms.fees_enabled else f"fee=${fee_usd:.3f}"
         self._log(
             f"{'LIVE' if self.live_mode else 'PAPER'} SNIPE ({trade_side}) "
             f"entry={entry_price:.3f} stake=${stake:.2f} "
             f"EV=${ev:.3f} OFI={ofi_ratio:.1f}x z={ofi_z:.1f} "
-            f"Kelly×{kelly_frac} {fee_tag} [{agent_tag}]",
+            f"Kelly×{kelly_frac} {fee_tag} [KuralTabanlı]",
             "LIVE" if self.live_mode else "PAPER",
         )
 
@@ -1393,15 +1198,6 @@ class KrajekisSniperV16:
             "TRADE",
         )
 
-        # Agent belleğine bildir
-        if self._agent_enabled and self.agent_brain is not None:
-            self.agent_brain.notify_trade_result(
-                market_question=ms.question,
-                action=t.side,
-                pnl_usd=pnl,
-                result_type=reason,
-            )
-
         ms.active_trade = None
         ms.has_traded   = True
         ms.settled      = True
@@ -1449,15 +1245,6 @@ class KrajekisSniperV16:
                 f"PnL: ${pnl:+.3f} | Bankroll: ${self.bankroll:.2f}",
                 "TRADE",
             )
-
-            # Agent belleğine sonucu bildir
-            if self._agent_enabled and self.agent_brain is not None:
-                self.agent_brain.notify_trade_result(
-                    market_question=ms.question,
-                    action=t.side,
-                    pnl_usd=pnl,
-                    result_type=reason,
-                )
 
             ms.active_trade = None
             ms.has_traded   = True
