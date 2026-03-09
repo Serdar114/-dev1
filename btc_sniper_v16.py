@@ -768,107 +768,92 @@ class KrajekisSniperV16:
 
         self._rtds_ok = False
 
-    # ------------------------------------------------------------------ V16: Piyasa Tarayıcı
+    # ------------------------------------------------------------------ V16: Piyasa Tarayıcı (V15 slug tabanlı)
 
     async def _update_markets(self, session: aiohttp.ClientSession) -> None:
         """
-        Gamma API taraması — V16 kriterleri:
-        1. active=true, closed=false
-        2. Süre: 1 saat - 7 gün
-        3. Fiyat bandı: 0.30-0.45 VEYA 0.55-0.70
-        4. Likidite: min $1000
-        5. feesEnabled durumu kaydedilir
+        V15-style slug-based BTC up/down piyasa keşfi.
+        btc-updown-5m-{ts} ve btc-updown-15m-{ts} slugları üretilir;
+        her biri Gamma API'ye ayrı sorgu olarak gönderilir.
+        Genel events taraması yerine doğrudan hedefli keşif.
         """
-        min_dur_h = float(self.strat.get("min_market_duration_hours", 1.0))
-        max_dur_d = float(self.strat.get("max_market_duration_days",  7.0))
-        pb_lo_min = float(self.strat.get("price_band_low_min",  0.30))
-        pb_lo_max = float(self.strat.get("price_band_low_max",  0.45))
-        pb_hi_min = float(self.strat.get("price_band_high_min", 0.55))
-        pb_hi_max = float(self.strat.get("price_band_high_max", 0.70))
-        min_liq   = float(self.strat.get("min_liquidity_usd", 1000.0))
+        min_liq = float(self.strat.get("min_liquidity_usd", 1000.0))
+        now_ts  = int(datetime.now(timezone.utc).timestamp())
+        now_dt  = datetime.now(timezone.utc)
 
-        now = datetime.now(timezone.utc)
-        params = {"active": "true", "closed": "false", "limit": 200}
+        base_5m  = (now_ts // 300) * 300
+        base_15m = (now_ts // 900) * 900
 
-        try:
-            async with session.get(
-                f"{self.net['gamma_url']}/events",
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=8),
-            ) as r:
-                if r.status != 200:
-                    return
-                events = await r.json(content_type=None)
-        except Exception as e:
-            self._log(f"Gamma API hata: {str(e)[:60]}", "WARNING")
-            return
-
-        if not isinstance(events, list):
-            events = [events] if isinstance(events, dict) else []
+        sluglar: list[str] = []
+        for i in range(-1, 4):
+            sluglar.append(f"btc-updown-5m-{base_5m  + i * 300}")
+            sluglar.append(f"btc-updown-15m-{base_15m + i * 900}")
 
         new_count = 0
-        for ev in events:
-            if not isinstance(ev, dict):
+        for slug in sluglar:
+            try:
+                async with session.get(
+                    f"{self.net['gamma_url']}/events",
+                    params={"slug": slug},
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as r:
+                    if r.status != 200:
+                        continue
+                    data = await r.json(content_type=None)
+            except Exception:
                 continue
 
-            for m in ev.get("markets", []):
-                if not isinstance(m, dict):
+            for ev in (data if isinstance(data, list) else [data]):
+                if not ev or not isinstance(ev, dict):
                     continue
-                if m.get("closed") or m.get("active") is False:
-                    continue
+                for m in ev.get("markets", []):
+                    if not isinstance(m, dict):
+                        continue
+                    if m.get("closed") or m.get("active") is False:
+                        continue
 
-                mid = m.get("id")
-                if not mid:
-                    continue
+                    mid = m.get("id")
+                    if not mid or mid in self.markets:
+                        continue
 
-                # Süre filtresi
-                end_str = m.get("endDate", "")
-                try:
-                    end_t = datetime.fromisoformat(
-                        end_str.replace("Z", "+00:00")
-                    ).replace(tzinfo=timezone.utc)
-                except Exception:
-                    continue
+                    # endDate
+                    end_str = m.get("endDate", "")
+                    try:
+                        end_t = datetime.fromisoformat(
+                            end_str.replace("Z", "+00:00")
+                        ).replace(tzinfo=timezone.utc)
+                    except Exception:
+                        continue
+                    secs_left = (end_t - now_dt).total_seconds()
+                    if secs_left < -60:
+                        continue
 
-                secs_left = (end_t - now).total_seconds()
-                if secs_left < min_dur_h * 3600:
-                    continue
-                if secs_left > max_dur_d * 86400:
-                    continue
+                    # Fiyat
+                    try:
+                        prices_raw = m.get("outcomePrices", "[]")
+                        if isinstance(prices_raw, str):
+                            prices_raw = json.loads(prices_raw)
+                        yes_price = float(prices_raw[0]) if prices_raw else 0.5
+                    except Exception:
+                        yes_price = 0.5
 
-                # Fiyat bandı filtresi
-                try:
-                    prices_raw = m.get("outcomePrices", "[]")
-                    if isinstance(prices_raw, str):
-                        prices_raw = json.loads(prices_raw)
-                    yes_price = float(prices_raw[0]) if prices_raw else 0.5
-                except Exception:
-                    yes_price = 0.5
+                    # Likidite
+                    liquidity    = float(m.get("liquidity", 0) or 0)
+                    fees_enabled = bool(m.get("feesEnabled", True))
 
-                in_low_band  = pb_lo_min <= yes_price <= pb_lo_max
-                in_high_band = pb_hi_min <= yes_price <= pb_hi_max
-                if not (in_low_band or in_high_band):
-                    continue
+                    # Token ID'leri
+                    cids   = _parse_clob_token_ids(m.get("clobTokenIds", []))
+                    yes_id = cids[0] if len(cids) > 0 else ""
+                    no_id  = cids[1] if len(cids) > 1 else ""
+                    if not yes_id:
+                        continue
 
-                # Likidite filtresi
-                liquidity = float(m.get("liquidity", 0) or 0)
-                if liquidity < min_liq:
-                    continue
+                    question = m.get("question") or ev.get("title") or "BTC Up/Down"
+                    # Horizon: slug veya question'dan 5m/15m ayırt et
+                    tag = slug + question.lower()
+                    horizon_min = 15 if "15m" in tag or "15 min" in tag else 5
+                    dur_hours   = max(secs_left, 0) / 3600.0
 
-                # feesEnabled durumu
-                fees_enabled = bool(m.get("feesEnabled", True))
-
-                # Token ID'leri
-                cids   = _parse_clob_token_ids(m.get("clobTokenIds", []))
-                yes_id = cids[0] if len(cids) > 0 else ""
-                no_id  = cids[1] if len(cids) > 1 else ""
-                if not yes_id:
-                    continue
-
-                if mid not in self.markets:
-                    question = (m.get("question") or
-                                ev.get("title") or "Bilinmeyen Piyasa")
-                    dur_hours = secs_left / 3600.0
                     ms_new = MarketState(
                         mid, question, end_t, yes_id, no_id,
                         duration_hours=dur_hours,
@@ -881,7 +866,7 @@ class KrajekisSniperV16:
                     new_count += 1
                     fee_tag = "FREE" if not fees_enabled else "FEE"
                     self._log(
-                        f"Radar [{fee_tag}] {dur_hours:.1f}h "
+                        f"Radar [{horizon_min}m/{fee_tag}] "
                         f"p={yes_price:.2f} liq=${liquidity:.0f}: "
                         f"{question[:40]}",
                         "INFO",
