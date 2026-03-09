@@ -58,10 +58,11 @@
     "_comment_liquidity": "5dk piyasası açılışta düşük likidite olur. $100 minimum yeterli — FOK emrimiz $2.50-$15 arası.",
     "min_liquidity_usd": 100.0,
 
-    "_comment_ofi": "Elite Sniper: Z-skor 3.0'a yükseltildi. 4000ms'lik kör uçuşu kompanse eder — bu seviyede momentum 4sn içinde dönmez.",
-    "ofi_lookback_minutes": 15,
-    "ofi_ratio_threshold":   3.0,
-    "ofi_z_threshold":       3.0,
+    "_comment_ofi": "V17 WS: Z-skor 3.0. OFI artık 100ms Binance WS ile besleniyor (REST kaldırıldı). ofi_snapshot_interval_s=1.0 = delta her 1s kaydedilir.",
+    "ofi_lookback_minutes":      15,
+    "ofi_ratio_threshold":        3.0,
+    "ofi_z_threshold":            3.0,
+    "ofi_snapshot_interval_s":    1.0,
 
     "_comment_ev": "Minimum beklenen değer eşiği (USD).",
     "min_ev_threshold": 0.05,

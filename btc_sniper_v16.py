@@ -47,7 +47,7 @@ TEMEL DEĞİŞİKLİKLER (V15'ten V16'ya):
 
   DEĞIŞMEYEN PARÇALAR:
   + OrderManager (CLOB auth, FOK/GTC, cancel/approve)
-  + RTDS Binance REST polling (fiyat takibi)
+  + V17: RTDS Binance WebSocket (REST polling kaldırıldı — 100ms stream)
   + Rich UI terminali
   + debug.log + trades JSONL kaydı
 """
@@ -259,10 +259,10 @@ class OFIBuffer:
     Araştırma kalibrasyonu:
     - Lookback: 15 dakika (5dk piyasalar için ±0.55 yetersiz)
     - Eşik: 3:1 oran (bid_cumulative / ask_cumulative)
-    - Her 10 saniyede bir Binance depth snapshot alınır
-    - Delta birikimi: Δbid = bid_depth[t] - bid_depth[t-1]
+    - V17: Binance WebSocket depth10@100ms ile beslenir (REST kaldırıldı)
+    - Delta birikimi: Δbid = bid_depth[t] - bid_depth[t-1]; 1s throttle ile yazılır
     """
-    def __init__(self, lookback_minutes: int = 15, snapshot_interval_s: float = 10.0):
+    def __init__(self, lookback_minutes: int = 15, snapshot_interval_s: float = 1.0):
         self.lookback_secs = lookback_minutes * 60
         self.snapshot_interval_s = snapshot_interval_s
         # (timestamp, bid_delta, ask_delta)
@@ -662,7 +662,7 @@ class KrajekisSniperV16:
         # V16: Tek global OFI buffer (Binance BTC/USDT için)
         self._ofi_buf = OFIBuffer(
             lookback_minutes=int(self.strat.get("ofi_lookback_minutes", 15)),
-            snapshot_interval_s=10.0,
+            snapshot_interval_s=float(self.strat.get("ofi_snapshot_interval_s", 1.0)),
         )
 
         self.prices: Dict[str, float] = {"BTC_BINANCE": 0.0}
@@ -755,73 +755,84 @@ class KrajekisSniperV16:
             "INFO",
         )
 
-    # ------------------------------------------------------------------ RTDS: Binance REST
+    # ------------------------------------------------------------------ RTDS: Binance WebSocket (V17)
 
     async def _rtds_binance_ws(self) -> None:
-        """Binance BTC/USDT fiyat + derinlik (10s aralıkla OFI buffer güncellemesi)."""
-        _PRICE_URL = "https://api.binance.com/api/v3/ticker/price"
-        _DEPTH_URL = "https://api.binance.com/api/v3/depth"
-        _PARAMS_P  = {"symbol": "BTCUSDT"}
-        _PARAMS_D  = {"symbol": "BTCUSDT", "limit": 20}
-        backoff    = 1.0
+        """
+        V17: Binance BTC/USDT WebSocket stream.
+        REST polling tamamen kaldırıldı.
 
-        connector = aiohttp.TCPConnector(
-            family=socket.AF_INET,
-            resolver=aiohttp.ThreadedResolver(),
-            limit=4,
+        Combined stream:
+          btcusdt@miniTicker  → anlık fiyat (last price)
+          btcusdt@depth10@100ms → top-10 bid/ask depth (100ms güncelleme)
+
+        Gecikme: REST ~10s → WS ~100ms (~100x iyileşme)
+        Auto-reconnect: üstel geri çekilme, max 30s.
+        """
+        _WS_URL = (
+            "wss://stream.binance.com:9443/stream"
+            "?streams=btcusdt@miniTicker/btcusdt@depth10@100ms"
         )
-        async with aiohttp.ClientSession(connector=connector) as sess:
-            cycle = 0
-            while self._running:
-                try:
-                    # Fiyat polling (her tur)
-                    async with sess.get(
-                        _PRICE_URL, params=_PARAMS_P,
-                        timeout=aiohttp.ClientTimeout(total=3),
-                    ) as r:
-                        if r.status == 200:
-                            data  = await r.json(content_type=None)
-                            price = float(data.get("price", 0))
-                            if price > 0:
-                                self.prices["BTC_BINANCE"]              = price
-                                self.prices_ts["BTC_BINANCE_ts_src_ms"] = int(
-                                    time.time() * 1000)
-                                if not self._rtds_ok:
-                                    self._rtds_ok = True
-                                    self._log("RTDS Binance polling basladi", "INFO")
+        backoff = 1.0
 
-                    # Derinlik polling (her 3 turda = ~3s)
-                    if cycle % 3 == 0:
-                        async with sess.get(
-                            _DEPTH_URL, params=_PARAMS_D,
-                            timeout=aiohttp.ClientTimeout(total=3),
-                        ) as r2:
-                            if r2.status == 200:
-                                d = await r2.json(content_type=None)
-                                bids = d.get("bids", [])
-                                asks = d.get("asks", [])
-                                bid_depth = sum(
-                                    float(b[1]) for b in bids[:10]) if bids else 0.0
-                                ask_depth = sum(
-                                    float(a[1]) for a in asks[:10]) if asks else 0.0
-                                # V16: 15dk kümülatif OFI güncelle
-                                self._ofi_buf.update(bid_depth, ask_depth)
+        while self._running:
+            try:
+                async with aiohttp.ClientSession() as sess:
+                    async with sess.ws_connect(
+                        _WS_URL,
+                        heartbeat=20.0,
+                        receive_timeout=30.0,
+                    ) as ws:
+                        if not self._rtds_ok:
+                            self._rtds_ok = True
+                            self._log("RTDS Binance WS baglandi (100ms stream)", "INFO")
+                        backoff = 1.0  # başarılı bağlantıda sıfırla
 
-                    backoff = 1.0
-                    await asyncio.sleep(1.0)
-                    cycle += 1
+                        async for msg in ws:
+                            if not self._running:
+                                break
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                payload = json.loads(msg.data)
+                                stream  = payload.get("stream", "")
+                                data    = payload.get("data", {})
 
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    self._rtds_ok = False
-                    if self._running:
-                        self._log(
-                            f"RTDS Binance hata: {str(e)[:50]} — {backoff:.0f}s",
-                            "WARNING",
-                        )
-                        await asyncio.sleep(backoff)
-                        backoff = min(backoff * 2, 30.0)
+                                if "miniTicker" in stream:
+                                    price = float(data.get("c", 0))
+                                    if price > 0:
+                                        self.prices["BTC_BINANCE"] = price
+                                        self.prices_ts["BTC_BINANCE_ts_src_ms"] = int(
+                                            time.time() * 1000)
+
+                                elif "depth" in stream:
+                                    bids = data.get("b", [])
+                                    asks = data.get("a", [])
+                                    bid_depth = sum(
+                                        float(b[1]) for b in bids) if bids else 0.0
+                                    ask_depth = sum(
+                                        float(a[1]) for a in asks) if asks else 0.0
+                                    self._ofi_buf.update(bid_depth, ask_depth)
+
+                            elif msg.type in (
+                                aiohttp.WSMsgType.ERROR,
+                                aiohttp.WSMsgType.CLOSE,
+                            ):
+                                self._log(
+                                    f"RTDS Binance WS kapandi (type={msg.type}), yeniden bag.",
+                                    "WARNING",
+                                )
+                                break
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._rtds_ok = False
+                if self._running:
+                    self._log(
+                        f"RTDS Binance WS hata: {str(e)[:60]} — {backoff:.0f}s sonra bag.",
+                        "WARNING",
+                    )
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 30.0)
 
         self._rtds_ok = False
 
