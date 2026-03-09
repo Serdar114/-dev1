@@ -769,10 +769,11 @@ class KrajekisSniperV16:
         Gecikme: REST ~10s → WS ~100ms (~100x iyileşme)
         Auto-reconnect: üstel geri çekilme, max 30s.
         """
-        _WS_URL = (
-            "wss://stream.binance.com/stream"
-            "?streams=btcusdt@miniTicker/btcusdt@depth10@100ms"
-        )
+        _WS_URL  = "wss://stream.bybit.com/v5/public/spot"
+        _SUB_MSG = json.dumps({
+            "op":   "subscribe",
+            "args": ["tickers.BTCUSDT", "orderbook.10.BTCUSDT"],
+        })
         backoff = 1.0
 
         while self._running:
@@ -783,27 +784,29 @@ class KrajekisSniperV16:
                         heartbeat=20.0,
                         receive_timeout=30.0,
                     ) as ws:
+                        await ws.send_str(_SUB_MSG)
+
                         if not self._rtds_ok:
                             self._rtds_ok = True
-                            self._log("RTDS Binance WS baglandi (100ms stream)", "INFO")
-                        backoff = 1.0  # başarılı bağlantıda sıfırla
+                            self._log("RTDS Bybit WS baglandi (100ms stream)", "INFO")
+                        backoff = 1.0
 
                         async for msg in ws:
                             if not self._running:
                                 break
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 payload = json.loads(msg.data)
-                                stream  = payload.get("stream", "")
+                                topic   = payload.get("topic", "")
                                 data    = payload.get("data", {})
 
-                                if "miniTicker" in stream:
-                                    price = float(data.get("c", 0))
+                                if topic.startswith("tickers."):
+                                    price = float(data.get("lastPrice", 0))
                                     if price > 0:
                                         self.prices["BTC_BINANCE"] = price
                                         self.prices_ts["BTC_BINANCE_ts_src_ms"] = int(
                                             time.time() * 1000)
 
-                                elif "depth" in stream:
+                                elif topic.startswith("orderbook."):
                                     bids = data.get("b", [])
                                     asks = data.get("a", [])
                                     bid_depth = sum(
@@ -817,7 +820,7 @@ class KrajekisSniperV16:
                                 aiohttp.WSMsgType.CLOSE,
                             ):
                                 self._log(
-                                    f"RTDS Binance WS kapandi (type={msg.type}), yeniden bag.",
+                                    f"RTDS Bybit WS kapandi (type={msg.type}), yeniden bag.",
                                     "WARNING",
                                 )
                                 break
@@ -828,7 +831,7 @@ class KrajekisSniperV16:
                 self._rtds_ok = False
                 if self._running:
                     self._log(
-                        f"RTDS Binance WS hata: {str(e)[:60]} — {backoff:.0f}s sonra bag.",
+                        f"RTDS Bybit WS hata: {str(e)[:60]} — {backoff:.0f}s sonra bag.",
                         "WARNING",
                     )
                     await asyncio.sleep(backoff)
@@ -1455,7 +1458,9 @@ class KrajekisSniperV16:
             if h_left < 0.017:
                 time_str = f"{int(ms.secs_left)}s"
             elif h_left < 1:
-                time_str = f"{ms.mins_left:.0f}m"
+                _m = int(ms.mins_left)
+                _s = int(ms.secs_left % 60)
+                time_str = f"{_m}m{_s:02d}s"
             else:
                 time_str = f"{h_left:.1f}h"
 
