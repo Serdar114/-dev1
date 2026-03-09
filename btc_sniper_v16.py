@@ -763,20 +763,23 @@ class KrajekisSniperV16:
         REST polling tamamen kaldırıldı.
 
         Combined stream:
-          btcusdt@miniTicker  → anlık fiyat (last price)
+          btcusdt@miniTicker    → anlık fiyat (last price)
           btcusdt@depth10@100ms → top-10 bid/ask depth (100ms güncelleme)
 
         Gecikme: REST ~10s → WS ~100ms (~100x iyileşme)
         Auto-reconnect: üstel geri çekilme, max 30s.
+        Fallback: data-stream.binance.vision (birincil başarısız olursa)
         """
-        _WS_URL  = "wss://stream.bybit.com/v5/public/spot"
-        _SUB_MSG = json.dumps({
-            "op":   "subscribe",
-            "args": ["tickers.BTCUSDT", "orderbook.10.BTCUSDT"],
-        })
+        _STREAMS = "btcusdt@miniTicker/btcusdt@depth10@100ms"
+        _WS_URLS = [
+            f"wss://stream.binance.com:9443/stream?streams={_STREAMS}",
+            f"wss://data-stream.binance.vision/stream?streams={_STREAMS}",
+        ]
         backoff = 1.0
+        _url_idx = 0
 
         while self._running:
+            _WS_URL = _WS_URLS[_url_idx % len(_WS_URLS)]
             try:
                 async with aiohttp.ClientSession() as sess:
                     async with sess.ws_connect(
@@ -784,11 +787,9 @@ class KrajekisSniperV16:
                         heartbeat=20.0,
                         receive_timeout=30.0,
                     ) as ws:
-                        await ws.send_str(_SUB_MSG)
-
                         if not self._rtds_ok:
                             self._rtds_ok = True
-                            self._log("RTDS Bybit WS baglandi (100ms stream)", "INFO")
+                            self._log(f"RTDS Binance WS baglandi: {_WS_URL.split('/')[2]}", "INFO")
                         backoff = 1.0
 
                         async for msg in ws:
@@ -796,19 +797,19 @@ class KrajekisSniperV16:
                                 break
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 payload = json.loads(msg.data)
-                                topic   = payload.get("topic", "")
+                                stream  = payload.get("stream", "")
                                 data    = payload.get("data", {})
 
-                                if topic.startswith("tickers."):
-                                    price = float(data.get("lastPrice", 0))
+                                if "miniTicker" in stream:
+                                    price = float(data.get("c", 0))
                                     if price > 0:
                                         self.prices["BTC_BINANCE"] = price
                                         self.prices_ts["BTC_BINANCE_ts_src_ms"] = int(
                                             time.time() * 1000)
 
-                                elif topic.startswith("orderbook."):
-                                    bids = data.get("b", [])
-                                    asks = data.get("a", [])
+                                elif "depth" in stream:
+                                    bids = data.get("bids", [])
+                                    asks = data.get("asks", [])
                                     bid_depth = sum(
                                         float(b[1]) for b in bids) if bids else 0.0
                                     ask_depth = sum(
@@ -820,7 +821,7 @@ class KrajekisSniperV16:
                                 aiohttp.WSMsgType.CLOSE,
                             ):
                                 self._log(
-                                    f"RTDS Bybit WS kapandi (type={msg.type}), yeniden bag.",
+                                    f"RTDS Binance WS kapandi (type={msg.type}), yeniden bag.",
                                     "WARNING",
                                 )
                                 break
@@ -829,9 +830,10 @@ class KrajekisSniperV16:
                 raise
             except Exception as e:
                 self._rtds_ok = False
+                _url_idx += 1  # Sonraki bağlantıda alternatif URL dene
                 if self._running:
                     self._log(
-                        f"RTDS Bybit WS hata: {str(e)[:60]} — {backoff:.0f}s sonra bag.",
+                        f"RTDS Binance WS hata: {str(e)[:60]} — {backoff:.0f}s sonra bag.",
                         "WARNING",
                     )
                     await asyncio.sleep(backoff)
