@@ -45,9 +45,9 @@
     "_comment_mode": "false=CANLI, true=PAPER (kağıt) işlem",
     "paper_only": true,
 
-    "_comment_market_filter": "5 DAKİKALIK BTC pazarları (btc-updown-5m). Min=1.2dk kalan süre, Max=5.8dk pencere.",
+    "_comment_market_filter": "5dk ve 15dk BTC pazarları (btc-updown-5m + btc-updown-15m). Min=1.2dk, Max=16dk.",
     "min_market_duration_hours": 0.02,
-    "max_market_duration_days":  0.004,
+    "max_market_duration_days":  0.011,
 
     "_comment_price_band": "Elite Sniper: EV pozitife dönen uç bandlar. avg 0.275 → break-even %27.5 (eski avg 0.785 → %78.5 break-even → negatif EV). 0.40-0.60 ölüm bölgesi: komisyon %1.56 zirve.",
     "price_band_low_min":   0.20,
