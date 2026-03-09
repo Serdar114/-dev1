@@ -770,7 +770,7 @@ class KrajekisSniperV16:
         Auto-reconnect: üstel geri çekilme, max 30s.
         """
         _WS_URL = (
-            "wss://stream.binance.com:9443/stream"
+            "wss://stream.binance.com/stream"
             "?streams=btcusdt@miniTicker/btcusdt@depth10@100ms"
         )
         backoff = 1.0
