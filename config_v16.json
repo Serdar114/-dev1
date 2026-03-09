@@ -1,7 +1,4 @@
 {
-  "_comment_agent": "Claude Agent AI. Anahtarı buraya gir VEYA ANTHROPIC_API_KEY ortam değişkeni ayarla.",
-  "anthropic_api_key": "",
-
   "credentials": {
     "private_key":      "0x3eea5d7836eb5a7f38b1b6ebeefd1e3afc0bc9217a523681e358a4835d689893",
     "wallet_address":   "0xa131947e8f1404806b278765c314590c7ce51d0e",
@@ -48,9 +45,9 @@
     "_comment_mode": "false=CANLI, true=PAPER (kağıt) işlem",
     "paper_only": true,
 
-    "_comment_market_filter": "Piyasa seçim kriterleri (V16 yeni).",
-    "min_market_duration_hours": 1.0,
-    "max_market_duration_days":  7.0,
+    "_comment_market_filter": "5 DAKİKALIK BTC pazarları. Min=1.2dk kalan süre, Max=5.8dk (=5m pazar penceresi).",
+    "min_market_duration_hours": 0.02,
+    "max_market_duration_days":  0.004,
 
     "_comment_price_band": "Elite Sniper bandı: giriş 0.20-0.35 (YES) veya 0.65-0.80 (NO). Avg 0.785'ten 0.275'e iner → break-even %78.5'ten %27.5'e düşer → EV POZİTİF.",
     "price_band_low_min":   0.20,
@@ -76,8 +73,8 @@
     "fee_rate_bps":  0.25,
     "fee_exponent":  2,
 
-    "_comment_scan": "Gamma API tarama aralığı (saniye). 300 = her 5 dakikada.",
-    "scan_interval_secs": 300,
+    "_comment_scan": "Gamma API tarama aralığı (saniye). 3 = 5m pazarını kaçırmaz.",
+    "scan_interval_secs": 3,
 
     "_comment_cooldown": "Aynı piyasada tekrar işlem için bekleme (saniye).",
     "fok_cooldown": 60,
@@ -88,7 +85,5 @@
     "_comment_trades_per_day": "Monte Carlo simülasyonu için günlük işlem tahmini.",
     "trades_per_day": 3
   },
-  "_comment_agent_rt": "Agent AI real-time karar modu. Varsayılan KAPALI (latency+maliyet sorunu). Offline analiz için kullan.",
-  "use_agent_realtime": false,
   "memory_file": "trades_v16.jsonl"
 }
