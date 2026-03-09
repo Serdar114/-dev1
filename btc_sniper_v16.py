@@ -1004,7 +1004,7 @@ class KrajekisSniperV16:
             await self._fetch_book(session, ms)  # anlık fiyatı tazele
             t       = ms.active_trade
             yes_mid = (ms.best_bid + ms.best_ask) / 2.0
-            sl_thr  = float(self.risk.get("sl_market_price_threshold", 0.18))
+            sl_thr  = float(self.risk.get("sl_market_price_threshold", 0.04))
 
             # Fiyat SL eşiğinin altına düştü mü?
             price_crashed = (
@@ -1103,6 +1103,21 @@ class KrajekisSniperV16:
         # NO tarafı için fiyat = 1 - yes_ask
         entry_price = ms.best_ask if ofi_signal == "YES" else (1.0 - ms.best_bid)
         entry_price = _safe_price(entry_price)
+
+        # V17: FOK kayma koruması (slippage guard)
+        # 4000ms kör uçuşta fiyat kayabilir. Tolerans eklenir;
+        # toleranslı fiyat bandı sınırını aşarsa emir gönderilmez.
+        slip_tol = float(self.strat.get("fok_slippage_tolerance", 0.02))
+        limit_price = round(entry_price + slip_tol, 4)
+        band_ceil   = pb_lo_max if ofi_signal == "YES" else (1.0 - pb_hi_min)
+        if limit_price > band_ceil:
+            ms.signal = (
+                f"SLIP GUARD {entry_price:.3f}+{slip_tol:.2f}={limit_price:.3f}"
+                f">{band_ceil:.2f}"
+            )
+            return
+        # Emir bu toleranslı limit_price ile gönderilir
+        entry_price = limit_price
 
         stake = _calc_kelly_stake(
             bankroll=self.bankroll,

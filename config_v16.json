@@ -30,7 +30,7 @@
     "_comment_positions": "Max 2 eş zamanlı pozisyon (araştırma önerisi).",
     "max_open_positions": 2,
 
-    "_comment_sl": "FIX 1 REVİZE: Phantom SL kaldırıldı (4000ms gecikmeyle 0.18 likidite hayalet).",
+    "_comment_sl": "V17: Sadece mutlak çöküş ($0.04) durumunda acil çıkış. Gemini öneri: pozisyonu kesmek erken çıkış değil, 0.18 çok yüksekti.",
     "sl_market_price_threshold": 0.04,
 
     "_comment_survival": "FIX 3: Survival mode. Kasa bu eşiğin altındayken stake hard-cap uygulanır.",
@@ -84,6 +84,9 @@
 
     "_comment_fok_lat_gate": "V17: Gerçek RTT p90 bu eşiği aşarsa FOK gönderilmez. İlk 5 ölçüm toplanana kadar gate devrede değil. Kapatmak için 99999 yaz.",
     "max_fok_latency_p90_ms": 2500,
+
+    "_comment_slip": "V17: FOK kayma koruması. entry_price+tol > band_max ise emir iptal. Gemini: 0.02 öneriyor.",
+    "fok_slippage_tolerance": 0.02,
 
     "_comment_trades_per_day": "Monte Carlo simülasyonu için günlük işlem tahmini.",
     "trades_per_day": 3
