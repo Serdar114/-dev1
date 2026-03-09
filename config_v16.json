@@ -46,7 +46,7 @@
   },
   "strategy": {
     "_comment_mode": "false=CANLI, true=PAPER (kağıt) işlem",
-    "paper_only": false,
+    "paper_only": true,
 
     "_comment_market_filter": "Piyasa seçim kriterleri (V16 yeni).",
     "min_market_duration_hours": 1.0,
