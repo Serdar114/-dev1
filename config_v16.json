@@ -19,8 +19,8 @@
     "_comment_kelly": "Araştırma önerisi: Half-Kelly (0.50). Full-Kelly ruin %61.4.",
     "kelly_fraction":     0.50,
 
-    "_comment_stake": "Polymarket minimum $2.50. Max %50 bankroll per işlem.",
-    "min_stake_usd":      2.50,
+    "_comment_stake": "Polymarket minimum $5.00 (API limit altı hata verir). Max %50 bankroll per işlem.",
+    "min_stake_usd":      5.00,
     "max_stake_pct":      0.50,
 
     "_comment_loss": "Günlük %30 kayıp limiti. Araştırma: çok sıkı limit büyümeyi durdurur.",
@@ -33,9 +33,9 @@
     "_comment_sl": "V17: Sadece mutlak çöküş ($0.04) durumunda acil çıkış. Gemini öneri: pozisyonu kesmek erken çıkış değil, 0.18 çok yüksekti.",
     "sl_market_price_threshold": 0.04,
 
-    "_comment_survival": "FIX 3: Survival mode. Kasa bu eşiğin altındayken stake hard-cap uygulanır.",
+    "_comment_survival": "FIX 3: Survival mode. Kasa bu eşiğin altındayken stake hard-cap. Min=$5.00 (API limiti).",
     "survival_bankroll_threshold": 50.0,
-    "survival_max_stake_usd":      2.50,
+    "survival_max_stake_usd":      5.00,
 
     "_comment_target": "Monte Carlo hedefi (45 gün, $30→$900).",
     "target_bankroll":    900.0,
@@ -74,8 +74,8 @@
     "fee_rate_bps":  0.25,
     "fee_exponent":  2,
 
-    "_comment_scan": "Gamma API tarama aralığı (saniye). 3 = 5m pazarını kaçırmaz.",
-    "scan_interval_secs": 3,
+    "_comment_scan": "Gamma API tarama aralığı. 15s = Cloudflare ban riski yok. WS fiyat anlık akıyor, pazar keşfi daha seyrek olabilir.",
+    "scan_interval_secs": 15,
 
     "_comment_cooldown": "Aynı piyasada tekrar işlem için bekleme (saniye).",
     "fok_cooldown": 60,
