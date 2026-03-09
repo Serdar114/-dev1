@@ -82,6 +82,9 @@
     "_comment_latency": "FIX 2: Stale veri limiti (ms). Bu süre aşılırsa işlem yapılmaz.",
     "stale_data_limit_ms": 3000,
 
+    "_comment_fok_lat_gate": "V17: Gerçek RTT p90 bu eşiği aşarsa FOK gönderilmez. İlk 5 ölçüm toplanana kadar gate devrede değil. Kapatmak için 99999 yaz.",
+    "max_fok_latency_p90_ms": 2500,
+
     "_comment_trades_per_day": "Monte Carlo simülasyonu için günlük işlem tahmini.",
     "trades_per_day": 3
   },

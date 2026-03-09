@@ -197,6 +197,59 @@ def _calc_kelly_stake(bankroll: float, win_rate: float, entry_price: float,
     return round(stake, 2)
 
 
+# ============================================================ V16: Latency Tracker
+
+class LatencyTracker:
+    """
+    Gerçek API round-trip sürelerini (RTT) ölçer ve istatistik üretir.
+    İki ayrı tracker kullanılır:
+      - book_rtt  : Polymarket CLOB orderbook sorgu gecikmesi
+      - order_rtt : FOK emir gönderme → yanıt gecikmesi
+    """
+    def __init__(self, maxlen: int = 50):
+        self._rtts: deque = deque(maxlen=maxlen)
+
+    def record(self, rtt_ms: float) -> None:
+        self._rtts.append(rtt_ms)
+
+    @property
+    def count(self) -> int:
+        return len(self._rtts)
+
+    @property
+    def p50(self) -> float:
+        if not self._rtts:
+            return 0.0
+        s = sorted(self._rtts)
+        return s[len(s) // 2]
+
+    @property
+    def p90(self) -> float:
+        if not self._rtts:
+            return 0.0
+        s = sorted(self._rtts)
+        return s[int(len(s) * 0.9)]
+
+    @property
+    def p99(self) -> float:
+        if not self._rtts:
+            return 0.0
+        s = sorted(self._rtts)
+        return s[int(len(s) * 0.99)]
+
+    @property
+    def mean(self) -> float:
+        if not self._rtts:
+            return 0.0
+        return sum(self._rtts) / len(self._rtts)
+
+    def summary(self) -> str:
+        if not self._rtts:
+            return "—"
+        return (f"p50={self.p50:.0f}ms p90={self.p90:.0f}ms "
+                f"avg={self.mean:.0f}ms n={self.count}")
+
+
 # ============================================================ V16: OFI Buffer (15dk kümülatif)
 
 class OFIBuffer:
@@ -633,6 +686,10 @@ class KrajekisSniperV16:
         # V16: Monte Carlo sonuçları (başlangıçta hesaplanır)
         self._mc_results: dict = {}
 
+        # V17: Gerçek latency ölçümü — raporlar p50/p90/avg
+        self._book_lat  = LatencyTracker(maxlen=50)   # CLOB orderbook RTT
+        self._order_lat = LatencyTracker(maxlen=30)   # FOK emir gönderme RTT
+
     # ------------------------------------------------------------------ log
 
     def _log(self, msg: str, level: str = "INFO") -> None:
@@ -879,8 +936,9 @@ class KrajekisSniperV16:
 
     async def _fetch_book(self, session: aiohttp.ClientSession,
                            ms: MarketState) -> None:
-        """Polymarket CLOB orderbook: best bid/ask güncelleme."""
+        """Polymarket CLOB orderbook: best bid/ask güncelleme + RTT ölçümü."""
         try:
+            _t0 = time.perf_counter()
             async with session.get(
                 f"{self.net['clob_url']}/book",
                 params={"token_id": ms.yes_id},
@@ -888,6 +946,8 @@ class KrajekisSniperV16:
             ) as r:
                 if r.status == 200:
                     d    = await r.json(content_type=None)
+                    _rtt = (time.perf_counter() - _t0) * 1000.0
+                    self._book_lat.record(_rtt)
                     bids = sorted(d.get("bids", []),
                                   key=lambda x: float(x.get("price", 0)),
                                   reverse=True)
@@ -1088,13 +1148,30 @@ class KrajekisSniperV16:
         if now_ts - ms.last_buy_attempt < fok_cd:
             return
 
+        # V17: Latency gate — p90 gecikme eşiği aşarsa FOK gönderme
+        max_lat = float(self.strat.get("max_fok_latency_p90_ms", 3000))
+        if self._book_lat.count >= 5 and self._book_lat.p90 > max_lat:
+            ms.signal = (
+                f"LAT GATE p90={self._book_lat.p90:.0f}ms>{max_lat:.0f}ms"
+            )
+            return
+
         # Kural tabanlı karar — sıfır gecikme, saf algo
         trade_side = ofi_signal  # "YES" veya "NO"
         token_id   = ms.yes_id if ofi_signal == "YES" else ms.no_id
 
         ms.last_buy_attempt = now_ts
 
+        _order_t0 = time.perf_counter()
         oid = await self.order_mgr.place_buy(token_id, entry_price, raw_shares)
+        _order_rtt = (time.perf_counter() - _order_t0) * 1000.0
+        self._order_lat.record(_order_rtt)
+        self._log(
+            f"FOK RTT={_order_rtt:.0f}ms "
+            f"(book p90={self._book_lat.p90:.0f}ms "
+            f"order p90={self._order_lat.p90:.0f}ms)",
+            "INFO",
+        )
         if not oid or oid.startswith("ERR:"):
             self._log(f"FOK red ({int(fok_cd)}s bekleme): {oid}", "WARNING")
             return
@@ -1307,12 +1384,28 @@ class KrajekisSniperV16:
             if mc else "—"
         )
 
+        # V17: Latency istatistikleri
+        book_p90  = self._book_lat.p90
+        order_p90 = self._order_lat.p90
+        max_lat   = float(self.strat.get("max_fok_latency_p90_ms", 3000))
+        if self._book_lat.count == 0:
+            lat_str = "[dim]lat=ölçülüyor...[/dim]"
+        elif book_p90 < max_lat * 0.5:
+            lat_str = f"[bold green]lat p90={book_p90:.0f}ms[/bold green]"
+        elif book_p90 < max_lat:
+            lat_str = f"[yellow]lat p90={book_p90:.0f}ms[/yellow]"
+        else:
+            lat_str = f"[bold red]lat p90={book_p90:.0f}ms GATE![/bold red]"
+        if self._order_lat.count > 0:
+            lat_str += f" ord={order_p90:.0f}ms"
+
         hdr = (
             f"[bold white]KRAJEKIS V16.0 KELLY+OFI[/bold white] "
             f"{'[bold red]CANLI[/bold red]' if self.live_mode else '[dim]PAPER[/dim]'} | "
             f"RTDS:{rtds_tag} BTC:[cyan]${bn:,.0f}[/cyan] | "
             f"OFI:[{ofi_col}]{ofi_r:.1f}x z={ofi_z:.1f}[/] "
             f"{'→'+ofi_sig if ofi_sig else '→BEKLE'} | "
+            f"{lat_str} | "
             f"Bankroll:[bold yellow]${self.bankroll:.2f}[/bold yellow]"
         )
         lay["h"].update(Panel(Text.from_markup(hdr), border_style="white"))
