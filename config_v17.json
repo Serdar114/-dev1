@@ -1,0 +1,93 @@
+{
+  "credentials": {
+    "_comment": "Paper modda bu alanlar kullanılmaz. Canlıya geçmeden önce doldurun.",
+    "private_key":      "0x",
+    "wallet_address":   "",
+    "api_key":          "",
+    "api_secret":       "",
+    "api_passphrase":   ""
+  },
+  "network": {
+    "clob_url":       "https://clob.polymarket.com",
+    "gamma_url":      "https://gamma-api.polymarket.com",
+    "chain_id":       137,
+    "binance_symbol": "BTCUSDT"
+  },
+  "risk": {
+    "_comment_bankroll": "Başlangıç kasası. Her işlem sonrası otomatik güncellenir.",
+    "bankroll_usd":       30.0,
+
+    "_comment_kelly": "Half-Kelly (0.50). Gerçek p kanıtlanana kadar bu değeri düşürmeyin.",
+    "kelly_fraction":     0.50,
+
+    "_comment_stake": "V17: min_stake artık zorunlu alt sınır DEĞİL — Kelly < min_stake ise işlem yapılmaz.",
+    "min_stake_usd":      2.50,
+    "max_stake_pct":      0.40,
+
+    "_comment_loss": "Günlük kayıp limiti.",
+    "max_daily_loss_pct": 0.30,
+    "max_daily_loss_usd": 9.0,
+
+    "_comment_positions": "Eş zamanlı max pozisyon.",
+    "max_open_positions": 2,
+
+    "_comment_sl": "Mutlak çöküş SL eşiği (piyasa fiyatı). 0.04 = sıfıra yakın pozisyonu kurtar.",
+    "sl_market_price_threshold": 0.04,
+
+    "_comment_circuit": "V17 YENİ: N art arda zarar → M dakika bekleme.",
+    "circuit_breaker_losses":    3,
+    "circuit_breaker_pause_min": 10,
+
+    "_comment_target": "Monte Carlo simülasyonu hedef parametreleri.",
+    "target_bankroll": 500.0,
+    "target_days":     60
+  },
+  "strategy": {
+    "_comment_mode": "true=PAPER (kağıt işlem). 200+ işlem sonra false yapın.",
+    "paper_only": true,
+
+    "_comment_ofi": "15dk kümülatif OFI. Oran eşiği 3.0x, Z-skor eşiği 3.0 (V17: sıkılaştırıldı).",
+    "ofi_lookback_minutes":   15,
+    "ofi_ratio_threshold":     3.0,
+    "ofi_z_threshold":         3.0,
+    "ofi_snapshot_interval_s": 1.0,
+
+    "_comment_price_band": "OFI sinyali ile uyumlu fiyat bantları. YES için düşük bant, NO için yüksek bant.",
+    "price_band_low_min":  0.25,
+    "price_band_low_max":  0.42,
+    "price_band_high_min": 0.58,
+    "price_band_high_max": 0.75,
+
+    "_comment_liquidity": "Minimum piyasa likiditesi ($). 5dk piyasalar başlangıçta düşük likiditeyle açılır.",
+    "min_liquidity_usd": 50.0,
+
+    "_comment_ev": "Minimum beklenen değer eşiği (USD).",
+    "min_ev_threshold": 0.05,
+
+    "_comment_winrate": "Monte Carlo ve Kelly hesabı için kullanılan hedef kazanma oranı.",
+    "target_win_rate": 0.60,
+
+    "_comment_fee": "Polymarket dinamik taker ücret formülü.",
+    "fee_rate_bps": 0.25,
+    "fee_exponent":  2,
+
+    "_comment_scan": "V17: 10s tarama (5dk piyasalar için sık keşif gerekli).",
+    "scan_interval_secs": 10,
+
+    "_comment_cooldown": "Aynı piyasada tekrar işlem bekleme (saniye).",
+    "fok_cooldown": 60,
+
+    "_comment_stale": "V17: 5000ms (REST fallback gecikmesine tolerans).",
+    "stale_data_limit_ms": 5000,
+
+    "_comment_lat_gate": "V17 DÜZELTİLDİ: 500ms (önceki 2500ms işlevsizdi). Kapatmak için 99999.",
+    "max_fok_latency_p90_ms": 500,
+
+    "_comment_slip": "FOK kayma toleransı. Fiyat bant üstüne çıkacaksa emir iptal.",
+    "fok_slippage_tolerance": 0.02,
+
+    "_comment_trades_per_day": "Monte Carlo için günlük işlem tahmini (5dk+15dk = ~4-6 sinyal/gün).",
+    "trades_per_day": 4
+  },
+  "memory_file": "trades_v17.jsonl"
+}
