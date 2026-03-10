@@ -87,7 +87,7 @@
     "fok_slippage_tolerance": 0.02,
 
     "_comment_trades_per_day": "Monte Carlo için günlük işlem tahmini (5dk+15dk = ~4-6 sinyal/gün).",
-    "trades_per_day": 4
+    "trades_per_day": 5
   },
   "memory_file": "trades_v17.jsonl"
 }
