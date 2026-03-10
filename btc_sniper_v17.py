@@ -76,7 +76,7 @@ except ImportError:
 def load_config(path: str = "config_v17.json") -> dict:
     if not os.path.exists(path):
         raise FileNotFoundError(f"{path} bulunamadi!")
-    with open(path) as f:
+    with open(path, encoding='utf-8') as f:
         return json.load(f)
 
 
