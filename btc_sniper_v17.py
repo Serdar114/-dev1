@@ -1,45 +1,4 @@
 #!/usr/bin/env python3
-"""
-Polymarket Krajekis Auto-Sniper V17.0  (BTC 5DK/15DK PAPER TEST EDİSYONU)
-==========================================================================
-V16 → V17 DEĞİŞİKLİKLERİ:
-
-  BTC FİYAT DÜZELTMESİ (V17):
-  + 3. WS URL: wss://stream.binance.com:443  (port 9443 bloke ağlar için)
-  + REST fallback task: WS fiyatı 30s güncellenmediyse Binance ticker REST
-  + self._btc_price_ts ile fiyat tazeliği izleme
-  + UI header'da kaynak etiketi: [WS] / [REST] / [STALE]
-
-  KELLY OVERBETTİNG FİXİ (V17):
-  + _calc_kelly_stake(): max(stake, min_stake) KALDIRILDI
-  + _analyze(): hesaplanan stake < min_stake → "KELLY<MIN" — işlem yapılmaz
-  + Bankroll < 3×min_stake → "KASA YETERSIZ" — tüm işlemler duraklatılır
-
-  CIRCUIT BREAKER (V17 YENİ):
-  + N art arda zarar → pause (varsayılan: 3 zarar → 10dk bekleme)
-  + _consec_losses sayacı; WIN → sıfırla, LOSS → arttır
-  + config: circuit_breaker_losses=3, circuit_breaker_pause_min=10
-
-  API RATE LİMİTER (V17 YENİ):
-  + RateLimiter sınıfı: 10dk penceresinde CLOB istek sayısı
-  + Polymarket limit: 36.000 req/10min
-  + Uyarı eşiği: >30000 sarı, >34000 kırmızı, >35500 işlem bloke
-  + _update_markets / _fetch_book / place_buy / _check_resolved → tick()
-
-  LATENCY GATE DÜZELTMESİ:
-  + max_fok_latency_p90_ms varsayılanı: 500ms  (önceki 2500ms işlevsizdi)
-  + scan_interval_secs: 10s  (5dk piyasa keşfi için daha sık tarama)
-
-  DEĞİŞMEYEN PARÇALAR (V16'dan korundu):
-  + 5dk/15dk BTC slug tarayıcı (_update_markets)
-  + OFIBuffer 15dk kümülatif (Binance depth10@100ms)
-  + Monte Carlo başlangıç simülasyonu
-  + OrderManager (CLOB auth, FOK/GTC, cancel, approvals)
-  + Quadratic fee modeli
-  + Market timing penceresi (%20-%60 elapsed)
-  + Emergency SL exit (piyasa fiyatı < eşik)
-  + Rich terminal UI
-"""
 import sys
 import asyncio
 import socket
