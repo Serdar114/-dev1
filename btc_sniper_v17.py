@@ -1046,16 +1046,19 @@ class KrajekisSniperV17:
             ms.signal = "FIYAT HATALI"
             return
 
-        # Zamanlama penceresi: 5dk/15dk piyasalar için %20–%60
-        total_secs = ms.duration_hours * 3600.0
-        secs_left  = ms.secs_left
-        if total_secs < 1800:  # 30 dakikadan kısa piyasa
-            elapsed_pct = (total_secs - secs_left) / total_secs if total_secs > 0 else 0
-            if elapsed_pct < 0.20:
-                ms.signal = f"TOO EARLY {elapsed_pct:.0%}<20%"
+        # Zamanlama penceresi — V17 Sweet Spot: 15. ile 255. saniyeler arası
+        # İlk 15s: fiyat keşfi kaotik, spread geniş, false positive yüksek.
+        # Son 45s (255s sonrası): oracle hizalaması + Endgame Sweep, likidite buharlaşır.
+        # Kaynak: "btc-updown-5m" piyasa mikro-yapısı analizi (V17 raporu).
+        total_secs   = ms.duration_hours * 3600.0
+        secs_left    = ms.secs_left
+        if total_secs < 1800:  # 30 dakikadan kısa piyasalar için
+            secs_elapsed = total_secs - secs_left
+            if secs_elapsed < 15:
+                ms.signal = f"TOO EARLY {secs_elapsed:.0f}s<15s"
                 return
-            if elapsed_pct > 0.60:
-                ms.signal = f"TOO LATE {elapsed_pct:.0%}>60%"
+            if secs_left < 45:
+                ms.signal = f"TOO LATE {secs_left:.0f}s kaldi<45s"
                 return
 
         # Stale veri kontrolü
@@ -1071,8 +1074,8 @@ class KrajekisSniperV17:
             return
 
         # OFI sinyali
-        ofi_threshold = float(self.strat.get("ofi_ratio_threshold", 3.0))
-        ofi_z_thresh  = float(self.strat.get("ofi_z_threshold",     3.0))
+        ofi_threshold = float(self.strat.get("ofi_ratio_threshold", 1.5))
+        ofi_z_thresh  = float(self.strat.get("ofi_z_threshold",     1.5))
         ofi_signal    = self._ofi_buf.signal(ofi_threshold, ofi_z_thresh)
         ofi_ratio     = self._ofi_buf.ratio
         ofi_z         = self._ofi_buf.z_score
@@ -1085,10 +1088,10 @@ class KrajekisSniperV17:
             return
 
         # Fiyat bandı uyumu
-        pb_lo_min = float(self.strat.get("price_band_low_min",  0.25))
-        pb_lo_max = float(self.strat.get("price_band_low_max",  0.42))
-        pb_hi_min = float(self.strat.get("price_band_high_min", 0.58))
-        pb_hi_max = float(self.strat.get("price_band_high_max", 0.75))
+        pb_lo_min = float(self.strat.get("price_band_low_min",  0.28))
+        pb_lo_max = float(self.strat.get("price_band_low_max",  0.41))
+        pb_hi_min = float(self.strat.get("price_band_high_min", 0.59))
+        pb_hi_max = float(self.strat.get("price_band_high_max", 0.72))
 
         yes_price = (ms.best_bid + ms.best_ask) / 2.0
         if ofi_signal == "YES" and not (pb_lo_min <= yes_price <= pb_lo_max):
@@ -1368,8 +1371,8 @@ class KrajekisSniperV17:
         ofi_r    = self._ofi_buf.ratio
         ofi_z    = self._ofi_buf.z_score
         ofi_sig  = self._ofi_buf.signal(
-            float(self.strat.get("ofi_ratio_threshold", 3.0)),
-            float(self.strat.get("ofi_z_threshold",     3.0)),
+            float(self.strat.get("ofi_ratio_threshold", 1.5)),
+            float(self.strat.get("ofi_z_threshold",     1.5)),
         )
         ofi_col  = "green" if ofi_sig == "YES" else ("red" if ofi_sig == "NO" else "yellow")
 
@@ -1469,8 +1472,8 @@ class KrajekisSniperV17:
 
         stat = (
             f"[bold cyan]OFI BUFFER (15dk kümülatif)[/bold cyan]\n"
-            f"  Oran:   [{ofi_col}]{ofi_r:.2f}x[/] (eşik:{float(self.strat.get('ofi_ratio_threshold',3.0)):.1f}x)\n"
-            f"  Z-skor: [{ofi_col}]{ofi_z:+.2f}[/] (±{float(self.strat.get('ofi_z_threshold',3.0)):.1f})\n"
+            f"  Oran:   [{ofi_col}]{ofi_r:.2f}x[/] (eşik:{float(self.strat.get('ofi_ratio_threshold',1.5)):.1f}x)\n"
+            f"  Z-skor: [{ofi_col}]{ofi_z:+.2f}[/] (±{float(self.strat.get('ofi_z_threshold',1.5)):.1f})\n"
             f"  Örnek:  {self._ofi_buf.sample_count} snap\n"
             f"  Yaş:    {self._ofi_buf.data_age_ms:.0f}ms\n"
             f"  Sinyal: [{ofi_col}]{ofi_sig or 'BEKLE'}[/]\n\n"
