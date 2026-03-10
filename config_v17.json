@@ -48,8 +48,8 @@
 
     "_comment_ofi": "15dk kümülatif OFI. Oran eşiği 3.0x, Z-skor eşiği 2.15 (büyüme modeli: Z=3.0 çok nadir, Z=2.15 daha fazla sinyal).",
     "ofi_lookback_minutes":   15,
-    "ofi_ratio_threshold":     3.0,
-    "ofi_z_threshold":         2.15,
+    "ofi_ratio_threshold":     1.5,
+    "ofi_z_threshold":         2.0,
     "ofi_snapshot_interval_s": 1.0,
 
     "_comment_price_band": "OFI sinyali ile uyumlu fiyat bantları. YES için düşük bant, NO için yüksek bant.",
