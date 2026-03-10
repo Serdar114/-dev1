@@ -20,7 +20,7 @@
     "_comment_kelly": "Half-Kelly (0.50). Gerçek p kanıtlanana kadar bu değeri düşürmeyin.",
     "kelly_fraction":     0.50,
 
-    "_comment_stake": "V17: min_stake artık zorunlu alt sınır DEĞİL — Kelly < min_stake ise işlem yapılmaz.",
+    "_comment_stake": "V17: min_stake zorunlu alt sınır DEĞİL — Kelly < min_stake ise işlem yapılmaz. UYARI: Canlı (Live) moda geçerken $5.00 yap (Polymarket borsa kuralı). Paper modda $2.50 geçerli.",
     "min_stake_usd":      2.50,
     "max_stake_pct":      0.40,
 
@@ -46,10 +46,10 @@
     "_comment_mode": "true=PAPER (kağıt işlem). 200+ işlem sonra false yapın.",
     "paper_only": true,
 
-    "_comment_ofi": "15dk kümülatif OFI. Oran eşiği 3.0x, Z-skor eşiği 3.0 (V17: sıkılaştırıldı).",
+    "_comment_ofi": "15dk kümülatif OFI. Oran eşiği 3.0x, Z-skor eşiği 2.15 (büyüme modeli: Z=3.0 çok nadir, Z=2.15 daha fazla sinyal).",
     "ofi_lookback_minutes":   15,
     "ofi_ratio_threshold":     3.0,
-    "ofi_z_threshold":         3.0,
+    "ofi_z_threshold":         2.15,
     "ofi_snapshot_interval_s": 1.0,
 
     "_comment_price_band": "OFI sinyali ile uyumlu fiyat bantları. YES için düşük bant, NO için yüksek bant.",
