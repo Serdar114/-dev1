@@ -1,3 +1,0 @@
-2026-03-13 08:48:57 [INFO    ] root: === V21 Logger başlatıldı | log_file=bot_log_v21.txt ===
-2026-03-13 08:48:57 [INFO    ] ofi_engine: OFIEngine hazır: lookback=30 z_thr=1.50 tfi_confirm=True
-2026-03-13 08:48:57 [INFO    ] bankroll: Bankroll hazır: stake=$5.00 max_open=2 dd_pause=25% streak=2x300s
