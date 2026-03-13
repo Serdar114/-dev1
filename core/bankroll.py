@@ -30,8 +30,8 @@ class Bankroll:
         # Loss timestamp'lerini tut
         self._loss_times: deque = deque(maxlen=20)
 
-        # Peak bankroll (drawdown hesabı için)
-        self._peak: float = state.bankroll
+        # Peak bankroll state üzerinden yönetilir (drawdown tek standart)
+        state.peak_bankroll = max(state.peak_bankroll, state.bankroll)
 
         log.info(
             "Bankroll hazır: stake=$%.2f max_open=%d dd_pause=%.0f%% streak=%dx%ds",
@@ -86,18 +86,14 @@ class Bankroll:
 
     def update_peak(self) -> None:
         """Her pozisyon kapandıktan sonra çağrılır."""
-        if self._state.bankroll > self._peak:
-            self._peak = self._state.bankroll
+        if self._state.bankroll > self._state.peak_bankroll:
+            self._state.peak_bankroll = self._state.bankroll
 
     # ── Drawdown ─────────────────────────────────────────────────────────────
 
     def _current_drawdown_pct(self) -> float:
-        if self._peak <= 0:
-            return 0.0
-        val = self._state.bankroll
-        if val > self._peak:
-            self._peak = val
-        return max(0.0, (self._peak - val) / self._peak * 100.0)
+        """state.drawdown_pct() ile aynı peak-based formülü kullanır."""
+        return self._state.drawdown_pct()
 
     # ── Pause ────────────────────────────────────────────────────────────────
 

@@ -148,9 +148,27 @@ class MarketDiscovery:
         return 0.0
 
     def _extract_token_ids(self, m: dict) -> tuple:
-        """(up_token_id, down_token_id) döner. Bulamazsa ("", "")."""
-        raw = m.get("clobTokenIds") or m.get("clob_token_ids") or ""
+        """(up_token_id, down_token_id) döner. Outcome label bazlı eşleşme."""
+        # ── 1. Öncelik: tokens[].outcome label eşleşmesi ──────────────────────
+        tokens = m.get("tokens", [])
+        if isinstance(tokens, list) and len(tokens) >= 2:
+            up_id = ""
+            down_id = ""
+            for t in tokens:
+                if isinstance(t, dict):
+                    outcome = (t.get("outcome") or "").strip().upper()
+                    tid = str(t.get("token_id", "")).strip()
+                    if outcome in ("UP", "YES") and not up_id:
+                        up_id = tid
+                    elif outcome in ("DOWN", "NO") and not down_id:
+                        down_id = tid
+            if up_id and down_id:
+                log.debug("Token mapping: label bazlı eşleşme OK up=%s... down=%s...",
+                          up_id[:12], down_id[:12])
+                return up_id, down_id
 
+        # ── 2. Fallback: clobTokenIds pozisyonel ──────────────────────────────
+        raw = m.get("clobTokenIds") or m.get("clob_token_ids") or ""
         if isinstance(raw, list):
             ids = [str(t) for t in raw]
         elif isinstance(raw, str) and raw.strip():
@@ -162,17 +180,14 @@ class MarketDiscovery:
         else:
             ids = []
 
-        if len(ids) < 2:
-            # tokens field'ı dene
-            tokens = m.get("tokens", [])
-            if isinstance(tokens, list):
-                ids = [
-                    str(t.get("token_id", t)) if isinstance(t, dict) else str(t)
-                    for t in tokens
-                ]
-
         if len(ids) >= 2:
+            log.warning(
+                "Token mapping: outcome label bulunamadı, pozisyonel fallback kullanıldı "
+                "(up=%s... down=%s...)", ids[0][:12], ids[1][:12]
+            )
             return ids[0], ids[1]
+
+        log.error("Token mapping başarısız: ne outcome label ne clobTokenIds bulunamadı")
         return "", ""
 
     def _apply(self, m: dict, end_time: float) -> None:

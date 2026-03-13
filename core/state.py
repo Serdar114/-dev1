@@ -82,6 +82,7 @@ class SharedState:
         # ── Bankroll ──────────────────────────────────────────────
         self.bankroll: float = bankroll_usd
         self.initial_bankroll: float = bankroll_usd
+        self.peak_bankroll: float = bankroll_usd   # peak-based drawdown için
         self.total_pnl: float = 0.0
         self.win_count: int = 0
         self.loss_count: int = 0
@@ -119,9 +120,12 @@ class SharedState:
         return (time.time() - self.btc_price_ts) * 1000 < ms
 
     def drawdown_pct(self) -> float:
-        if self.initial_bankroll <= 0:
+        """Peak-based drawdown. Bankroll.update_peak() ile senkronize tutulur."""
+        if self.peak_bankroll <= 0:
             return 0.0
-        return max(0.0, (self.initial_bankroll - self.bankroll) / self.initial_bankroll * 100.0)
+        if self.bankroll > self.peak_bankroll:
+            self.peak_bankroll = self.bankroll
+        return max(0.0, (self.peak_bankroll - self.bankroll) / self.peak_bankroll * 100.0)
 
     def win_rate(self) -> float:
         total = self.win_count + self.loss_count

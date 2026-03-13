@@ -16,11 +16,12 @@ _initialized = False
 _log_file = "bot_log_v21.txt"
 
 
-def setup(cfg: dict | None = None, level: int = logging.INFO) -> None:
+def setup(cfg: dict | None = None, level: int = logging.DEBUG) -> None:
     """
     Root logger'ı kurar. Yalnızca bir kez çağrılmalı.
     cfg["log_file"] varsa o dosyaya yazar, yoksa bot_log_v21.txt.
     Dashboard konsolu kirletmesin diye stderr handler sadece WARNING+ basar.
+    Root her zaman DEBUG seviyesindedir; handler'lar kendi filtrelerini uygular.
     """
     global _initialized, _log_file
 
@@ -38,12 +39,13 @@ def setup(cfg: dict | None = None, level: int = logging.INFO) -> None:
     fmt_stderr = logging.Formatter("[%(levelname)s] %(name)s: %(message)s")
 
     root = logging.getLogger()
-    root.setLevel(level)
+    # Root her zaman DEBUG: handler'lar gatekeeper, root değil.
+    root.setLevel(logging.DEBUG)
     root.handlers.clear()
 
-    # ── File handler (INFO ve üstü) ─────────────────────────────────────────
+    # ── File handler (DEBUG ve üstü) ────────────────────────────────────────
     fh = logging.FileHandler(_log_file, encoding="utf-8", mode="a")
-    fh.setLevel(logging.DEBUG)
+    fh.setLevel(level)
     fh.setFormatter(fmt_file)
     root.addHandler(fh)
 
