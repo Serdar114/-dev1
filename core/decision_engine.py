@@ -271,14 +271,13 @@ class DecisionEngine:
                 to_close.append((pos, "FLIP", cur_bid, pnl))
                 continue
 
-            # Market sona erdi → resolve at 0.5 (paper unknown)
+            # Market sona erdi → son görülen bid'den paper MTM close
             if state.seconds_to_market_end() <= 2.0:
-                # Paper: sabit 0.5'ten resolve (gerçek resolution yok)
-                resolve_price = 0.5
-                pnl = (resolve_price - pos.entry_price) * pos.shares
-                pos.status = "resolved"
+                close_price = cur_bid if cur_bid > 0 else pos.entry_price
+                pnl = (close_price - pos.entry_price) * pos.shares
+                pos.status = "closed_expire_mtm"
                 pos.pnl = pnl
-                to_close.append((pos, "EXPIRE", resolve_price, pnl))
+                to_close.append((pos, "EXPIRE_MTM", close_price, pnl))
 
         for pos, reason, close_price, pnl in to_close:
             state.open_positions.remove(pos)
