@@ -1,0 +1,53 @@
+{
+  "mode": "paper",
+  "initial_bankroll": 30.0,
+  "base_stake_shares": 5,
+
+  "binance": {
+    "ws_url": "wss://stream.binance.com:9443/ws/btcusdt@bookTicker",
+    "stale_threshold_sec": 5,
+    "reconnect_attempts": 5,
+    "reconnect_delay_sec": 2
+  },
+
+  "polymarket": {
+    "gamma_base": "https://gamma-api.polymarket.com",
+    "clob_base": "https://clob.polymarket.com"
+  },
+
+  "signal": {
+    "entry_window_sec": [30, 5],
+    "min_delta_pct": 0.03,
+    "price_band": [0.60, 0.95],
+    "min_edge": 0.06,
+    "delta_to_prob": {
+      "0.03": 0.62,
+      "0.05": 0.72,
+      "0.10": 0.85,
+      "0.15": 0.92
+    },
+    "_note": "delta_to_prob is PLACEHOLDER. Calibrate from paper data."
+  },
+
+  "risk": {
+    "max_open_positions": 1,
+    "max_daily_loss": 5.0,
+    "consecutive_loss_cooldown_count": 3,
+    "consecutive_loss_cooldown_min": 60
+  },
+
+  "fee": {
+    "fee_rate": 0.25,
+    "exponent": 2,
+    "_note": "Polymarket crypto market fee. Hardcoded for now."
+  },
+
+  "paper": {
+    "slippage_cents": 0.01
+  },
+
+  "logs": {
+    "signal_file": "logs/signals.jsonl",
+    "trade_file": "logs/trades.csv"
+  }
+}
