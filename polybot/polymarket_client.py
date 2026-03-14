@@ -10,6 +10,7 @@ All HTTP calls are wrapped in try/except. On failure, logs the error and
 returns None so main loop can skip the window gracefully.
 """
 
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -173,17 +174,25 @@ class PolymarketClient:
                     elif outcome == "NO":
                         no_token_id = t.get("token_id") or t.get("tokenId") or ""
             else:
-                # Some API responses embed token IDs directly
+                # Some API responses embed token IDs directly.
+                # clobTokenIds may be a JSON-encoded string e.g. '["id1","id2"]'
+                # — parse it before indexing to avoid getting '[' as the token.
+                clob_ids = m.get("clobTokenIds") or []
+                if isinstance(clob_ids, str):
+                    try:
+                        clob_ids = json.loads(clob_ids)
+                    except (json.JSONDecodeError, ValueError):
+                        clob_ids = []
                 yes_token_id = (
                     m.get("yes_token_id")
                     or m.get("yesTokenId")
-                    or m.get("clobTokenIds", [None, None])[0]
+                    or (clob_ids[0] if len(clob_ids) > 0 else "")
                     or ""
                 )
                 no_token_id = (
                     m.get("no_token_id")
                     or m.get("noTokenId")
-                    or (m.get("clobTokenIds") or [None, None])[1]
+                    or (clob_ids[1] if len(clob_ids) > 1 else "")
                     or ""
                 )
 
