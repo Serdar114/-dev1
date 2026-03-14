@@ -16,7 +16,7 @@
   },
 
   "signal": {
-    "entry_window_sec": [30, 5],
+    "entry_window_sec": [90, 10],
     "min_delta_pct": 0.02,
     "price_band": [0.55, 0.97],
     "min_edge": 0.04,
