@@ -25,6 +25,10 @@ class RiskManager:
         self._cooldown_count: int = config["risk"]["consecutive_loss_cooldown_count"]
         self._cooldown_min: float = config["risk"]["consecutive_loss_cooldown_min"]
         self._cooldown_until: float = 0.0  # unix timestamp; 0 = no cooldown active
+        # Read stake from config so we don't touch trader internals
+        self._stake: float = float(config["base_stake_shares"])
+        self._slippage: float = float(config["paper"]["slippage_cents"])
+        self._fee_cfg = config["fee"]
 
         logger.info(
             "RiskManager initialized. max_positions=%d max_daily_loss=%.2f "
@@ -56,9 +60,13 @@ class RiskManager:
 
         # 3. Sufficient bankroll
         from polymarket_client import calc_fee
-        fill_price = signal.trade_price + 0.01  # slippage already known at signal time
-        fee = calc_fee(fill_price) * trader._stake
-        stake_cost = fill_price * trader._stake + fee
+        fill_price = signal.trade_price + self._slippage
+        fee = calc_fee(
+            fill_price,
+            fee_rate=self._fee_cfg["fee_rate"],
+            exponent=self._fee_cfg["exponent"],
+        ) * self._stake
+        stake_cost = fill_price * self._stake + fee
         if trader.bankroll < stake_cost:
             return self._reject(
                 f"insufficient_balance:bankroll={trader.bankroll:.4f} "
