@@ -103,6 +103,11 @@ async def main() -> None:
     prev_window: int = 0  # track window transitions
     market_cache: dict[int, object] = {}  # window_ts -> MarketInfo (avoid repeated fetches)
 
+    # Startup sync: if the bot starts mid-window (ste < 295) we skip the
+    # current window entirely and begin trading from the next boundary.
+    startup_synced: bool = False
+    _init_sync_logged: bool = False
+
     try:
         while True:
             trader.reset_daily_pnl_if_new_day()
@@ -110,6 +115,22 @@ async def main() -> None:
             now = time.time()
             current_window = _current_window(now)
             ste = _sec_to_expiry(now)
+
+            # ---- Startup sync guard ----
+            if not startup_synced:
+                if ste < 295:
+                    if not _init_sync_logged:
+                        logger.info(
+                            "INIT_SYNC | started mid-window ste=%.0fs "
+                            "-> wait next boundary, no trading",
+                            ste,
+                        )
+                        _init_sync_logged = True
+                    prev_window = current_window  # suppress spurious "new window" log
+                    await asyncio.sleep(1)
+                    continue
+                # ste >= 295: we are at a fresh window boundary — proceed
+                startup_synced = True
 
             # ---- Window transition logging ----
             if current_window != prev_window:
@@ -135,30 +156,35 @@ async def main() -> None:
                         log_trade(result, trade_file)
 
             # ---- Record open price for this window ----
-            # Capture when we're very early in the window (295–300s left)
+            # Capture once, at the very start of the window (295–300s left).
+            # Never overwritten — the open is fixed for the whole window.
             if ste >= 295 and not trader.has_open_price(current_window):
                 if feed.mid_price is not None and not feed.is_stale:
                     trader.record_open_price(current_window, feed.mid_price)
+                    logger.info(
+                        "OPEN_CAPTURED | window=%d btc_open=%.2f ste=%.2f",
+                        current_window,
+                        feed.mid_price,
+                        ste,
+                    )
 
             # ---- Entry window: generate and act on signal ----
             entry_min = config["signal"]["entry_window_sec"][1]  # 5
             entry_max = config["signal"]["entry_window_sec"][0]  # 30
 
             if entry_min <= ste <= entry_max:
+                # btc_open must have been captured at window boundary.
+                # Never substitute current price — delta would be meaningless.
                 btc_open = trader.get_open_price(current_window)
                 if btc_open is None:
-                    # Fallback: use current price as open (last resort)
-                    btc_open = feed.mid_price
-                    if btc_open is not None:
-                        trader.record_open_price(current_window, btc_open)
-                        logger.warning(
-                            "Open price not pre-recorded for window %d; "
-                            "using current BTC=%.2f as proxy.",
-                            current_window,
-                            btc_open,
-                        )
+                    logger.warning(
+                        "SKIP_ENTRY | window=%d reason=no_true_open_captured",
+                        current_window,
+                    )
+                    await asyncio.sleep(1)
+                    continue
 
-                if feed.mid_price is None or btc_open is None:
+                if feed.mid_price is None:
                     logger.warning("No BTC price available; skipping entry window tick.")
                     await asyncio.sleep(1)
                     continue
