@@ -163,9 +163,18 @@ async def main() -> None:
                     await asyncio.sleep(1)
                     continue
 
-                # Fetch market (cache per window to avoid repeated API calls)
+                # Fetch market off the event loop (sync requests → thread pool).
+                # Cached after first successful fetch for this window.
                 if current_window not in market_cache:
-                    market = pm.get_market(current_window)
+                    t0 = time.perf_counter()
+                    market = await asyncio.to_thread(pm.get_market, current_window)
+                    market_fetch_ms = int((time.perf_counter() - t0) * 1000)
+                    logger.info(
+                        "Market fetch | window=%d took=%dms found=%s",
+                        current_window,
+                        market_fetch_ms,
+                        market.slug if market else "None",
+                    )
                     market_cache[current_window] = market
                     # Prune old windows from cache
                     for old_w in [w for w in market_cache if w < current_window - 300]:
@@ -181,16 +190,30 @@ async def main() -> None:
                     await asyncio.sleep(1)
                     continue
 
-                # Fetch implied price
-                implied = pm.get_implied_price(market.yes_token_id)
+                # Snapshot BTC price and its age before the blocking Polymarket call.
+                btc_before_fetch = feed.mid_price
+                btc_age_before_ms = int((time.time() - feed.last_update_ts) * 1000)
+
+                # Fetch implied price off the event loop (every tick, not cached).
+                t0 = time.perf_counter()
+                implied = await asyncio.to_thread(
+                    pm.get_implied_price, market.yes_token_id
+                )
+                pm_fetch_ms = int((time.perf_counter() - t0) * 1000)
+
+                # BTC age measured after the fetch so we can see if it updated.
+                btc_age_ms = int((time.time() - feed.last_update_ts) * 1000)
+
                 if implied is None:
                     logger.warning(
-                        "No implied price for market %s; skipping.", market.slug
+                        "No implied price for market %s (fetch=%dms); skipping.",
+                        market.slug,
+                        pm_fetch_ms,
                     )
                     await asyncio.sleep(1)
                     continue
 
-                # Evaluate signal
+                # Evaluate signal using the freshest BTC price available.
                 sig = signal_eng.evaluate(
                     btc_current=feed.mid_price,
                     btc_open=btc_open,
@@ -220,11 +243,13 @@ async def main() -> None:
                     else sig.reason
                 )
 
-                # One INFO line per entry-window tick (NO_TRADE and trades)
+                # One INFO line per entry-window tick (NO_TRADE and trades).
+                # btc_age_ms: age of price used for signal; pm_fetch_ms: Polymarket latency.
                 logger.info(
                     "TICK | window=%d ste=%.0fs btc=%.2f open=%.2f delta=%.3f%% "
                     "implied=%.4f model_prob=%.4f edge=%.4f "
-                    "band_ok=%s risk_ok=%s action=%s reason=%s",
+                    "band_ok=%s risk_ok=%s action=%s reason=%s "
+                    "btc_age=%dms pm_fetch=%dms",
                     current_window,
                     ste,
                     feed.mid_price,
@@ -237,9 +262,20 @@ async def main() -> None:
                     "N/A" if risk_ok is None else risk_ok,
                     sig.action,
                     tick_reason,
+                    btc_age_ms,
+                    pm_fetch_ms,
                 )
 
-                log_tick(sig, current_window, band_ok, risk_ok, tick_reason, signal_file)
+                log_tick(
+                    sig,
+                    current_window,
+                    band_ok,
+                    risk_ok,
+                    tick_reason,
+                    signal_file,
+                    btc_age_ms=btc_age_ms,
+                    pm_fetch_ms=pm_fetch_ms,
+                )
 
                 if sig.action != "NO_TRADE" and risk_ok:
                     trader.open_trade(sig, current_window)

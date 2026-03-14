@@ -16,6 +16,8 @@ import websockets
 
 logger = logging.getLogger(__name__)
 
+_HEARTBEAT_INTERVAL_SEC = 5
+
 
 class BinanceFeed:
     def __init__(self, config: dict):
@@ -29,6 +31,7 @@ class BinanceFeed:
         self._callbacks: list[Callable] = []
         self._running: bool = False
         self._ws_task: Optional[asyncio.Task] = None
+        self._heartbeat_task: Optional[asyncio.Task] = None
 
     @property
     def is_stale(self) -> bool:
@@ -41,20 +44,34 @@ class BinanceFeed:
         self._callbacks.append(cb)
 
     async def connect(self) -> None:
-        """Start the WebSocket listener task in the background."""
+        """Start the WebSocket listener and heartbeat tasks in the background."""
         self._running = True
         self._ws_task = asyncio.create_task(self._listen_loop())
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         logger.info("BinanceFeed background task started.")
 
     async def disconnect(self) -> None:
         self._running = False
-        if self._ws_task:
-            self._ws_task.cancel()
-            try:
-                await self._ws_task
-            except asyncio.CancelledError:
-                pass
+        for task in (self._ws_task, self._heartbeat_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         logger.info("BinanceFeed disconnected.")
+
+    async def _heartbeat_loop(self) -> None:
+        """Log feed liveness every _HEARTBEAT_INTERVAL_SEC seconds."""
+        while self._running:
+            await asyncio.sleep(_HEARTBEAT_INTERVAL_SEC)
+            if not self._running:
+                break
+            if self.mid_price is not None:
+                age_ms = int((time.time() - self.last_update_ts) * 1000)
+                logger.info("HEARTBEAT | mid=%.2f age=%dms", self.mid_price, age_ms)
+            else:
+                logger.warning("HEARTBEAT | mid=N/A (no price yet)")
 
     async def _listen_loop(self) -> None:
         attempt = 0

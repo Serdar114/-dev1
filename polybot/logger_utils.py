@@ -51,6 +51,8 @@ def log_tick(
     risk_ok: Optional[bool],
     reason: str,
     signal_file: str,
+    btc_age_ms: int = 0,
+    pm_fetch_ms: int = 0,
 ) -> None:
     """
     Append one entry-window tick to the JSONL signals file.
@@ -70,6 +72,8 @@ def log_tick(
     risk_ok     : True/False result of RiskManager; null if signal was NO_TRADE
     action      : "UP" | "DOWN" | "NO_TRADE"
     reason      : why we traded or didn't (or risk rejection reason)
+    btc_age_ms  : milliseconds since last Binance price tick
+    pm_fetch_ms : milliseconds taken to fetch Polymarket implied price
     """
     _ensure_dir(signal_file)
     record = {
@@ -85,6 +89,8 @@ def log_tick(
         "risk_ok": risk_ok,
         "action": signal.action,
         "reason": reason,
+        "btc_age_ms": btc_age_ms,
+        "pm_fetch_ms": pm_fetch_ms,
     }
     try:
         with open(signal_file, "a", encoding="utf-8") as f:
