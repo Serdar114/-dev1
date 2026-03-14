@@ -2,7 +2,7 @@
 logger_utils.py — Structured logging to JSONL and CSV files.
 
 Manages two log files:
-  logs/signals.jsonl — every signal evaluation (NO_TRADE and trades)
+  logs/signals.jsonl — every entry-window tick (NO_TRADE and trades)
   logs/trades.csv    — every resolved paper trade with PnL
 
 Creates the logs/ directory and CSV header automatically on first write.
@@ -12,7 +12,7 @@ import csv
 import json
 import logging
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from signal_engine import SignalResult
@@ -44,57 +44,53 @@ def _ensure_dir(path: str) -> None:
         logger.info("Created log directory: %s", directory)
 
 
-def log_signal(signal: "SignalResult", signal_file: str) -> None:
+def log_tick(
+    signal: "SignalResult",
+    window_ts: int,
+    band_ok: Optional[bool],
+    risk_ok: Optional[bool],
+    reason: str,
+    signal_file: str,
+) -> None:
     """
-    Append a signal evaluation record to the JSONL signals file.
-    All signals are logged, including NO_TRADE decisions.
+    Append one entry-window tick to the JSONL signals file.
+    Written for every tick — NO_TRADE and actionable signals alike.
+
+    Fields
+    ------
+    window_ts   : start of the 5-min window (unix seconds)
+    ste         : seconds to expiry at evaluation time
+    btc         : BTC mid price at evaluation time
+    open        : BTC open price recorded at window start
+    delta_pct   : (btc - open) / open * 100
+    implied_price: YES token implied price from Polymarket
+    model_prob  : model's estimated YES probability
+    edge        : model_prob - trade_price - fee  (0 when no trade signal)
+    band_ok     : True/False if band check was reached; null if delta too small
+    risk_ok     : True/False result of RiskManager; null if signal was NO_TRADE
+    action      : "UP" | "DOWN" | "NO_TRADE"
+    reason      : why we traded or didn't (or risk rejection reason)
     """
     _ensure_dir(signal_file)
     record = {
-        "ts": signal.timestamp,
-        "market": signal.market_slug,
+        "window_ts": window_ts,
+        "ste": round(signal.seconds_to_expiry, 1),
+        "btc": round(signal.btc_spot, 2),
+        "open": round(signal.btc_open, 2),
+        "delta_pct": round(signal.delta_pct, 6),
+        "implied_price": round(signal.implied_prob, 6),
+        "model_prob": round(signal.model_prob, 6),
+        "edge": round(signal.edge, 6),
+        "band_ok": band_ok,
+        "risk_ok": risk_ok,
         "action": signal.action,
-        "delta_pct": round(signal.delta_pct, 6),
-        "edge": round(signal.edge, 6),
-        "reason": signal.reason,
-        "implied": round(signal.implied_prob, 6),
-        "model": round(signal.model_prob, 6),
-        "trade_price": round(signal.trade_price, 6),
-        "fee_pct": round(signal.fee_pct, 6),
-        "btc_spot": round(signal.btc_spot, 2),
-        "btc_open": round(signal.btc_open, 2),
-        "tte_sec": round(signal.seconds_to_expiry, 1),
+        "reason": reason,
     }
     try:
         with open(signal_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
     except OSError as exc:
-        logger.error("Failed to write signal log: %s", exc)
-
-
-def log_signal_rejected(signal: "SignalResult", risk_reason: str, signal_file: str) -> None:
-    """Log a signal that was blocked by risk manager."""
-    _ensure_dir(signal_file)
-    record = {
-        "ts": signal.timestamp,
-        "market": signal.market_slug,
-        "action": f"REJECTED:{signal.action}",
-        "delta_pct": round(signal.delta_pct, 6),
-        "edge": round(signal.edge, 6),
-        "reason": f"risk:{risk_reason}",
-        "implied": round(signal.implied_prob, 6),
-        "model": round(signal.model_prob, 6),
-        "trade_price": round(signal.trade_price, 6),
-        "fee_pct": round(signal.fee_pct, 6),
-        "btc_spot": round(signal.btc_spot, 2),
-        "btc_open": round(signal.btc_open, 2),
-        "tte_sec": round(signal.seconds_to_expiry, 1),
-    }
-    try:
-        with open(signal_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
-    except OSError as exc:
-        logger.error("Failed to write rejected signal log: %s", exc)
+        logger.error("Failed to write tick log: %s", exc)
 
 
 def log_trade(trade_result: "TradeResult", trade_file: str) -> None:

@@ -21,6 +21,7 @@ import signal
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 # Ensure polybot/ is on the path when invoked as a module or directly
 _HERE = Path(__file__).parent
@@ -28,8 +29,7 @@ sys.path.insert(0, str(_HERE))
 
 from binance_feed import BinanceFeed
 from logger_utils import (
-    log_signal,
-    log_signal_rejected,
+    log_tick,
     log_trade,
     setup_logging,
 )
@@ -198,14 +198,51 @@ async def main() -> None:
                     seconds_to_expiry=ste,
                     market_slug=market.slug,
                 )
-                log_signal(sig, signal_file)
 
+                # band_ok: True/False only if delta was large enough to reach the
+                # price-band check; None if we never got there (delta too small).
+                band_ok: Optional[bool] = None
+                if sig.model_prob > 0.0:
+                    band_ok = "price_out_of_band" not in sig.reason
+
+                # risk_ok: only evaluated when signal is actionable
+                risk_ok: Optional[bool] = None
+                risk_reason = ""
                 if sig.action != "NO_TRADE":
                     risk_check = risk.check(sig, feed, trader)
-                    if risk_check.ok:
-                        trader.open_trade(sig, current_window)
-                    else:
-                        log_signal_rejected(sig, risk_check.reason, signal_file)
+                    risk_ok = risk_check.ok
+                    risk_reason = risk_check.reason
+
+                # Unified reason: prefer risk rejection reason when applicable
+                tick_reason = (
+                    f"risk:{risk_reason}"
+                    if (risk_reason and risk_ok is False)
+                    else sig.reason
+                )
+
+                # One INFO line per entry-window tick (NO_TRADE and trades)
+                logger.info(
+                    "TICK | window=%d ste=%.0fs btc=%.2f open=%.2f delta=%.3f%% "
+                    "implied=%.4f model_prob=%.4f edge=%.4f "
+                    "band_ok=%s risk_ok=%s action=%s reason=%s",
+                    current_window,
+                    ste,
+                    feed.mid_price,
+                    btc_open,
+                    sig.delta_pct,
+                    sig.implied_prob,
+                    sig.model_prob,
+                    sig.edge,
+                    "N/A" if band_ok is None else band_ok,
+                    "N/A" if risk_ok is None else risk_ok,
+                    sig.action,
+                    tick_reason,
+                )
+
+                log_tick(sig, current_window, band_ok, risk_ok, tick_reason, signal_file)
+
+                if sig.action != "NO_TRADE" and risk_ok:
+                    trader.open_trade(sig, current_window)
 
             await asyncio.sleep(1)
 
