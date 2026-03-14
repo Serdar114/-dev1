@@ -23,6 +23,10 @@ logger = logging.getLogger(__name__)
 # Hardcoded fee params — matches config["fee"] defaults.
 _FEE_NOTE_LOGGED = False
 
+# Minimum character length for a token ID to be considered valid.
+# Real Polymarket token IDs are 64-char hex strings.
+_MIN_TOKEN_ID_LEN = 10
+
 
 def calc_fee(price: float, fee_rate: float = 0.25, exponent: int = 2) -> float:
     """
@@ -177,12 +181,40 @@ class PolymarketClient:
                 # Some API responses embed token IDs directly.
                 # clobTokenIds may be a JSON-encoded string e.g. '["id1","id2"]'
                 # — parse it before indexing to avoid getting '[' as the token.
-                clob_ids = m.get("clobTokenIds") or []
+                raw_clob = m.get("clobTokenIds")
+                clob_ids = raw_clob or []
                 if isinstance(clob_ids, str):
                     try:
                         clob_ids = json.loads(clob_ids)
                     except (json.JSONDecodeError, ValueError):
+                        logger.error(
+                            "clobTokenIds for market %s is a string but not valid JSON: %r",
+                            slug,
+                            clob_ids[:80],
+                        )
                         clob_ids = []
+
+                # Guard: must be a list after parsing
+                if not isinstance(clob_ids, list):
+                    logger.error(
+                        "clobTokenIds for market %s parsed to unexpected type %s (raw=%r). "
+                        "Skipping market.",
+                        slug,
+                        type(clob_ids).__name__,
+                        str(raw_clob)[:80],
+                    )
+                    return None
+
+                # Guard: need at least 2 entries (YES index 0, NO index 1)
+                if len(clob_ids) < 2:
+                    logger.error(
+                        "clobTokenIds for market %s has only %d entries (need >=2). "
+                        "Skipping market.",
+                        slug,
+                        len(clob_ids),
+                    )
+                    return None
+
                 yes_token_id = (
                     m.get("yes_token_id")
                     or m.get("yesTokenId")
@@ -196,6 +228,40 @@ class PolymarketClient:
                     or ""
                 )
 
+                # Debug log: raw vs parsed token info for first-time diagnosis
+                logger.debug(
+                    "Market %s token parse | "
+                    "raw_clobTokenIds=%r | "
+                    "parsed_clob_ids=%s | "
+                    "yes_token_id=%s | "
+                    "no_token_id=%s",
+                    slug,
+                    str(raw_clob)[:120],
+                    clob_ids,
+                    yes_token_id,
+                    no_token_id,
+                )
+
+            # Guard: validate token ID length — real IDs are 64-char hex strings
+            if len(yes_token_id) < _MIN_TOKEN_ID_LEN:
+                logger.error(
+                    "yes_token_id for market %s is too short (%d chars): %r. "
+                    "Likely a parse error. Skipping market.",
+                    slug,
+                    len(yes_token_id),
+                    yes_token_id,
+                )
+                return None
+            if len(no_token_id) < _MIN_TOKEN_ID_LEN:
+                logger.error(
+                    "no_token_id for market %s is too short (%d chars): %r. "
+                    "Likely a parse error. Skipping market.",
+                    slug,
+                    len(no_token_id),
+                    no_token_id,
+                )
+                return None
+
             if not yes_token_id or not no_token_id:
                 logger.warning(
                     "Could not extract token IDs from market %s. "
@@ -204,6 +270,14 @@ class PolymarketClient:
                     list(m.keys()),
                 )
                 return None
+
+            # One-time INFO log with chosen IDs so we can confirm parsing in logs
+            logger.info(
+                "Market parsed OK | slug=%s | yes_token=...%s | no_token=...%s",
+                slug,
+                yes_token_id[-8:],
+                no_token_id[-8:],
+            )
 
             min_order_size = float(m.get("minOrderSize") or m.get("min_order_size") or 1)
             if not m.get("minOrderSize") and not m.get("min_order_size"):
@@ -234,6 +308,16 @@ class PolymarketClient:
         Tries /midpoint first, then /price, then computes from /book.
         Returns float in [0, 1] or None on failure.
         """
+        # Guard: refuse to fire any HTTP request for a clearly invalid token ID
+        if not yes_token_id or len(yes_token_id) < _MIN_TOKEN_ID_LEN:
+            logger.error(
+                "get_implied_price called with invalid token_id %r (len=%d). "
+                "Skipping all price lookups.",
+                yes_token_id,
+                len(yes_token_id),
+            )
+            return None
+
         price = self._fetch_midpoint(yes_token_id)
         if price is not None:
             return price
