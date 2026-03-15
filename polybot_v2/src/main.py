@@ -167,6 +167,17 @@ class PolybotV2:
                 from ui_dashboard import UIDashboard
                 from ui_state import UIState, UILogHandler
                 self._ui_state = UIState()
+                # Seed with known-at-startup values so UI never shows $0.00 on fields
+                # where config already provides the correct starting value
+                self._ui_state.update(
+                    mode=self._cfg.mode,
+                    bankroll=self._bankroll.bankroll,
+                    peak_bankroll=self._bankroll.peak_bankroll,
+                    market_slug="discovering…",
+                    entry_start_sec=self._cfg.entry_start_sec,
+                    entry_end_sec=self._cfg.entry_end_sec,
+                    status_msg="INITIALIZING…",
+                )
                 self._ui = UIDashboard(self._cfg, self._ui_state)
                 # Route all log records to the live log panel
                 _ui_handler = UILogHandler(self._ui_state)
@@ -273,24 +284,46 @@ class PolybotV2:
         if now - self._last_market_refresh >= refresh_interval:
             self._refresh_market(now)
 
+        # ── Binance snapshot ─────────────────────────────────────────────
+        # Compute age with a FRESH time.time() AFTER get_snapshot() to avoid
+        # the race where the WS callback fires between 'now' capture and the
+        # snapshot read, making btc_ts > now → negative age.
+        btc_mid, btc_ts, realized_vol = self._binance.get_snapshot()
+        _snap_read_ts = time.time()
+        if btc_mid is None:
+            if self._ui_state is not None:
+                self._ui_state.update(status_msg="WAITING FOR BINANCE FEED…")
+            log.warning("No Binance price, skipping tick")
+            return
+
+        # Root-cause fix kept; max(0.0) is a defensive last-resort guard
+        binance_age_ms = max(0.0, (_snap_read_ts - btc_ts) * 1000)
+
+        # ── EARLY UI UPDATE ──────────────────────────────────────────────
+        # Push BTC price BEFORE any market/sanity checks so the header
+        # always shows the live price even on early-return paths.
+        if self._ui_state is not None:
+            self._ui_state.update(
+                btc_mid=btc_mid,
+                binance_age_ms=binance_age_ms,
+                realized_vol_60s=realized_vol,
+                ui_update_ts=_snap_read_ts,
+            )
+            if btc_mid <= 0.0:
+                log.debug(
+                    "UI_DEBUG btc_header_unset has_snapshot=True"
+                    " snapshot_mid=%.2f snapshot_ts=%.3f",
+                    btc_mid, btc_ts,
+                )
+
         if self._current_market is None:
+            if self._ui_state is not None:
+                self._ui_state.update(status_msg="WAITING FOR MARKET DISCOVERY…")
             log.debug("No active market, waiting…")
             return
 
         market = self._current_market
-
-        # Get Binance snapshot — compute age with a FRESH time.time() taken after
-        # the snapshot call.  Using the stale 'now' from tick-start risks negative
-        # data_age_ms if the WS callback fires between 'now = time.time()' and
-        # 'get_snapshot()' and updates _last_ts to a value > now.
-        btc_mid, btc_ts, realized_vol = self._binance.get_snapshot()
-        _snap_read_ts = time.time()
-        if btc_mid is None:
-            log.warning("No Binance price, skipping tick")
-            return
-
-        binance_age_ms = (_snap_read_ts - btc_ts) * 1000   # always >= 0
-        polymarket_age_ms = (_snap_read_ts - market.fetched_at) * 1000
+        polymarket_age_ms = max(0.0, (_snap_read_ts - market.fetched_at) * 1000)
 
         # Set / maintain window open price — frozen at first tick of each window
         if self._window_open_price is None:
@@ -311,9 +344,12 @@ class PolybotV2:
         )
 
         # Lane 1: Selective Taker — hard sanity gate first
+        wo = self._window_open_price or 0.0
+        raw_d = (btc_mid - wo) / wo if wo > 0 else 0.0
         if sanity_reject:
-            # Synthetic NO_TRADE with spread/skew reject reason
+            # Synthetic NO_TRADE — still carry as much diagnostic context as possible
             from models import SignalDecision as _SD
+            lf = self._signal_engine._last_fair_result
             taker_decision = _SD(
                 ts=now, window_ts=current_window_end,
                 lane="selective_taker", action="NO_TRADE",
@@ -321,9 +357,18 @@ class PolybotV2:
                 seconds_to_expiry=market.seconds_to_expiry,
                 elapsed_from_window_start=elapsed_in_window,
                 btc_mid=btc_mid,
-                window_open=self._window_open_price or 0.0,
+                window_open=wo,
+                delta_pct=raw_d,
+                delta_raw_fraction=raw_d,
+                delta_pct_display=raw_d * 100.0,
+                realized_vol_60s=realized_vol,
+                implied_yes_prob=market.implied_yes_prob,
+                fair_yes_prob=lf.fair_yes_prob if lf else 0.0,
+                regime=self._signal_engine._last_regime,
+                pattern=self._signal_engine._last_pattern,
                 bankroll=self._bankroll.bankroll,
                 data_age_ms=binance_age_ms,
+                fair_computed=(lf is not None),
             )
         else:
             taker_decision = self._signal_engine.evaluate_taker(
@@ -349,6 +394,40 @@ class PolybotV2:
                 self._risk_state.actions_this_window += 1
                 self._risk_state.open_paper_trades_this_window += 1
                 self._log_paper_trade(trade, "open")
+                # Trade thesis — why we opened; logged separately for easy filtering
+                d = taker_decision
+                log.info(
+                    "PAPER_TRADE OPEN thesis: side=%s fair=%.4f implied=%.4f "
+                    "afe_yes=%+.5f afe_no=%+.5f conf=%.3f "
+                    "delta_raw=%.5f delta_pct=%.4f%% regime=%s pattern=%s",
+                    d.chosen_side, d.fair_yes_prob, d.implied_yes_prob,
+                    d.after_fee_edge_yes, d.after_fee_edge_no, d.confidence_score,
+                    d.delta_raw_fraction, d.delta_pct_display,
+                    d.regime, d.pattern,
+                )
+                self._structured.log("paper_trades", {
+                    "event": "trade_thesis",
+                    "trade_id": trade.trade_id,
+                    "side": d.chosen_side,
+                    "entry_price": entry_price,
+                    "fair_yes_prob": d.fair_yes_prob,
+                    "implied_yes_prob": d.implied_yes_prob,
+                    "raw_edge_yes": d.raw_edge_yes,
+                    "raw_edge_no": d.raw_edge_no,
+                    "after_fee_edge_yes": d.after_fee_edge_yes,
+                    "after_fee_edge_no": d.after_fee_edge_no,
+                    "fee_per_share": d.fee_per_share,
+                    "effective_rate": d.effective_rate,
+                    "confidence_score": d.confidence_score,
+                    "confidence_components": d.confidence_components,
+                    "delta_raw_fraction": d.delta_raw_fraction,
+                    "delta_pct_display": d.delta_pct_display,
+                    "regime": d.regime,
+                    "pattern": d.pattern,
+                    "elapsed_from_window_start": d.elapsed_from_window_start,
+                    "seconds_to_expiry": d.seconds_to_expiry,
+                    "sanity_status": "pass",
+                })
 
         # Lane 2: Shadow Probe
         if self._cfg.mode == "paper_with_shadow_probe":
@@ -556,43 +635,72 @@ class PolybotV2:
     # ------------------------------------------------------------------ #
 
     def _log_signal(self, d) -> None:
-        """Write signal decision to JSONL with unified schema (no legacy mixing)."""
+        """
+        Write signal decision to JSONL with full diagnostic schema.
+
+        Fields that require fair_prob computation are written as null when
+        d.fair_computed is False (early-reject path before engine ran).
+        Fields always available (btc_mid, delta, implied_yes, etc.) are
+        always written.
+        """
+        fc = d.fair_computed  # True when analytical fields are freshly computed
+        sd = self._last_sanity_details  # market sanity numerics from current tick
+
+        # Helper: return value or null depending on whether it was computed
+        def _or_null(v, precision: int = 5):
+            return round(v, precision) if fc else None
+
         self._structured.log("signals", {
-            # Identity
+            # ── Identity ──────────────────────────────────────────────
             "ts": d.ts,
             "window_ts": d.window_ts,
+            "market_slug": sd.get("slug", "") or getattr(self._current_market, "slug", ""),
             "lane": d.lane,
-            # Window position
+            # ── Window position ───────────────────────────────────────
             "elapsed_from_window_start": round(d.elapsed_from_window_start, 1),
             "seconds_to_expiry": round(d.seconds_to_expiry, 1),
-            # BTC price — dual representation to eliminate unit ambiguity
-            "btc_mid": d.btc_mid,
-            "window_open": d.window_open,
-            "delta_raw_fraction": round(d.delta_raw_fraction, 6),   # e.g. 0.001000
-            "delta_pct_display": round(d.delta_pct_display, 4),     # e.g. 0.1000 (%)
-            "delta_pct": round(d.delta_pct, 6),                     # legacy alias
+            # ── BTC price (dual representation) ──────────────────────
+            "btc_mid": round(d.btc_mid, 2),
+            "window_open": round(d.window_open, 2),
+            "delta_raw_fraction": round(d.delta_raw_fraction, 6),
+            "delta_pct_display": round(d.delta_pct_display, 4),
             "realized_vol_60s": round(d.realized_vol_60s, 8),
-            # Fair vs implied
-            "fair_yes_prob": round(d.fair_yes_prob, 4),
-            "implied_yes_prob": round(d.implied_yes_prob, 4),
-            # Edge
-            "raw_edge_yes": round(d.raw_edge_yes, 5),
-            "raw_edge_no": round(d.raw_edge_no, 5),
-            "after_fee_edge_yes": round(d.after_fee_edge_yes, 5),
-            "after_fee_edge_no": round(d.after_fee_edge_no, 5),
-            # Fee (pre-computed in SignalDecision)
-            "fee_per_share": d.fee_per_share,
-            "effective_rate": d.effective_rate,
-            # Signal quality
-            "confidence_score": d.confidence_score,
-            "regime": d.regime,
+            # ── Order book snapshot ───────────────────────────────────
+            "yes_bid": sd.get("yes_bid"),
+            "yes_ask": sd.get("yes_ask"),
+            "no_bid":  sd.get("no_bid"),
+            "no_ask":  sd.get("no_ask"),
+            "yes_mid": sd.get("yes_mid"),
+            "no_mid":  sd.get("no_mid"),
+            "spread_yes": round(sd.get("spread_yes", 0.0), 5) if sd else None,
+            "spread_no":  round(sd.get("spread_no",  0.0), 5) if sd else None,
+            "complement_skew": round(sd.get("complement_skew", 0.0), 5) if sd else None,
+            # ── Market sanity ─────────────────────────────────────────
+            "sanity_status": "reject" if sd.get("reject") else "pass",
+            "sanity_reason": sd.get("reject"),
+            # ── Fair vs implied (null when not computed) ──────────────
+            "fair_yes_prob": round(d.fair_yes_prob, 4) if d.fair_yes_prob > 0 else None,
+            "implied_yes_prob": round(d.implied_yes_prob, 4) if d.implied_yes_prob > 0 else None,
+            "fair_computed": fc,
+            # ── Edge (null when not computed) ─────────────────────────
+            "raw_edge_yes":       _or_null(d.raw_edge_yes),
+            "raw_edge_no":        _or_null(d.raw_edge_no),
+            "after_fee_edge_yes": _or_null(d.after_fee_edge_yes),
+            "after_fee_edge_no":  _or_null(d.after_fee_edge_no),
+            "fee_per_share":      _or_null(d.fee_per_share, 8),
+            "effective_rate":     _or_null(d.effective_rate, 6),
+            # ── Confidence (null when not computed) ───────────────────
+            "confidence_score":      _or_null(d.confidence_score, 4),
+            "confidence_components": d.confidence_components if fc else None,
+            # ── Regime / pattern (UNKNOWN when not computed) ──────────
+            "regime":  d.regime,
             "pattern": d.pattern,
-            # Decision
-            "action": d.action,
-            "chosen_side": d.chosen_side,
-            "reason": d.reason,
-            # Context
-            "bankroll": round(d.bankroll, 4),
+            # ── Decision ─────────────────────────────────────────────
+            "action":       d.action,
+            "chosen_side":  d.chosen_side,
+            "reason":       d.reason,
+            # ── Context ──────────────────────────────────────────────
+            "bankroll":    round(d.bankroll, 4),
             "data_age_ms": round(d.data_age_ms, 1),
         })
 

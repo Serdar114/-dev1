@@ -162,11 +162,22 @@ def _build_header(snap: dict) -> Panel:
     t.append("  POLYBOT V2 PHASE-1  ", style=_T["header_brand"])
     t.append("  ")
     t.append(f"MODE:{mode}", style=_T["header_key"])
+
+    # BTC: show WAITING FOR FEED if no price yet — never show $0.00
     t.append("  BTC:", style=_T["val_dim"])
-    btc_s = "bold green" if btc > 0 else "bold red"
-    t.append(f"${btc:,.2f}", style=btc_s)
+    if btc == 0.0:
+        t.append("WAITING FOR FEED", style="bold yellow")
+    else:
+        btc_s = "bold green" if btc > 0 else "bold red"
+        t.append(f"${btc:,.2f}", style=btc_s)
+        if stale_feed:
+            t.append(f"⚡({binance_age:.0f}ms)", style="bold red on white")
+
     t.append("  BANKROLL:", style=_T["val_dim"])
-    t.append(f"${bankroll:.2f}", style="bold green" if bankroll >= 30.0 else "bold red")
+    if bankroll == 0.0:
+        t.append("loading…", style="dim white")
+    else:
+        t.append(f"${bankroll:.2f}", style="bold green" if bankroll >= 30.0 else "bold red")
     t.append("  PnL:", style=_T["val_dim"])
     t.append(f"{pnl:+.4f}U", style=_sign(pnl))
     t.append("  W/L:", style=_T["val_dim"])
@@ -175,7 +186,7 @@ def _build_header(snap: dict) -> Panel:
         wr = win / (win + loss)
         t.append(f"({wr*100:.0f}%)", style="bold green" if wr >= 0.5 else "bold red")
     t.append("  MARKET:", style=_T["val_dim"])
-    t.append(slug_short, style="bold yellow")
+    t.append(slug_short if slug_short != "—" else "discovering…", style="bold yellow")
     if ws > 0:
         t.append(f"  {_ts(ws)}→{_ts(we)}", style="bold yellow")
     t.append(f"  T+{elapsed:.0f}s/{remaining:.0f}s", style="dim white")
@@ -183,8 +194,6 @@ def _build_header(snap: dict) -> Panel:
         t.append(f"  ⚠COOLDOWN:{cooldown}w", style="bold red")
     if consec > 0:
         t.append(f"  LOSSES:{consec}", style="bold red")
-    if stale_feed:
-        t.append(f"  ⚡STALE-FEED({binance_age:.0f}ms)", style="bold red on white")
     t.append("  ")
 
     return Panel(t, style="on grey3", padding=(0, 0), border_style="red")
@@ -417,7 +426,8 @@ def _build_status_panel(snap: dict) -> Panel:
 
     # Bankroll block
     tbl.add_row("[bold cyan]─── KASA ───[/bold cyan]", "")
-    tbl.add_row("Bankroll",  f"[bold green]${bankroll:.4f}[/bold green]")
+    br_s = "bold green" if bankroll > 0 else "dim white"
+    tbl.add_row("Bankroll",  f"[{br_s}]${bankroll:.4f}[/{br_s}]")
     tbl.add_row("Peak",      f"[dim white]${peak:.4f}[/dim white]")
     pnl_s = "bold green" if pnl >= 0 else "bold red"
     tbl.add_row("Paper PnL", f"[{pnl_s}]{pnl:+.4f} USDC[/{pnl_s}]")

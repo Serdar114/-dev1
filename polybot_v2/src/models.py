@@ -104,6 +104,11 @@ class SignalDecision:
     data_age_ms: float = 0.0
     regime: str = "UNKNOWN"
     pattern: str = "UNKNOWN"
+    # Diagnostic flags — set False when fields could not be computed this tick
+    # (e.g. early guard before fair_prob engine ran)
+    fair_computed: bool = False       # True iff fair_yes_prob is freshly computed
+    # Compact confidence breakdown for debugging: "div=X;base=X;reg=X;pat=X;dq=X;raw=X"
+    confidence_components: str = ""
 
 
 @dataclass
