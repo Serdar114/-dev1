@@ -1,0 +1,62 @@
+app:
+  mode: paper_with_shadow_probe   # paper | paper_with_shadow_probe
+  log_level: INFO
+
+market:
+  symbol: BTCUSDT
+  window_sec: 300                 # 5-minute window
+  entry_start_sec: 30             # open taker entry from T+30s
+  entry_end_sec: 240              # close taker entry at T+240s
+  shadow_start_sec: 10            # shadow probe from T+10s
+  shadow_end_sec: 270             # shadow probe until T+270s
+
+feeds:
+  stale_binance_ms: 3000          # max age for Binance mid-price
+  stale_polymarket_ms: 10000      # max age for Polymarket book
+
+fair_prob:
+  sigma_floor: 0.0008             # min effective vol (~0.08% per sqrt-window)
+  tau_floor: 0.05                 # min effective tau fraction
+  zscore_clip: 8.0                # z-score clamping bound
+  prob_clip_min: 0.01             # minimum output probability
+  prob_clip_max: 0.99             # maximum output probability
+
+fees:
+  taker_fee_rate: 0.02            # 2% taker fee (Polymarket)
+  maker_rebate_rate: 0.0          # Phase 1: no maker rebate assumed
+  use_dynamic_zone_adjustment: false
+
+zones:
+  taker_min_prob: 0.10            # ignore near-0 markets (taker)
+  taker_max_prob: 0.90            # ignore near-1 markets (taker)
+  extreme_upper: 0.85             # shadow: extreme zone threshold (YES)
+  extreme_lower: 0.15             # shadow: extreme zone threshold (NO)
+
+stake:
+  bankroll: 30.0                  # starting bankroll USDC
+  min_notional: 0.50              # smallest trade allowed
+  max_risk_fraction: 0.05         # max 5% bankroll per trade
+  drawdown_reduce_factor: 0.5     # halve size if in drawdown
+  scale_tiers:
+    - { min_bankroll: 0,   max_bankroll: 30,   fraction: 0.02 }
+    - { min_bankroll: 30,  max_bankroll: 60,   fraction: 0.03 }
+    - { min_bankroll: 60,  max_bankroll: 120,  fraction: 0.04 }
+    - { min_bankroll: 120, max_bankroll: 9999, fraction: 0.05 }
+
+risk:
+  max_actions_per_window: 2
+  max_consecutive_losses: 4
+  cooldown_windows: 2
+  max_shadow_quotes_per_window: 5
+
+edge:
+  min_after_fee_edge: 0.03        # require at least 3% after-fee edge
+
+maker_shadow:
+  default_tick_size: 0.01
+  extreme_tick_size: 0.005        # finer tick in extreme zones
+  post_only: true
+
+logging:
+  directory: logs
+  jsonl_enabled: true
