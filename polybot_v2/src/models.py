@@ -77,6 +77,7 @@ class SignalDecision:
     reason: str
     # enrichment fields stored for logging
     seconds_to_expiry: float = 0.0
+    elapsed_from_window_start: float = 0.0   # seconds since window open
     btc_mid: float = 0.0
     window_open: float = 0.0
     delta_pct: float = 0.0
@@ -87,6 +88,9 @@ class SignalDecision:
     raw_edge_no: float = 0.0
     after_fee_edge_yes: float = 0.0
     after_fee_edge_no: float = 0.0
+    fee_per_share: float = 0.0
+    effective_rate: float = 0.0
+    confidence_score: float = 0.0
     bankroll: float = 0.0
     data_age_ms: float = 0.0
     regime: str = "UNKNOWN"
@@ -161,11 +165,23 @@ class MetricsSnapshot:
     taker_trade_count: int = 0
     taker_no_trade_count: int = 0
     no_trade_reasons: dict = field(default_factory=dict)
+    # Shadow quote state counters
     shadow_quote_count: int = 0
-    shadow_fillable_count: int = 0
+    shadow_pending_count: int = 0
+    shadow_filled_count: int = 0
+    shadow_expired_count: int = 0
+    shadow_adverse_fill_count: int = 0
+    shadow_crossed_count: int = 0
+    shadow_fillable_count: int = 0   # legacy: kept for compatibility
+    # Reject counters
+    stale_reject_count: int = 0
+    spread_reject_count: int = 0
+    skew_reject_count: int = 0
+    # PnL / bankroll
     paper_pnl: float = 0.0
     bankroll_path: list = field(default_factory=list)
     edge_distribution: list = field(default_factory=list)
+    confidence_distribution: list = field(default_factory=list)
     fair_prob_distribution: list = field(default_factory=list)
     taker_win_count: int = 0
     taker_loss_count: int = 0

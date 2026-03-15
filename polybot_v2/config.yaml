@@ -13,10 +13,15 @@ market:
   # shadow_start_sec / shadow_end_sec: same convention (elapsed from window start).
   shadow_start_sec: 10            # shadow probe from T+10s into window
   shadow_end_sec: 270             # shadow probe until T+270s (30s buffer before close)
+  # Adaptive Polymarket refresh cadence:
+  #   During active window (inside entry/shadow bounds) refresh aggressively.
+  #   Outside active window, refresh slowly to avoid rate limits.
+  refresh_active_sec: 2.0         # refresh interval when inside active window
+  refresh_inactive_sec: 15.0      # refresh interval when outside active window
 
 feeds:
   stale_binance_ms: 3000          # max age for Binance mid-price
-  stale_polymarket_ms: 10000      # max age for Polymarket book
+  stale_polymarket_ms: 10000      # max age for Polymarket book (must be >= refresh_active_sec + latency)
 
 fair_prob:
   sigma_floor: 0.0008             # min effective vol (~0.08% per sqrt-window)
@@ -41,9 +46,9 @@ zones:
   taker_max_prob: 0.90            # ignore near-1 markets (taker)
   extreme_upper: 0.85             # shadow: extreme zone threshold (YES)
   extreme_lower: 0.15             # shadow: extreme zone threshold (NO)
-  # Spread sanity
-  max_spread_warn: 0.05           # log warning if yes bid-ask spread exceeds this
-  max_complement_skew: 0.05       # log warning if |yes_mid + no_mid - 1| exceeds this
+  # Spread sanity — hard reject (not just warning)
+  max_spread_warn: 0.05           # reject if yes bid-ask spread exceeds this
+  max_complement_skew: 0.05       # reject if |yes_mid + no_mid - 1| exceeds this
 
 signal:
   # Regime thresholds
@@ -57,6 +62,15 @@ signal:
   burst_vol_ratio: 4.0
   fade_abs_delta: 0.002
   fade_vol_ratio_max: 1.5
+  # Taker conviction guards
+  min_abs_delta_for_taker: 0.0005  # minimum |delta_pct| to allow taker entry
+  min_confidence_for_taker: 0.20   # minimum confidence_score (0-1) for PAPER_TRADE
+  allow_quiet_noise_trades: false   # reject PAPER_TRADE when regime=QUIET and pattern=NOISE
+  # Neutral probability band: near p=0.50 require extra evidence
+  neutral_prob_band_low: 0.47       # lower bound of neutral zone
+  neutral_prob_band_high: 0.53      # upper bound of neutral zone
+  neutral_band_min_delta: 0.001     # extra delta requirement inside neutral zone
+  neutral_band_min_confidence: 0.30 # extra confidence requirement inside neutral zone
 
 stake:
   bankroll: 30.0                  # starting bankroll USDC
@@ -88,3 +102,12 @@ maker_shadow:
 logging:
   directory: logs
   jsonl_enabled: true
+  # Log rotation: create a timestamped subdirectory per session so runs don't mix
+  session_subdirs: true           # if true, logs go to logs/<session_ts>/
+
+ui:
+  enabled: true
+  refresh_sec: 1.0
+  show_log_lines: 20
+  theme: sniper_red               # sniper_red | plain
+  compact_mode: false

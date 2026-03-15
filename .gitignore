@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+polybot_v2/logs/
+*.log
+*.jsonl
+state.json
+.env
+*.egg-info/
+dist/
+build/

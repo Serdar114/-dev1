@@ -57,6 +57,49 @@ def _classify_regime(
     return "CHOP"
 
 
+def _compute_confidence(
+    fair_yes_prob: float,
+    implied_yes_prob: float,
+    delta_pct: float,
+    regime: str,
+    pattern: str,
+    min_edge: float,
+) -> float:
+    """
+    Composite confidence score [0, 1].
+
+    Combines:
+      - implied_divergence: how much our model disagrees with market price
+        relative to the minimum edge threshold
+      - regime multiplier: TRENDING > CHOP > EXTREME_ZONE > QUIET
+      - pattern multiplier: SUSTAINED_MOVE > BURST > NOISE > FADE
+      - delta boost: directional conviction from BTC price move
+
+    A score of 0.20+ is required for a PAPER_TRADE in config.
+    """
+    implied_divergence = abs(fair_yes_prob - implied_yes_prob)
+    base = implied_divergence / max(min_edge, 0.01)
+
+    regime_mult = {
+        "TRENDING": 1.5,
+        "CHOP": 1.0,
+        "QUIET": 0.4,
+        "EXTREME_ZONE": 0.7,
+    }.get(regime, 1.0)
+
+    pattern_mult = {
+        "SUSTAINED_MOVE": 1.5,
+        "BURST": 1.2,
+        "NOISE": 0.5,
+        "FADE": 0.4,
+    }.get(pattern, 1.0)
+
+    # Directional conviction from BTC delta (caps at 2x boost)
+    delta_boost = min(abs(delta_pct) / 0.003, 2.0)
+    raw = base * regime_mult * pattern_mult * (1.0 + delta_boost * 0.3)
+    return min(raw, 1.0)
+
+
 def _classify_pattern(
     delta_pct: float,
     realized_vol_60s: float,
@@ -193,7 +236,83 @@ class SignalEngine:
                 window_open=window_open, fair_result=fair_result,
                 yes_edge=yes_edge, no_edge=no_edge,
                 bankroll_state=bankroll_state, binance_age_ms=binance_age_ms,
-                regime=regime, pattern=pattern,
+                regime=regime, pattern=pattern, confidence=0.0,
+            )
+
+        # Compute confidence score
+        confidence = _compute_confidence(
+            fair_yes_prob=fair_result.fair_yes_prob,
+            implied_yes_prob=market_snap.implied_yes_prob,
+            delta_pct=fair_result.delta_pct,
+            regime=regime,
+            pattern=pattern,
+            min_edge=self._edge._min_edge,
+        )
+
+        # --- Taker conviction guards ---
+
+        # Guard: minimum directional move
+        if abs(fair_result.delta_pct) < self._cfg.min_abs_delta_for_taker:
+            return self._make_decision(
+                ts=ts, window_ts=window_ts, lane="selective_taker",
+                action="NO_TRADE", chosen_side=None,
+                reason=f"delta_too_small({abs(fair_result.delta_pct):.5f})",
+                price_snap=price_snap, market_snap=market_snap,
+                window_open=window_open, fair_result=fair_result,
+                yes_edge=yes_edge, no_edge=no_edge,
+                bankroll_state=bankroll_state, binance_age_ms=binance_age_ms,
+                regime=regime, pattern=pattern, confidence=confidence,
+            )
+
+        # Guard: no QUIET+NOISE trades
+        if not self._cfg.allow_quiet_noise_trades and regime == "QUIET" and pattern == "NOISE":
+            return self._make_decision(
+                ts=ts, window_ts=window_ts, lane="selective_taker",
+                action="NO_TRADE", chosen_side=None, reason="quiet_noise_rejected",
+                price_snap=price_snap, market_snap=market_snap,
+                window_open=window_open, fair_result=fair_result,
+                yes_edge=yes_edge, no_edge=no_edge,
+                bankroll_state=bankroll_state, binance_age_ms=binance_age_ms,
+                regime=regime, pattern=pattern, confidence=confidence,
+            )
+
+        # Guard: neutral probability band — require extra evidence near p=0.50
+        fair_yes = fair_result.fair_yes_prob
+        if self._cfg.neutral_prob_band_low <= fair_yes <= self._cfg.neutral_prob_band_high:
+            if abs(fair_result.delta_pct) < self._cfg.neutral_band_min_delta:
+                return self._make_decision(
+                    ts=ts, window_ts=window_ts, lane="selective_taker",
+                    action="NO_TRADE", chosen_side=None,
+                    reason=f"neutral_band:delta_too_small({abs(fair_result.delta_pct):.5f})",
+                    price_snap=price_snap, market_snap=market_snap,
+                    window_open=window_open, fair_result=fair_result,
+                    yes_edge=yes_edge, no_edge=no_edge,
+                    bankroll_state=bankroll_state, binance_age_ms=binance_age_ms,
+                    regime=regime, pattern=pattern, confidence=confidence,
+                )
+            if confidence < self._cfg.neutral_band_min_confidence:
+                return self._make_decision(
+                    ts=ts, window_ts=window_ts, lane="selective_taker",
+                    action="NO_TRADE", chosen_side=None,
+                    reason=f"neutral_band:low_confidence({confidence:.2f})",
+                    price_snap=price_snap, market_snap=market_snap,
+                    window_open=window_open, fair_result=fair_result,
+                    yes_edge=yes_edge, no_edge=no_edge,
+                    bankroll_state=bankroll_state, binance_age_ms=binance_age_ms,
+                    regime=regime, pattern=pattern, confidence=confidence,
+                )
+
+        # Guard: minimum confidence
+        if confidence < self._cfg.min_confidence_for_taker:
+            return self._make_decision(
+                ts=ts, window_ts=window_ts, lane="selective_taker",
+                action="NO_TRADE", chosen_side=None,
+                reason=f"low_confidence({confidence:.2f})",
+                price_snap=price_snap, market_snap=market_snap,
+                window_open=window_open, fair_result=fair_result,
+                yes_edge=yes_edge, no_edge=no_edge,
+                bankroll_state=bankroll_state, binance_age_ms=binance_age_ms,
+                regime=regime, pattern=pattern, confidence=confidence,
             )
 
         # Stake sizing
@@ -220,7 +339,7 @@ class SignalEngine:
                 window_open=window_open, fair_result=fair_result,
                 yes_edge=yes_edge, no_edge=no_edge,
                 bankroll_state=bankroll_state, binance_age_ms=binance_age_ms,
-                regime=regime, pattern=pattern,
+                regime=regime, pattern=pattern, confidence=confidence,
             )
 
         return self._make_decision(
@@ -230,7 +349,7 @@ class SignalEngine:
             window_open=window_open, fair_result=fair_result,
             yes_edge=yes_edge, no_edge=no_edge,
             bankroll_state=bankroll_state, binance_age_ms=binance_age_ms,
-            regime=regime, pattern=pattern,
+            regime=regime, pattern=pattern, confidence=confidence,
         )
 
     def evaluate_shadow(
@@ -304,6 +423,14 @@ class SignalEngine:
             self._cfg.fade_abs_delta, self._cfg.fade_vol_ratio_max,
         )
 
+        shadow_confidence = _compute_confidence(
+            fair_yes_prob=fair_result.fair_yes_prob,
+            implied_yes_prob=market_snap.implied_yes_prob,
+            delta_pct=fair_result.delta_pct,
+            regime=regime,
+            pattern=pattern,
+            min_edge=self._edge._min_edge,
+        )
         return self._make_decision(
             ts=ts, window_ts=window_ts, lane="maker_shadow",
             action="SHADOW_QUOTE", chosen_side=chosen_side, reason="shadow_edge_identified",
@@ -311,7 +438,7 @@ class SignalEngine:
             window_open=window_open, fair_result=fair_result,
             yes_edge=yes_edge, no_edge=no_edge,
             bankroll_state=bankroll_state, binance_age_ms=binance_age_ms,
-            regime=regime, pattern=pattern,
+            regime=regime, pattern=pattern, confidence=shadow_confidence,
         )
 
     # ------------------------------------------------------------------ #
@@ -322,11 +449,14 @@ class SignalEngine:
         self, ts, window_ts, price_snap, market_snap, window_open,
         bankroll_state, binance_age_ms, reason,
     ) -> SignalDecision:
+        ste = market_snap.seconds_to_expiry
+        elapsed = max(0.0, self._cfg.window_sec - ste)
         return SignalDecision(
             ts=ts, window_ts=window_ts,
             lane="selective_taker", action="NO_TRADE",
             chosen_side=None, reason=reason,
-            seconds_to_expiry=market_snap.seconds_to_expiry,
+            seconds_to_expiry=ste,
+            elapsed_from_window_start=elapsed,
             btc_mid=price_snap.btc_mid,
             window_open=window_open,
             bankroll=bankroll_state.bankroll,
@@ -344,8 +474,16 @@ class SignalEngine:
         self, ts, window_ts, lane, action, chosen_side, reason,
         price_snap, market_snap, window_open, fair_result,
         yes_edge, no_edge, bankroll_state, binance_age_ms,
-        regime, pattern,
+        regime, pattern, confidence: float = 0.0,
     ) -> SignalDecision:
+        ste = market_snap.seconds_to_expiry
+        elapsed = max(0.0, self._cfg.window_sec - ste)
+        # Compute fee fields for logging
+        fee_est = None
+        if fair_result.fair_yes_prob > 0:
+            from fee_engine import FeeEngine  # avoid circular at module level
+            # Use the engine attached to edge_engine
+            fee_est = self._edge._fee.taker_estimate(fair_result.fair_yes_prob)
         return SignalDecision(
             ts=ts,
             window_ts=window_ts,
@@ -353,7 +491,8 @@ class SignalEngine:
             action=action,
             chosen_side=chosen_side,
             reason=reason,
-            seconds_to_expiry=market_snap.seconds_to_expiry,
+            seconds_to_expiry=ste,
+            elapsed_from_window_start=elapsed,
             btc_mid=price_snap.btc_mid,
             window_open=window_open,
             delta_pct=fair_result.delta_pct,
@@ -364,6 +503,9 @@ class SignalEngine:
             raw_edge_no=no_edge.raw_edge,
             after_fee_edge_yes=yes_edge.after_fee_edge,
             after_fee_edge_no=no_edge.after_fee_edge,
+            fee_per_share=round(fee_est.fee_per_share, 8) if fee_est else 0.0,
+            effective_rate=round(fee_est.effective_rate, 6) if fee_est else 0.0,
+            confidence_score=round(confidence, 4),
             bankroll=bankroll_state.bankroll,
             data_age_ms=binance_age_ms,
             regime=regime,

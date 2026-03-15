@@ -258,12 +258,87 @@ class Settings:
     def fade_vol_ratio_max(self) -> float:
         return self._sig("fade_vol_ratio_max", 1.5)
 
+    # Taker conviction guards
+    @property
+    def min_abs_delta_for_taker(self) -> float:
+        return self._sig("min_abs_delta_for_taker", 0.0005)
+
+    @property
+    def min_confidence_for_taker(self) -> float:
+        return self._sig("min_confidence_for_taker", 0.20)
+
+    @property
+    def allow_quiet_noise_trades(self) -> bool:
+        return bool(self._raw.get("signal", {}).get("allow_quiet_noise_trades", False))
+
+    @property
+    def neutral_prob_band_low(self) -> float:
+        return self._sig("neutral_prob_band_low", 0.47)
+
+    @property
+    def neutral_prob_band_high(self) -> float:
+        return self._sig("neutral_prob_band_high", 0.53)
+
+    @property
+    def neutral_band_min_delta(self) -> float:
+        return self._sig("neutral_band_min_delta", 0.001)
+
+    @property
+    def neutral_band_min_confidence(self) -> float:
+        return self._sig("neutral_band_min_confidence", 0.30)
+
+    # Adaptive Polymarket refresh cadence
+    @property
+    def refresh_active_sec(self) -> float:
+        return float(self._raw["market"].get("refresh_active_sec", 2.0))
+
+    @property
+    def refresh_inactive_sec(self) -> float:
+        return float(self._raw["market"].get("refresh_inactive_sec", 15.0))
+
+    # UI
+    def _ui(self, key: str, default):
+        return self._raw.get("ui", {}).get(key, default)
+
+    @property
+    def ui_enabled(self) -> bool:
+        return bool(self._ui("enabled", False))
+
+    @property
+    def ui_refresh_sec(self) -> float:
+        return float(self._ui("refresh_sec", 1.0))
+
+    @property
+    def ui_show_log_lines(self) -> int:
+        return int(self._ui("show_log_lines", 20))
+
+    @property
+    def ui_theme(self) -> str:
+        return str(self._ui("theme", "sniper_red"))
+
+    @property
+    def ui_compact_mode(self) -> bool:
+        return bool(self._ui("compact_mode", False))
+
+    @property
+    def session_subdirs(self) -> bool:
+        return bool(self._raw["logging"].get("session_subdirs", False))
+
     @property
     def log_dir(self) -> Path:
         d = Path(self._raw["logging"]["directory"])
         if not d.is_absolute():
             d = self._path.parent / d
         return d
+
+    def log_dir_for_session(self, session_ts: float) -> Path:
+        """Return per-session log directory if session_subdirs is enabled."""
+        import datetime
+        base = self.log_dir
+        if self.session_subdirs:
+            ts_str = datetime.datetime.utcfromtimestamp(session_ts).strftime("%Y%m%d_%H%M%S")
+            return base / ts_str
+        return base
 
     @property
     def jsonl_enabled(self) -> bool:

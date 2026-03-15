@@ -42,8 +42,7 @@ from state_store import StateStore
 
 log = logging.getLogger(__name__)
 
-_LOOP_INTERVAL = 5.0       # seconds between main loop iterations
-_MARKET_REFRESH = 15.0     # seconds between Polymarket market data refreshes
+_LOOP_INTERVAL = 2.0          # seconds between main loop iterations
 _METRICS_LOG_INTERVAL = 60.0  # seconds between metrics summaries
 
 
@@ -79,10 +78,15 @@ class PolybotV2:
     def __init__(self, config_path: Optional[str] = None) -> None:
         self._cfg = Settings(config_path)
 
-        # Logging
+        # Session timestamp for log rotation
+        self._session_ts = time.time()
+
+        # Logging — per-session subdirectory keeps runs separated
+        session_log_dir = self._cfg.log_dir_for_session(self._session_ts)
+        session_log_dir.mkdir(parents=True, exist_ok=True)
         setup_console_logger(self._cfg.log_level)
         self._structured = StructuredLogger(
-            self._cfg.log_dir,
+            session_log_dir,
             enabled=self._cfg.jsonl_enabled,
         )
 
@@ -155,6 +159,20 @@ class PolybotV2:
         self._shadow_probe = MakerShadowProbe(self._cfg)
         self._metrics = MetricsCollector()
 
+        # UI dashboard (optional)
+        self._ui = None
+        self._ui_state = None
+        if self._cfg.ui_enabled:
+            try:
+                from ui_dashboard import UIDashboard
+                from ui_state import UIState
+                self._ui_state = UIState()
+                self._ui = UIDashboard(self._cfg, self._ui_state)
+            except Exception as exc:
+                log.warning("UI dashboard unavailable: %s", exc)
+                self._ui = None
+                self._ui_state = None
+
         # Runtime state
         self._last_window_ts: float = self._store.last_window_ts
         self._last_market_refresh: float = 0.0
@@ -190,6 +208,14 @@ class PolybotV2:
             return
 
         log.info("Binance feed online")
+
+        # Start UI if configured
+        if self._ui is not None:
+            try:
+                self._ui.start()
+            except Exception as exc:
+                log.warning("UI start failed: %s — continuing without UI", exc)
+                self._ui = None
 
         try:
             while self._running:
@@ -229,8 +255,16 @@ class PolybotV2:
                 boundary_ts=current_window_start,  # = previous window_end
             )
 
-        # Refresh market data periodically (for metadata / token resolution only)
-        if now - self._last_market_refresh > _MARKET_REFRESH:
+        # Adaptive Polymarket refresh: fast during active window, slow outside
+        elapsed_in_window = now - current_window_start
+        in_active = (
+            (self._cfg.entry_start_sec <= elapsed_in_window <= self._cfg.entry_end_sec)
+            or (self._cfg.shadow_start_sec <= elapsed_in_window <= self._cfg.shadow_end_sec)
+        )
+        refresh_interval = (
+            self._cfg.refresh_active_sec if in_active else self._cfg.refresh_inactive_sec
+        )
+        if now - self._last_market_refresh >= refresh_interval:
             self._refresh_market(now)
 
         if self._current_market is None:
@@ -257,8 +291,8 @@ class PolybotV2:
                 btc_mid, current_window_start,
             )
 
-        # Implied price sanity check
-        self._check_spread_sanity(market)
+        # Implied price sanity check — hard reject if spread or skew too wide
+        sanity_reject = self._sanity_check_market(market)
 
         price_snap = PriceSnapshot(
             btc_mid=btc_mid,
@@ -266,16 +300,31 @@ class PolybotV2:
             realized_vol_60s=realized_vol,
         )
 
-        # Lane 1: Selective Taker
-        taker_decision = self._signal_engine.evaluate_taker(
-            price_snap=price_snap,
-            market_snap=market,
-            window_open=self._window_open_price,
-            bankroll_state=self._bankroll,
-            risk_state=self._risk_state,
-            binance_age_ms=binance_age_ms,
-            polymarket_age_ms=polymarket_age_ms,
-        )
+        # Lane 1: Selective Taker — hard sanity gate first
+        if sanity_reject:
+            # Synthetic NO_TRADE with spread/skew reject reason
+            from models import SignalDecision as _SD
+            taker_decision = _SD(
+                ts=now, window_ts=current_window_end,
+                lane="selective_taker", action="NO_TRADE",
+                chosen_side=None, reason=sanity_reject,
+                seconds_to_expiry=market.seconds_to_expiry,
+                elapsed_from_window_start=elapsed_in_window,
+                btc_mid=btc_mid,
+                window_open=self._window_open_price or 0.0,
+                bankroll=self._bankroll.bankroll,
+                data_age_ms=binance_age_ms,
+            )
+        else:
+            taker_decision = self._signal_engine.evaluate_taker(
+                price_snap=price_snap,
+                market_snap=market,
+                window_open=self._window_open_price,
+                bankroll_state=self._bankroll,
+                risk_state=self._risk_state,
+                binance_age_ms=binance_age_ms,
+                polymarket_age_ms=polymarket_age_ms,
+            )
         self._metrics.on_signal(taker_decision)
         self._log_signal(taker_decision)
 
@@ -314,7 +363,24 @@ class PolybotV2:
             # Advance TTL-based fill simulation for all pending shadow quotes
             completed = self._shadow_probe.process_pending(market)
             for sq in completed:
+                self._metrics.on_shadow_state_change(sq)
                 self._log_shadow_quote(sq)
+
+        # Update UI state snapshot
+        if self._ui is not None and self._ui_state is not None:
+            try:
+                self._update_ui_state(
+                    now=now,
+                    btc_mid=btc_mid,
+                    market=market,
+                    current_window_start=current_window_start,
+                    current_window_end=current_window_end,
+                    elapsed=elapsed_in_window,
+                    taker_decision=taker_decision,
+                    binance_age_ms=binance_age_ms,
+                )
+            except Exception as exc:
+                log.debug("UI state update failed: %s", exc)
 
         # Periodic metrics log
         if now - self._last_metrics_log > _METRICS_LOG_INTERVAL:
@@ -322,24 +388,36 @@ class PolybotV2:
             log.info("METRICS: %s", snap)
             self._last_metrics_log = now
 
-    def _check_spread_sanity(self, market: MarketSnapshot) -> None:
-        """Log warnings for wide spreads or yes/no complement skew."""
+    def _sanity_check_market(self, market: MarketSnapshot) -> Optional[str]:
+        """
+        Hard sanity gate for market data quality.
+        Returns a reject reason string if market should be skipped, else None.
+        Wide spread and YES/NO complement skew both produce hard rejects
+        (not just warnings) — trading on unreliable pricing is worse than missing a trade.
+        """
         spread_yes = market.best_ask_yes - market.best_bid_yes
         if spread_yes > self._cfg.max_spread_warn:
+            reason = f"wide_spread_reject(spread={spread_yes:.4f})"
             log.warning(
-                "Wide YES spread: bid=%.4f ask=%.4f spread=%.4f",
-                market.best_bid_yes, market.best_ask_yes, spread_yes,
+                "Market sanity REJECT: %s bid=%.4f ask=%.4f",
+                reason, market.best_bid_yes, market.best_ask_yes,
             )
+            return reason
+
         yes_mid = market.implied_yes_prob
         no_mid = (market.best_bid_no + market.best_ask_no) / 2.0 if (
             market.best_bid_no > 0 and market.best_ask_no > 0
         ) else 0.5
         skew = abs(yes_mid + no_mid - 1.0)
         if skew > self._cfg.max_complement_skew:
+            reason = f"complement_skew_reject(skew={skew:.4f})"
             log.warning(
-                "YES/NO complement skew: yes_mid=%.4f no_mid=%.4f skew=%.4f",
-                yes_mid, no_mid, skew,
+                "Market sanity REJECT: %s yes_mid=%.4f no_mid=%.4f",
+                reason, yes_mid, no_mid,
             )
+            return reason
+
+        return None
 
     def _refresh_market(self, now: float) -> None:
         market_info = self._discovery.get_current_market()
@@ -446,40 +524,76 @@ class PolybotV2:
     # ------------------------------------------------------------------ #
 
     def _log_signal(self, d) -> None:
-        # Compute fee estimate for the chosen side (for logging only)
-        fee_per_share = None
-        effective_rate = None
-        if d.fair_yes_prob > 0:
-            ref_p = d.fair_yes_prob  # use fair prob as reference price
-            fee_est = self._fee_engine.taker_estimate(ref_p)
-            fee_per_share = round(fee_est.fee_per_share, 8)
-            effective_rate = round(fee_est.effective_rate, 6)
-
+        """Write signal decision to JSONL with unified schema (no legacy mixing)."""
         self._structured.log("signals", {
+            # Identity
             "ts": d.ts,
             "window_ts": d.window_ts,
             "lane": d.lane,
-            "seconds_to_expiry": d.seconds_to_expiry,
+            # Window position
+            "elapsed_from_window_start": round(d.elapsed_from_window_start, 1),
+            "seconds_to_expiry": round(d.seconds_to_expiry, 1),
+            # BTC price
             "btc_mid": d.btc_mid,
             "window_open": d.window_open,
-            "delta_pct": d.delta_pct,
-            "realized_vol_60s": d.realized_vol_60s,
-            "fair_yes_prob": d.fair_yes_prob,
-            "implied_yes_prob": d.implied_yes_prob,
-            "raw_edge_yes": d.raw_edge_yes,
-            "raw_edge_no": d.raw_edge_no,
-            "after_fee_edge_yes": d.after_fee_edge_yes,
-            "after_fee_edge_no": d.after_fee_edge_no,
-            "fee_per_share": fee_per_share,
-            "effective_rate": effective_rate,
+            "delta_pct": round(d.delta_pct, 6),
+            "realized_vol_60s": round(d.realized_vol_60s, 8),
+            # Fair vs implied
+            "fair_yes_prob": round(d.fair_yes_prob, 4),
+            "implied_yes_prob": round(d.implied_yes_prob, 4),
+            # Edge
+            "raw_edge_yes": round(d.raw_edge_yes, 5),
+            "raw_edge_no": round(d.raw_edge_no, 5),
+            "after_fee_edge_yes": round(d.after_fee_edge_yes, 5),
+            "after_fee_edge_no": round(d.after_fee_edge_no, 5),
+            # Fee (pre-computed in SignalDecision)
+            "fee_per_share": d.fee_per_share,
+            "effective_rate": d.effective_rate,
+            # Signal quality
+            "confidence_score": d.confidence_score,
+            "regime": d.regime,
+            "pattern": d.pattern,
+            # Decision
             "action": d.action,
             "chosen_side": d.chosen_side,
             "reason": d.reason,
-            "bankroll": d.bankroll,
-            "data_age_ms": d.data_age_ms,
-            "regime": d.regime,
-            "pattern": d.pattern,
+            # Context
+            "bankroll": round(d.bankroll, 4),
+            "data_age_ms": round(d.data_age_ms, 1),
         })
+
+    def _update_ui_state(
+        self, now, btc_mid, market, current_window_start,
+        current_window_end, elapsed, taker_decision, binance_age_ms,
+    ) -> None:
+        """Push a snapshot to the UI state object for rendering."""
+        state = self._ui_state
+        state.update(
+            ts=now,
+            mode=self._cfg.mode,
+            btc_mid=btc_mid,
+            window_start=current_window_start,
+            window_end=current_window_end,
+            elapsed_from_window_start=elapsed,
+            bankroll=self._bankroll.bankroll,
+            paper_pnl=self._bankroll.total_pnl,
+            peak_bankroll=self._bankroll.peak_bankroll,
+            drawdown=self._bankroll.drawdown,
+            best_bid_yes=market.best_bid_yes,
+            best_ask_yes=market.best_ask_yes,
+            best_bid_no=market.best_bid_no,
+            best_ask_no=market.best_ask_no,
+            implied_yes_prob=market.implied_yes_prob,
+            window_open_price=self._window_open_price or 0.0,
+            last_decision=taker_decision,
+            metrics=self._metrics.snapshot(),
+            open_trades=list(self._paper_exec.get_open_trades().values()),
+            win_count=self._metrics._data.taker_win_count,
+            loss_count=self._metrics._data.taker_loss_count,
+            binance_age_ms=binance_age_ms,
+            cooldown_remaining=self._risk_state.cooldown_windows_remaining,
+            consecutive_losses=self._risk_state.consecutive_losses,
+        )
 
     def _log_paper_trade(self, trade, event: str) -> None:
         from dataclasses import asdict
@@ -498,6 +612,11 @@ class PolybotV2:
 
     def _shutdown(self) -> None:
         log.info("Shutting down…")
+        if self._ui is not None:
+            try:
+                self._ui.stop()
+            except Exception:
+                pass
         self._binance.stop()
         snap = self._metrics.snapshot()
         log.info("Final metrics: %s", snap)
