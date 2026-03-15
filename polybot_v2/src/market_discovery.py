@@ -78,8 +78,38 @@ class MarketDiscovery:
     # Internal
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _generate_slug(window_start_ts: float) -> str:
+        """
+        Deterministic slug for the BTC 5-minute market starting at window_start_ts.
+        Format: btc-updown-5m-<unix_ts_of_window_start>
+        """
+        return f"btc-updown-5m-{int(window_start_ts)}"
+
     def _discover(self, now: float) -> Optional[ActiveMarket]:
-        # Search terms that Polymarket uses for BTC 5m markets
+        """
+        Three-phase discovery with deterministic slug as primary path.
+
+        Phase 1 (slug_primary):   fetch market by deterministic slug
+        Phase 2 (text_fallback):  text search on known Polymarket query strings
+        Phase 3 (tag_fallback):   tag-based search filtered for BTC 5m keywords
+        """
+        # Compute current window start for slug generation
+        window_start_ts = math.floor(now / self._window_sec) * self._window_sec
+        slug = self._generate_slug(window_start_ts)
+
+        # --- Phase 1: slug-primary ---
+        try:
+            raw = self._client.get_market_by_slug(slug)
+            if raw:
+                market = self._parse_candidate(raw, now)
+                if market:
+                    log.info("MarketDiscovery path=slug_primary slug=%s", slug)
+                    return market
+        except Exception as exc:
+            log.debug("Slug lookup failed (%s): %s", slug, exc)
+
+        # --- Phase 2: text search fallback ---
         search_terms = [
             "Will Bitcoin be higher in 5 minutes",
             "Bitcoin 5-minute",
@@ -95,16 +125,21 @@ class MarketDiscovery:
         for raw in candidates:
             market = self._parse_candidate(raw, now)
             if market:
+                log.info("MarketDiscovery path=text_fallback slug=%s", market.slug)
                 return market
 
-        # fallback: try tag-based search
+        # --- Phase 3: tag-based fallback ---
         tag_results = self._client.get_markets(tag="bitcoin", limit=30)
         for raw in tag_results:
             if self._is_btc_5m(raw):
                 market = self._parse_candidate(raw, now)
                 if market:
+                    log.info("MarketDiscovery path=tag_fallback slug=%s", market.slug)
                     return market
 
+        log.warning(
+            "MarketDiscovery: no market found via any path (slug=%s)", slug
+        )
         return None
 
     def _is_btc_5m(self, raw: dict) -> bool:

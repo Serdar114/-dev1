@@ -42,14 +42,17 @@ def _classify_regime(
     extreme_lower: float,
     sigma_eff: float,
     sigma_floor: float,
+    trending_abs_delta: float,
+    quiet_abs_delta: float,
+    high_vol_sigma_multiple: float,
 ) -> str:
     if fair_yes >= extreme_upper or fair_yes <= extreme_lower:
         return "EXTREME_ZONE"
     abs_delta = abs(delta_pct)
-    high_vol = sigma_eff > sigma_floor * 3
-    if abs_delta > 0.003 and high_vol:
+    high_vol = sigma_eff > sigma_floor * high_vol_sigma_multiple
+    if abs_delta > trending_abs_delta and high_vol:
         return "TRENDING"
-    if abs_delta < 0.0005 and not high_vol:
+    if abs_delta < quiet_abs_delta and not high_vol:
         return "QUIET"
     return "CHOP"
 
@@ -58,14 +61,20 @@ def _classify_pattern(
     delta_pct: float,
     realized_vol_60s: float,
     sigma_floor: float,
+    sustained_move_abs_delta: float,
+    sustained_move_vol_ratio: float,
+    burst_abs_delta: float,
+    burst_vol_ratio: float,
+    fade_abs_delta: float,
+    fade_vol_ratio_max: float,
 ) -> str:
     abs_delta = abs(delta_pct)
     vol_ratio = realized_vol_60s / sigma_floor if sigma_floor > 0 else 1.0
-    if abs_delta > 0.004 and vol_ratio > 2.0:
+    if abs_delta > sustained_move_abs_delta and vol_ratio > sustained_move_vol_ratio:
         return "SUSTAINED_MOVE"
-    if abs_delta > 0.002 and vol_ratio > 4.0:
+    if abs_delta > burst_abs_delta and vol_ratio > burst_vol_ratio:
         return "BURST"
-    if abs_delta > 0.002 and vol_ratio < 1.5:
+    if abs_delta > fade_abs_delta and vol_ratio < fade_vol_ratio_max:
         return "FADE"
     return "NOISE"
 
@@ -150,14 +159,19 @@ class SignalEngine:
                 bankroll_state, binance_age_ms, f"fair_prob_error({exc})"
             )
 
-        # Classify regime and pattern
+        # Classify regime and pattern using config-driven thresholds
         regime = _classify_regime(
             fair_result.delta_pct, fair_result.fair_yes_prob,
             self._cfg.extreme_upper, self._cfg.extreme_lower,
             fair_result.sigma_eff, self._cfg.sigma_floor,
+            self._cfg.trending_abs_delta, self._cfg.quiet_abs_delta,
+            self._cfg.high_vol_sigma_multiple,
         )
         pattern = _classify_pattern(
-            fair_result.delta_pct, price_snap.realized_vol_60s, self._cfg.sigma_floor
+            fair_result.delta_pct, price_snap.realized_vol_60s, self._cfg.sigma_floor,
+            self._cfg.sustained_move_abs_delta, self._cfg.sustained_move_vol_ratio,
+            self._cfg.burst_abs_delta, self._cfg.burst_vol_ratio,
+            self._cfg.fade_abs_delta, self._cfg.fade_vol_ratio_max,
         )
 
         # Edge computation
@@ -280,9 +294,14 @@ class SignalEngine:
             fair_result.delta_pct, fair_result.fair_yes_prob,
             self._cfg.extreme_upper, self._cfg.extreme_lower,
             fair_result.sigma_eff, self._cfg.sigma_floor,
+            self._cfg.trending_abs_delta, self._cfg.quiet_abs_delta,
+            self._cfg.high_vol_sigma_multiple,
         )
         pattern = _classify_pattern(
-            fair_result.delta_pct, price_snap.realized_vol_60s, self._cfg.sigma_floor
+            fair_result.delta_pct, price_snap.realized_vol_60s, self._cfg.sigma_floor,
+            self._cfg.sustained_move_abs_delta, self._cfg.sustained_move_vol_ratio,
+            self._cfg.burst_abs_delta, self._cfg.burst_vol_ratio,
+            self._cfg.fade_abs_delta, self._cfg.fade_vol_ratio_max,
         )
 
         return self._make_decision(

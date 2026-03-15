@@ -123,8 +123,16 @@ class ShadowQuote:
     best_ask: float
     tick_size: float
     crossed: bool                # would this quote cross the book?
-    fill_would_happen: bool      # was best bid/ask at or better than quote?
-    adverse_move_after_fill: Optional[float] = None   # price move post-fill
+    fill_would_happen: bool      # was best bid/ask at or better than quote? (deprecated; use fill_status)
+    # Forward simulation result states:
+    #   pending           — quote is alive, waiting for fill or expiry
+    #   filled            — best_ask touched quote_price within TTL
+    #   expired           — TTL elapsed without a fill
+    #   crossed           — quote crossed the book at placement (would be taker)
+    #   adverse_fill      — filled and adverse move measured
+    fill_status: str = "pending"
+    fill_ts: Optional[float] = None              # unix ts when fill condition was met
+    adverse_move_after_fill: Optional[float] = None   # price move post-fill (negative = adverse for buyer)
 
 
 @dataclass

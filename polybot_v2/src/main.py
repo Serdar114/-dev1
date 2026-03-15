@@ -11,6 +11,7 @@ No real orders are placed.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import signal
 import sys
@@ -115,8 +116,9 @@ class PolybotV2:
         self._discovery = MarketDiscovery(self._poly_client, self._cfg.window_sec)
 
         self._fee_engine = FeeEngine(
-            taker_fee_rate=self._cfg.taker_fee_rate,
-            maker_rebate_rate=self._cfg.maker_rebate_rate,
+            fee_rate_base=self._cfg.fee_rate_base,
+            fee_exponent=self._cfg.fee_exponent,
+            maker_rebate_share=self._cfg.maker_rebate_share,
         )
         self._fair_engine = FairProbEngine(
             sigma_floor=self._cfg.sigma_floor,
@@ -140,6 +142,7 @@ class PolybotV2:
             max_notional_per_trade=self._bankroll.bankroll * self._cfg.max_risk_fraction,
             stale_binance_ms=self._cfg.stale_binance_ms,
             stale_polymarket_ms=self._cfg.stale_polymarket_ms,
+            max_open_paper_trades_per_window=self._cfg.max_open_paper_trades_per_window,
         )
         self._signal_engine = SignalEngine(
             settings=self._cfg,
@@ -200,7 +203,33 @@ class PolybotV2:
     def _tick(self) -> None:
         now = time.time()
 
-        # Refresh market data periodically
+        # ------------------------------------------------------------------ #
+        # Window boundary detection via LOCAL CLOCK (not market metadata).
+        # current_window_start = floor(now / window_sec) * window_sec
+        # current_window_end   = current_window_start + window_sec
+        # This ensures boundary detection is deterministic and independent of
+        # Polymarket market refresh timing.
+        # ------------------------------------------------------------------ #
+        window_sec = self._cfg.window_sec
+        current_window_start = math.floor(now / window_sec) * window_sec
+        current_window_end = current_window_start + window_sec
+
+        if self._last_window_ts == 0:
+            # First tick: initialise without triggering a resolve
+            self._last_window_ts = current_window_end
+            log.info(
+                "Window initialised: start=%.0f end=%.0f (in %.0fs)",
+                current_window_start, current_window_end,
+                current_window_end - now,
+            )
+        elif current_window_end != self._last_window_ts:
+            # Boundary crossed — resolve previous window at its exact close ts
+            self._on_new_window(
+                new_window_end=current_window_end,
+                boundary_ts=current_window_start,  # = previous window_end
+            )
+
+        # Refresh market data periodically (for metadata / token resolution only)
         if now - self._last_market_refresh > _MARKET_REFRESH:
             self._refresh_market(now)
 
@@ -208,10 +237,7 @@ class PolybotV2:
             log.debug("No active market, waiting…")
             return
 
-        # Window boundary detection
         market = self._current_market
-        if market.window_end_ts != self._last_window_ts:
-            self._on_new_window(market.window_end_ts)
 
         # Get Binance snapshot
         btc_mid, btc_ts, realized_vol = self._binance.get_snapshot()
@@ -222,11 +248,17 @@ class PolybotV2:
         binance_age_ms = (now - btc_ts) * 1000
         polymarket_age_ms = (now - market.fetched_at) * 1000
 
-        # Set / maintain window open price
+        # Set / maintain window open price — frozen at first tick of each window
         if self._window_open_price is None:
             self._window_open_price = btc_mid
             self._binance.set_window_open(btc_mid)
-            log.info("Window open price set: %.2f", btc_mid)
+            log.info(
+                "Window open snapshot: btc=%.2f window_start=%.0f",
+                btc_mid, current_window_start,
+            )
+
+        # Implied price sanity check
+        self._check_spread_sanity(market)
 
         price_snap = PriceSnapshot(
             btc_mid=btc_mid,
@@ -256,6 +288,7 @@ class PolybotV2:
             trade = self._paper_exec.open_trade(taker_decision, entry_price, self._bankroll)
             if trade:
                 self._risk_state.actions_this_window += 1
+                self._risk_state.open_paper_trades_this_window += 1
                 self._log_paper_trade(trade, "open")
 
         # Lane 2: Shadow Probe
@@ -278,16 +311,35 @@ class PolybotV2:
                     self._metrics.on_shadow_fill(shadow_quote)
                     self._log_shadow_quote(shadow_quote)
 
-            # Check adverse move from previous fill
-            adverse = self._shadow_probe.check_adverse_move(market)
-            if adverse:
-                self._log_shadow_quote(adverse)
+            # Advance TTL-based fill simulation for all pending shadow quotes
+            completed = self._shadow_probe.process_pending(market)
+            for sq in completed:
+                self._log_shadow_quote(sq)
 
         # Periodic metrics log
         if now - self._last_metrics_log > _METRICS_LOG_INTERVAL:
             snap = self._metrics.snapshot()
             log.info("METRICS: %s", snap)
             self._last_metrics_log = now
+
+    def _check_spread_sanity(self, market: MarketSnapshot) -> None:
+        """Log warnings for wide spreads or yes/no complement skew."""
+        spread_yes = market.best_ask_yes - market.best_bid_yes
+        if spread_yes > self._cfg.max_spread_warn:
+            log.warning(
+                "Wide YES spread: bid=%.4f ask=%.4f spread=%.4f",
+                market.best_bid_yes, market.best_ask_yes, spread_yes,
+            )
+        yes_mid = market.implied_yes_prob
+        no_mid = (market.best_bid_no + market.best_ask_no) / 2.0 if (
+            market.best_bid_no > 0 and market.best_ask_no > 0
+        ) else 0.5
+        skew = abs(yes_mid + no_mid - 1.0)
+        if skew > self._cfg.max_complement_skew:
+            log.warning(
+                "YES/NO complement skew: yes_mid=%.4f no_mid=%.4f skew=%.4f",
+                yes_mid, no_mid, skew,
+            )
 
     def _refresh_market(self, now: float) -> None:
         market_info = self._discovery.get_current_market()
@@ -306,17 +358,38 @@ class PolybotV2:
             )
         self._last_market_refresh = now
 
-    def _on_new_window(self, new_window_ts: float) -> None:
-        log.info("New window detected: %.0f → %.0f", self._last_window_ts, new_window_ts)
+    def _on_new_window(self, new_window_end: float, boundary_ts: float) -> None:
+        """
+        Called when the local clock crosses into a new 5-minute window.
 
-        # Resolve any open paper trades from previous window
-        if self._last_window_ts > 0 and self._paper_exec.get_open_trades():
-            # Determine outcome: YES wins if BTC ended above window open
-            btc_mid, _, _ = self._binance.get_snapshot()
-            if btc_mid is not None and self._window_open_price is not None:
-                outcome_yes = 1.0 if btc_mid > self._window_open_price else 0.0
+        boundary_ts: unix ts of the boundary (= previous window_end = new window_start).
+                     Used to look up the exact Binance snapshot for resolution.
+        new_window_end: end timestamp of the new (current) window.
+        """
+        log.info(
+            "Window boundary crossed: %.0f → %.0f (boundary_ts=%.0f)",
+            self._last_window_ts, new_window_end, boundary_ts,
+        )
+
+        # Resolve any open paper trades from previous window.
+        # Use Binance snapshot nearest to boundary_ts for accurate resolution.
+        if self._paper_exec.get_open_trades():
+            resolve_price, snapshot_ts = self._binance.get_snapshot_near(boundary_ts)
+            if resolve_price is not None and self._window_open_price is not None:
+                outcome_yes = 1.0 if resolve_price > self._window_open_price else 0.0
+                log.info(
+                    "Resolve: window_open=%.2f resolve_price=%.2f "
+                    "snapshot_ts=%.3f boundary_ts=%.3f outcome=%s",
+                    self._window_open_price, resolve_price,
+                    snapshot_ts, boundary_ts,
+                    "YES" if outcome_yes == 1.0 else "NO",
+                )
             else:
                 outcome_yes = 0.5  # fallback: neutral
+                log.warning(
+                    "Resolve fallback: no Binance snapshot near boundary_ts=%.3f",
+                    boundary_ts,
+                )
 
             resolved = self._paper_exec.resolve_all_pending(outcome_yes, self._bankroll)
             for trade in resolved:
@@ -327,10 +400,21 @@ class PolybotV2:
                     self._risk_mgr.on_loss(self._risk_state)
                 self._log_paper_trade(trade, "resolve")
 
+        # Freeze current Binance mid as the OPEN snapshot for the new window
+        btc_now, _, _ = self._binance.get_snapshot()
+        if btc_now is not None:
+            self._window_open_price = btc_now
+            self._binance.set_window_open(btc_now)
+            log.info(
+                "New window open snapshot frozen: btc=%.2f window_start=%.0f",
+                btc_now, boundary_ts,
+            )
+        else:
+            self._window_open_price = None
+
         # Reset per-window state
         self._risk_mgr.on_window_reset(self._risk_state)
         self._shadow_probe.reset()
-        self._window_open_price = None
         self._discovery.invalidate()
 
         # Persist state
@@ -341,15 +425,16 @@ class PolybotV2:
             "drawdown": self._bankroll.drawdown,
             "cooldown_windows_remaining": self._risk_state.cooldown_windows_remaining,
             "consecutive_losses": self._risk_state.consecutive_losses,
-            "last_window_ts": new_window_ts,
+            "last_window_ts": new_window_end,
         })
         self._store.save()
 
-        self._last_window_ts = new_window_ts
+        self._last_window_ts = new_window_end
 
         self._structured.log("bankroll", {
-            "event": "window_end",
-            "window_ts": new_window_ts,
+            "event": "window_boundary",
+            "boundary_ts": boundary_ts,
+            "new_window_end": new_window_end,
             "bankroll": self._bankroll.bankroll,
             "peak_bankroll": self._bankroll.peak_bankroll,
             "total_pnl": self._bankroll.total_pnl,
@@ -361,6 +446,15 @@ class PolybotV2:
     # ------------------------------------------------------------------ #
 
     def _log_signal(self, d) -> None:
+        # Compute fee estimate for the chosen side (for logging only)
+        fee_per_share = None
+        effective_rate = None
+        if d.fair_yes_prob > 0:
+            ref_p = d.fair_yes_prob  # use fair prob as reference price
+            fee_est = self._fee_engine.taker_estimate(ref_p)
+            fee_per_share = round(fee_est.fee_per_share, 8)
+            effective_rate = round(fee_est.effective_rate, 6)
+
         self._structured.log("signals", {
             "ts": d.ts,
             "window_ts": d.window_ts,
@@ -376,6 +470,8 @@ class PolybotV2:
             "raw_edge_no": d.raw_edge_no,
             "after_fee_edge_yes": d.after_fee_edge_yes,
             "after_fee_edge_no": d.after_fee_edge_no,
+            "fee_per_share": fee_per_share,
+            "effective_rate": effective_rate,
             "action": d.action,
             "chosen_side": d.chosen_side,
             "reason": d.reason,

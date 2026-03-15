@@ -18,6 +18,8 @@ class RiskState:
     shadow_quotes_this_window: int = 0
     consecutive_losses: int = 0
     cooldown_windows_remaining: int = 0
+    # Position policy: track open paper trades in the current window
+    open_paper_trades_this_window: int = 0
     # shadow: track how many theoretical fills we're "holding"
     shadow_notional_assumption: float = 0.0
     max_notional_per_trade: float = 5.0  # set from bankroll
@@ -39,6 +41,7 @@ class RiskManager:
         max_notional_per_trade: float,
         stale_binance_ms: int,
         stale_polymarket_ms: int,
+        max_open_paper_trades_per_window: int = 1,
     ) -> None:
         self._max_actions = max_actions_per_window
         self._max_consec_losses = max_consecutive_losses
@@ -47,6 +50,8 @@ class RiskManager:
         self._max_notional = max_notional_per_trade
         self._stale_binance_ms = stale_binance_ms
         self._stale_polymarket_ms = stale_polymarket_ms
+        # Position policy: enforce single open trade per window
+        self._max_open_trades = max_open_paper_trades_per_window
 
     def check_taker(
         self,
@@ -70,6 +75,13 @@ class RiskManager:
 
         if state.actions_this_window >= self._max_actions:
             return RiskDecision(False, f"max_actions({state.actions_this_window})")
+
+        # Position policy: only one open paper trade per window
+        if state.open_paper_trades_this_window >= self._max_open_trades:
+            return RiskDecision(
+                False,
+                f"position_policy:max_open_trades({state.open_paper_trades_this_window})",
+            )
 
         if proposed_notional > self._max_notional:
             return RiskDecision(False, f"notional_too_large({proposed_notional:.2f}>{self._max_notional:.2f})")
@@ -98,6 +110,7 @@ class RiskManager:
         """Call at the start of each new window to reset per-window counters."""
         state.actions_this_window = 0
         state.shadow_quotes_this_window = 0
+        state.open_paper_trades_this_window = 0
         state.shadow_notional_assumption = 0.0
         if state.cooldown_windows_remaining > 0:
             state.cooldown_windows_remaining -= 1

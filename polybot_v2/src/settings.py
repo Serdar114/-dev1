@@ -39,6 +39,7 @@ class Settings:
             "app", "market", "feeds", "fair_prob", "fees",
             "zones", "stake", "risk", "edge", "maker_shadow", "logging",
         ]
+        # signal section is optional (has defaults)
         for section in required_sections:
             if section not in self._raw:
                 raise ConfigError(f"Missing required config section: [{section}]")
@@ -125,12 +126,25 @@ class Settings:
         return float(self._raw["fair_prob"]["prob_clip_max"])
 
     @property
-    def taker_fee_rate(self) -> float:
-        return float(self._raw["fees"]["taker_fee_rate"])
+    def fee_rate_base(self) -> float:
+        return float(self._raw["fees"]["fee_rate_base"])
 
     @property
-    def maker_rebate_rate(self) -> float:
-        return float(self._raw["fees"].get("maker_rebate_rate", 0.0))
+    def fee_exponent(self) -> float:
+        return float(self._raw["fees"]["fee_exponent"])
+
+    @property
+    def maker_rebate_share(self) -> float:
+        return float(self._raw["fees"].get("maker_rebate_share", 0.0))
+
+    # Zones — spread sanity
+    @property
+    def max_spread_warn(self) -> float:
+        return float(self._raw["zones"].get("max_spread_warn", 0.05))
+
+    @property
+    def max_complement_skew(self) -> float:
+        return float(self._raw["zones"].get("max_complement_skew", 0.05))
 
     @property
     def taker_min_prob(self) -> float:
@@ -185,6 +199,10 @@ class Settings:
         return int(self._raw["risk"]["max_shadow_quotes_per_window"])
 
     @property
+    def max_open_paper_trades_per_window(self) -> int:
+        return int(self._raw["risk"].get("max_open_paper_trades_per_window", 1))
+
+    @property
     def min_after_fee_edge(self) -> float:
         return float(self._raw["edge"]["min_after_fee_edge"])
 
@@ -195,6 +213,50 @@ class Settings:
     @property
     def extreme_tick_size(self) -> float:
         return float(self._raw["maker_shadow"]["extreme_tick_size"])
+
+    @property
+    def quote_ttl_sec(self) -> float:
+        return float(self._raw["maker_shadow"].get("quote_ttl_sec", 20.0))
+
+    # Signal thresholds (regime/pattern classifiers)
+    def _sig(self, key: str, default: float) -> float:
+        return float(self._raw.get("signal", {}).get(key, default))
+
+    @property
+    def trending_abs_delta(self) -> float:
+        return self._sig("trending_abs_delta", 0.003)
+
+    @property
+    def quiet_abs_delta(self) -> float:
+        return self._sig("quiet_abs_delta", 0.0005)
+
+    @property
+    def high_vol_sigma_multiple(self) -> float:
+        return self._sig("high_vol_sigma_multiple", 3.0)
+
+    @property
+    def sustained_move_abs_delta(self) -> float:
+        return self._sig("sustained_move_abs_delta", 0.004)
+
+    @property
+    def sustained_move_vol_ratio(self) -> float:
+        return self._sig("sustained_move_vol_ratio", 2.0)
+
+    @property
+    def burst_abs_delta(self) -> float:
+        return self._sig("burst_abs_delta", 0.002)
+
+    @property
+    def burst_vol_ratio(self) -> float:
+        return self._sig("burst_vol_ratio", 4.0)
+
+    @property
+    def fade_abs_delta(self) -> float:
+        return self._sig("fade_abs_delta", 0.002)
+
+    @property
+    def fade_vol_ratio_max(self) -> float:
+        return self._sig("fade_vol_ratio_max", 1.5)
 
     @property
     def log_dir(self) -> Path:

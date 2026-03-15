@@ -5,13 +5,23 @@ NO real orders. NO real placement.
 
 This module:
   1. Computes a theoretical post-only quote price
-  2. Checks if that quote would cross the best bid/ask
-  3. Checks if a theoretical fill would have happened
-  4. Logs adverse move after fill (using next price snapshot)
+  2. Checks if that quote would cross the best bid/ask (crossed)
+  3. Keeps pending quotes alive with a TTL
+  4. On each subsequent snapshot, checks whether best_ask dropped to/below
+     the quote (forward simulation fill)
+  5. After a fill, measures adverse move on the next snapshot
+  6. Expired quotes are marked as expired if TTL elapsed without fill
+
+fill_status states:
+  pending     — alive, not yet filled or expired
+  filled      — best_ask touched quote_price within TTL
+  expired     — TTL elapsed without a fill
+  crossed     — quote crossed the book at placement (rejected as post-only)
+  adverse_fill — fill confirmed + adverse move measured
 
 Tick size:
   - default_tick_size from config
-  - extreme_tick_size used when implied_prob near extreme zones
+  - extreme_tick_size used when implied_prob is in extreme zone
 """
 
 from __future__ import annotations
@@ -19,6 +29,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from dataclasses import replace
 from typing import Optional
 
 from models import MarketSnapshot, ShadowQuote, SignalDecision
@@ -30,8 +41,10 @@ log = logging.getLogger(__name__)
 class MakerShadowProbe:
     def __init__(self, settings: Settings) -> None:
         self._cfg = settings
-        # pending: track last quote for adverse move check
-        self._pending: Optional[tuple[ShadowQuote, float]] = None  # (quote, entry_book_mid)
+        # Pending quotes awaiting fill check: (quote, entry_mid, expires_ts)
+        self._pending: list[tuple[ShadowQuote, float, float]] = []
+        # Filled quotes awaiting adverse-move measurement: (quote, entry_mid)
+        self._filled: list[tuple[ShadowQuote, float]] = []
 
     def build_quote(
         self,
@@ -41,6 +54,9 @@ class MakerShadowProbe:
         """
         Build a theoretical shadow quote from a SHADOW_QUOTE decision.
         Returns None if decision is not SHADOW_QUOTE.
+
+        The quote starts as 'pending'. Fill simulation is done on subsequent
+        snapshots via process_pending().
         """
         if decision.action != "SHADOW_QUOTE" or decision.chosen_side is None:
             return None
@@ -51,24 +67,22 @@ class MakerShadowProbe:
         if side == "yes":
             best_bid = market_snap.best_bid_yes
             best_ask = market_snap.best_ask_yes
-            # Post as maker on bid side: we want to buy below fair value
-            raw_quote = best_bid  # quote at best bid (passive)
         else:
             best_bid = market_snap.best_bid_no
             best_ask = market_snap.best_ask_no
-            raw_quote = best_bid
 
-        # Align to tick
-        quote_price = self._align_to_tick(raw_quote, tick_size)
+        # Post as maker on bid side: quote at best bid (passive)
+        quote_price = self._align_to_tick(best_bid, tick_size)
 
-        # Cross check: a post-only quote that crosses the opposite side is a taker
-        # For a BID quote: crossed if quote_price >= best_ask
-        crossed = quote_price >= best_ask
+        # Cross check: a post-only bid that is >= best_ask would take liquidity
+        is_crossed = quote_price >= best_ask
 
-        # Fill check: a bid quote fills if the best ask drops to/below our quote
-        # In a shadow (no real order), we check if current best_ask <= quote_price
-        fill_would_happen = (best_ask <= quote_price) and (quote_price > 0)
+        if is_crossed:
+            fill_status = "crossed"
+        else:
+            fill_status = "pending"
 
+        now = time.time()
         quote = ShadowQuote(
             ts=decision.ts,
             window_ts=decision.window_ts,
@@ -78,73 +92,136 @@ class MakerShadowProbe:
             best_bid=best_bid,
             best_ask=best_ask,
             tick_size=tick_size,
-            crossed=crossed,
-            fill_would_happen=fill_would_happen,
+            crossed=is_crossed,
+            fill_would_happen=False,   # legacy field; fill_status is authoritative
+            fill_status=fill_status,
+            fill_ts=None,
             adverse_move_after_fill=None,
         )
 
-        # Store for adverse move tracking
-        if fill_would_happen:
-            book_mid = (best_bid + best_ask) / 2.0 if best_bid > 0 and best_ask > 0 else 0.0
-            self._pending = (quote, book_mid)
-
-        log.debug(
-            "ShadowQuote: side=%s quote=%.4f bid=%.4f ask=%.4f cross=%s fill=%s",
-            side, quote_price, best_bid, best_ask, crossed, fill_would_happen,
-        )
+        if fill_status == "pending":
+            entry_mid = (best_bid + best_ask) / 2.0 if best_bid > 0 and best_ask > 0 else 0.0
+            expires_ts = now + self._cfg.quote_ttl_sec
+            self._pending.append((quote, entry_mid, expires_ts))
+            log.debug(
+                "ShadowQuote PENDING: side=%s quote=%.4f bid=%.4f ask=%.4f ttl=%.0fs",
+                side, quote_price, best_bid, best_ask, self._cfg.quote_ttl_sec,
+            )
+        else:
+            log.debug(
+                "ShadowQuote CROSSED: side=%s quote=%.4f bid=%.4f ask=%.4f",
+                side, quote_price, best_bid, best_ask,
+            )
 
         return quote
 
+    def process_pending(
+        self,
+        current_market: MarketSnapshot,
+    ) -> list[ShadowQuote]:
+        """
+        Advance the state machine for all pending and filled quotes.
+
+        Call once per main loop tick after each market snapshot.
+
+        Returns a list of ShadowQuotes that changed state this tick
+        (filled, expired, or adverse_fill measured).  Caller should log these.
+        """
+        now = time.time()
+        completed: list[ShadowQuote] = []
+
+        # --- Process pending quotes (check for fill or expiry) ---
+        still_pending: list[tuple[ShadowQuote, float, float]] = []
+        for quote, entry_mid, expires_ts in self._pending:
+            if quote.side == "yes":
+                current_ask = current_market.best_ask_yes
+                current_bid = current_market.best_bid_yes
+            else:
+                current_ask = current_market.best_ask_no
+                current_bid = current_market.best_bid_no
+
+            # Fill condition: best_ask dropped to/below our quote price
+            if current_ask <= quote.quote_price and quote.quote_price > 0:
+                fill_ts = now
+                filled_quote = replace(
+                    quote,
+                    fill_would_happen=True,
+                    fill_status="filled",
+                    fill_ts=fill_ts,
+                )
+                log.debug(
+                    "ShadowQuote FILLED: side=%s quote=%.4f current_ask=%.4f",
+                    quote.side, quote.quote_price, current_ask,
+                )
+                # Queue for adverse move measurement on next tick
+                current_mid = (
+                    (current_bid + current_ask) / 2.0
+                    if current_bid > 0 and current_ask > 0
+                    else entry_mid
+                )
+                self._filled.append((filled_quote, current_mid))
+                completed.append(filled_quote)
+            elif now >= expires_ts:
+                expired_quote = replace(quote, fill_status="expired")
+                log.debug(
+                    "ShadowQuote EXPIRED: side=%s quote=%.4f ttl_elapsed",
+                    quote.side, quote.quote_price,
+                )
+                completed.append(expired_quote)
+            else:
+                still_pending.append((quote, entry_mid, expires_ts))
+
+        self._pending = still_pending
+
+        # --- Process filled quotes (measure adverse move on next snapshot) ---
+        still_filled: list[tuple[ShadowQuote, float]] = []
+        for quote, fill_mid in self._filled:
+            if quote.side == "yes":
+                new_bid = current_market.best_bid_yes
+                new_ask = current_market.best_ask_yes
+            else:
+                new_bid = current_market.best_bid_no
+                new_ask = current_market.best_ask_no
+
+            new_mid = (new_bid + new_ask) / 2.0 if new_bid > 0 and new_ask > 0 else 0.0
+            if fill_mid > 0 and new_mid > 0:
+                # Adverse for a buyer: price fell after fill (new_mid < fill_mid)
+                adverse_move = new_mid - fill_mid
+            else:
+                adverse_move = 0.0
+
+            adverse_quote = replace(
+                quote,
+                fill_status="adverse_fill",
+                adverse_move_after_fill=adverse_move,
+            )
+            log.debug(
+                "ShadowQuote ADVERSE_FILL: side=%s fill_mid=%.4f new_mid=%.4f adverse=%.4f",
+                quote.side, fill_mid, new_mid, adverse_move,
+            )
+            completed.append(adverse_quote)
+            # Don't re-queue; adverse move measured once
+
+        self._filled = still_filled  # clear filled queue
+
+        return completed
+
+    # Legacy single-result wrapper — kept for callers that only handle one result
     def check_adverse_move(
         self,
         current_market: MarketSnapshot,
     ) -> Optional[ShadowQuote]:
         """
-        If we have a pending theoretical fill, compute adverse move
-        based on new book mid vs entry book mid.
-        Returns updated ShadowQuote if pending fill exists, else None.
+        Compatibility shim: calls process_pending and returns the first completed
+        quote, if any.  Callers should migrate to process_pending() for full results.
         """
-        if self._pending is None:
-            return None
-
-        quote, entry_mid = self._pending
-        side = quote.side
-
-        if side == "yes":
-            new_bid = current_market.best_bid_yes
-            new_ask = current_market.best_ask_yes
-        else:
-            new_bid = current_market.best_bid_no
-            new_ask = current_market.best_ask_no
-
-        new_mid = (new_bid + new_ask) / 2.0 if new_bid > 0 and new_ask > 0 else 0.0
-        if entry_mid > 0 and new_mid > 0:
-            # adverse move: price moved away from us (as a buyer, price dropped)
-            adverse_move = new_mid - entry_mid
-            # for a buyer, adverse = negative move (price fell after our fill)
-        else:
-            adverse_move = 0.0
-
-        updated = ShadowQuote(
-            ts=quote.ts,
-            window_ts=quote.window_ts,
-            seconds_to_expiry=quote.seconds_to_expiry,
-            side=quote.side,
-            quote_price=quote.quote_price,
-            best_bid=quote.best_bid,
-            best_ask=quote.best_ask,
-            tick_size=quote.tick_size,
-            crossed=quote.crossed,
-            fill_would_happen=quote.fill_would_happen,
-            adverse_move_after_fill=adverse_move,
-        )
-
-        self._pending = None
-        return updated
+        results = self.process_pending(current_market)
+        return results[0] if results else None
 
     def reset(self) -> None:
-        """Reset pending state at window boundary."""
-        self._pending = None
+        """Reset all pending state at window boundary."""
+        self._pending.clear()
+        self._filled.clear()
 
     # ------------------------------------------------------------------ #
     # Internal

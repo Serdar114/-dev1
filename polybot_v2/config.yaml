@@ -5,10 +5,14 @@ app:
 market:
   symbol: BTCUSDT
   window_sec: 300                 # 5-minute window
-  entry_start_sec: 30             # open taker entry from T+30s
-  entry_end_sec: 240              # close taker entry at T+240s
-  shadow_start_sec: 10            # shadow probe from T+10s
-  shadow_end_sec: 270             # shadow probe until T+270s
+  # entry_start_sec / entry_end_sec: seconds ELAPSED from window START (T+0).
+  # e.g. entry_start_sec=30 means entry opens 30s after window starts.
+  # These are NOT seconds_to_expiry — they measure forward from the open.
+  entry_start_sec: 30             # open taker entry from T+30s into window
+  entry_end_sec: 240              # close taker entry at T+240s (60s buffer before close)
+  # shadow_start_sec / shadow_end_sec: same convention (elapsed from window start).
+  shadow_start_sec: 10            # shadow probe from T+10s into window
+  shadow_end_sec: 270             # shadow probe until T+270s (30s buffer before close)
 
 feeds:
   stale_binance_ms: 3000          # max age for Binance mid-price
@@ -22,15 +26,37 @@ fair_prob:
   prob_clip_max: 0.99             # maximum output probability
 
 fees:
-  taker_fee_rate: 0.02            # 2% taker fee (Polymarket)
-  maker_rebate_rate: 0.0          # Phase 1: no maker rebate assumed
-  use_dynamic_zone_adjustment: false
+  # Polymarket crypto market fee curve:
+  #   fee_per_share = p * fee_rate_base * (p * (1 - p)) ^ fee_exponent
+  # Examples at fee_rate_base=0.25, fee_exponent=2:
+  #   p=0.50 -> 0.0078125 USDC/share
+  #   p=0.90 -> 0.0018225 USDC/share
+  #   p=0.10 -> 0.0002025 USDC/share
+  fee_rate_base: 0.25             # C in fee formula
+  fee_exponent: 2                 # n in (p*(1-p))^n
+  maker_rebate_share: 0.20        # informational only; Phase 1 shadow economic reference
 
 zones:
   taker_min_prob: 0.10            # ignore near-0 markets (taker)
   taker_max_prob: 0.90            # ignore near-1 markets (taker)
   extreme_upper: 0.85             # shadow: extreme zone threshold (YES)
   extreme_lower: 0.15             # shadow: extreme zone threshold (NO)
+  # Spread sanity
+  max_spread_warn: 0.05           # log warning if yes bid-ask spread exceeds this
+  max_complement_skew: 0.05       # log warning if |yes_mid + no_mid - 1| exceeds this
+
+signal:
+  # Regime thresholds
+  trending_abs_delta: 0.003       # min |delta_pct| to classify as TRENDING
+  quiet_abs_delta: 0.0005         # max |delta_pct| to classify as QUIET
+  high_vol_sigma_multiple: 3.0    # sigma multiple above floor to be "high vol"
+  # Pattern thresholds
+  sustained_move_abs_delta: 0.004
+  sustained_move_vol_ratio: 2.0
+  burst_abs_delta: 0.002
+  burst_vol_ratio: 4.0
+  fade_abs_delta: 0.002
+  fade_vol_ratio_max: 1.5
 
 stake:
   bankroll: 30.0                  # starting bankroll USDC
@@ -48,6 +74,7 @@ risk:
   max_consecutive_losses: 4
   cooldown_windows: 2
   max_shadow_quotes_per_window: 5
+  max_open_paper_trades_per_window: 1   # single open position policy per window
 
 edge:
   min_after_fee_edge: 0.03        # require at least 3% after-fee edge
@@ -56,6 +83,7 @@ maker_shadow:
   default_tick_size: 0.01
   extreme_tick_size: 0.005        # finer tick in extreme zones
   post_only: true
+  quote_ttl_sec: 20               # seconds before unmatched shadow quote expires
 
 logging:
   directory: logs

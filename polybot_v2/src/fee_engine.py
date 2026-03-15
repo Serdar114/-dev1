@@ -4,9 +4,13 @@ Fee engine for polybot_v2.
 Computes taker and maker fee/rebate for after-fee entry economics.
 This module only calculates — it never makes trade decisions.
 
-Fee model (Polymarket, Phase 1):
-  Taker: entry_price * taker_fee_rate on the notional bought
-  Maker: post-only; rebate applied on fill (Phase 1 rebate = 0 by default)
+Fee model (Polymarket crypto markets):
+  fee_per_share = p * fee_rate_base * (p * (1 - p)) ^ fee_exponent
+
+  With fee_rate_base=0.25, fee_exponent=2:
+    p=0.50 -> 0.0078125 USDC/share
+    p=0.90 -> 0.0018225 USDC/share
+    p=0.10 -> 0.0002025 USDC/share
 
 All values are per-unit (per share / per $1 notional).
 """
@@ -19,33 +23,42 @@ from dataclasses import dataclass
 @dataclass
 class TakerFeeEstimate:
     entry_price: float        # price paid per share (0-1 range)
-    taker_fee_rate: float     # e.g. 0.02 for 2%
     fee_per_share: float      # cost in USDC per share
     effective_cost: float     # entry_price + fee_per_share
+    effective_rate: float     # fee_per_share / entry_price (for logging)
     breakeven_price: float    # price at which trade is flat (incl. fee)
 
 
 @dataclass
 class MakerFeeEstimate:
     quote_price: float        # posted price
-    rebate_rate: float        # e.g. 0.0 in Phase 1
-    rebate_per_share: float   # credit in USDC per share on fill
+    maker_rebate_share: float # rebate fraction (informational in Phase 1)
+    rebate_per_share: float   # credit in USDC per share on fill (Phase 1 = 0)
     effective_proceeds: float # quote_price + rebate_per_share
 
 
 class FeeEngine:
     """
-    Stateless fee calculator.
-    All rates come from config at construction time.
+    Stateless fee calculator using the Polymarket crypto fee curve.
+
+    fee_per_share = p * fee_rate_base * (p * (1 - p)) ^ fee_exponent
     """
 
-    def __init__(self, taker_fee_rate: float, maker_rebate_rate: float) -> None:
-        if taker_fee_rate < 0 or taker_fee_rate >= 1:
-            raise ValueError(f"taker_fee_rate must be in [0, 1), got {taker_fee_rate}")
-        if maker_rebate_rate < 0:
-            raise ValueError(f"maker_rebate_rate must be >= 0, got {maker_rebate_rate}")
-        self.taker_fee_rate = taker_fee_rate
-        self.maker_rebate_rate = maker_rebate_rate
+    def __init__(
+        self,
+        fee_rate_base: float,
+        fee_exponent: float,
+        maker_rebate_share: float = 0.0,
+    ) -> None:
+        if fee_rate_base < 0:
+            raise ValueError(f"fee_rate_base must be >= 0, got {fee_rate_base}")
+        if fee_exponent < 0:
+            raise ValueError(f"fee_exponent must be >= 0, got {fee_exponent}")
+        if maker_rebate_share < 0:
+            raise ValueError(f"maker_rebate_share must be >= 0, got {maker_rebate_share}")
+        self.fee_rate_base = fee_rate_base
+        self.fee_exponent = fee_exponent
+        self.maker_rebate_share = maker_rebate_share
 
     # ------------------------------------------------------------------ #
     # Taker
@@ -55,23 +68,22 @@ class FeeEngine:
         """
         Estimate taker cost for buying 1 share at entry_price.
 
-        Polymarket charges taker_fee_rate * entry_price on the entry side.
-        Selling (when market resolves) is also subject to fee on the payout.
-        Here we model the round-trip cost as 2× one-side fee for conservatism,
-        since the payout is 1.0 (win) or 0.0 (loss).
+        fee_per_share = p * fee_rate_base * (p * (1 - p)) ^ fee_exponent
 
-        For Phase 1 we use single-side entry fee only (entry side),
-        because resolution payouts are net of no additional fee on Polymarket.
+        This is the fee-equivalent for Phase 1 paper trading.
+        No actual share deduction is modelled; but fee-equivalent must be correct
+        so that after-fee edge calculations reflect real Polymarket economics.
         """
-        fee_per_share = entry_price * self.taker_fee_rate
-        effective_cost = entry_price + fee_per_share
-        # breakeven: need price to reach effective_cost to be flat
+        p = entry_price
+        fee_per_share = p * self.fee_rate_base * (p * (1.0 - p)) ** self.fee_exponent
+        effective_cost = p + fee_per_share
+        effective_rate = fee_per_share / p if p > 0 else 0.0
         breakeven_price = effective_cost
         return TakerFeeEstimate(
-            entry_price=entry_price,
-            taker_fee_rate=self.taker_fee_rate,
+            entry_price=p,
             fee_per_share=fee_per_share,
             effective_cost=effective_cost,
+            effective_rate=effective_rate,
             breakeven_price=breakeven_price,
         )
 
@@ -82,7 +94,7 @@ class FeeEngine:
         PnL per share given outcome (1.0 = win, 0.0 = loss).
         outcome is the resolution value (YES=1, NO=0).
         """
-        fee = entry_price * self.taker_fee_rate
+        fee = self.taker_estimate(entry_price).fee_per_share
         return outcome - entry_price - fee
 
     # ------------------------------------------------------------------ #
@@ -92,12 +104,13 @@ class FeeEngine:
     def maker_estimate(self, quote_price: float) -> MakerFeeEstimate:
         """
         Estimate maker economics for a theoretical post-only quote.
-        Phase 1: rebate = 0, so effective_proceeds == quote_price.
+        Phase 1: rebate tracked as informational only (rebate_per_share = 0).
+        maker_rebate_share is stored for future reference.
         """
-        rebate_per_share = quote_price * self.maker_rebate_rate
+        rebate_per_share = 0.0  # Phase 1: no live rebate deduction
         return MakerFeeEstimate(
             quote_price=quote_price,
-            rebate_rate=self.maker_rebate_rate,
+            maker_rebate_share=self.maker_rebate_share,
             rebate_per_share=rebate_per_share,
             effective_proceeds=quote_price + rebate_per_share,
         )
@@ -108,9 +121,8 @@ class FeeEngine:
 
     def taker_edge_yes(self, fair_yes_prob: float, ask_yes: float) -> float:
         """
-        Raw after-fee expected value of buying YES at ask_yes.
-        EV = fair_yes_prob * 1.0 + (1 - fair_yes_prob) * 0.0 - effective_cost
-           = fair_yes_prob - (ask_yes + ask_yes * fee_rate)
+        After-fee expected value of buying YES at ask_yes.
+        EV = fair_yes_prob - effective_cost
         """
         est = self.taker_estimate(ask_yes)
         return fair_yes_prob - est.effective_cost

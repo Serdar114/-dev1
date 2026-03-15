@@ -25,10 +25,17 @@ _RECONNECT_DELAY_BASE = 2.0
 _MAX_RECONNECT_DELAY = 30.0
 
 
+_SNAPSHOT_BUFFER_SEC = 60.0   # keep 60s of timestamped snapshots for resolve lookups
+
+
 class BinanceFeed:
     """
     Subscribes to Binance BTCUSDT best bid/ask stream.
     Computes mid-price and tracks a 60-second price history for realized vol.
+
+    Also maintains a timestamped snapshot buffer so that window-boundary
+    resolution can use the Binance price closest to the boundary timestamp
+    rather than the instantaneous current price (which may arrive seconds late).
     """
 
     def __init__(self, stale_threshold_ms: int = 3000) -> None:
@@ -36,8 +43,11 @@ class BinanceFeed:
         self._lock = threading.Lock()
         self._mid: Optional[float] = None
         self._last_ts: float = 0.0
-        # (timestamp, mid) pairs for last 60s
+        # (timestamp, mid) pairs for last 60s — used for vol calculation
         self._history: deque[tuple[float, float]] = deque()
+        # Separate snapshot buffer for accurate window-boundary resolve lookups
+        # Stores (timestamp, mid) with _SNAPSHOT_BUFFER_SEC retention
+        self._snapshot_buffer: deque[tuple[float, float]] = deque()
         self._ws: Optional[websocket.WebSocketApp] = None
         self._thread: Optional[threading.Thread] = None
         self._running = False
@@ -67,6 +77,39 @@ class BinanceFeed:
         """
         with self._lock:
             return self._mid, self._last_ts, self._compute_vol_locked()
+
+    def get_snapshot_near(self, target_ts: float) -> tuple[Optional[float], float]:
+        """
+        Return (mid_price, snapshot_ts) from the snapshot buffer nearest to target_ts.
+
+        Prefers the last snapshot at or before target_ts (i.e. the most recent
+        price that was actually known at the boundary).  If all buffered snapshots
+        post-date target_ts (very unlikely: system just started), returns the
+        earliest available snapshot.
+
+        Returns (None, 0.0) if the buffer is empty.
+        """
+        with self._lock:
+            if not self._snapshot_buffer:
+                return None, 0.0
+
+            best_mid: Optional[float] = None
+            best_ts: float = 0.0
+
+            for ts, mid in self._snapshot_buffer:
+                if ts <= target_ts:
+                    # Keep updating: we want the LAST entry <= target_ts
+                    best_mid = mid
+                    best_ts = ts
+                else:
+                    # First entry that exceeds target_ts
+                    if best_mid is None:
+                        # All entries are after target_ts — use earliest
+                        best_mid = mid
+                        best_ts = ts
+                    break
+
+            return best_mid, best_ts
 
     def is_stale(self) -> bool:
         with self._lock:
@@ -132,6 +175,9 @@ class BinanceFeed:
                 self._last_ts = now
                 self._history.append((now, mid))
                 self._prune_history_locked(now)
+                # Also maintain snapshot buffer for boundary-resolve lookups
+                self._snapshot_buffer.append((now, mid))
+                self._prune_snapshot_buffer_locked(now)
         except (KeyError, ValueError, TypeError) as exc:
             log.debug("BinanceFeed parse error: %s | raw=%s", exc, raw[:80])
 
@@ -145,6 +191,11 @@ class BinanceFeed:
         cutoff = now - 60.0
         while self._history and self._history[0][0] < cutoff:
             self._history.popleft()
+
+    def _prune_snapshot_buffer_locked(self, now: float) -> None:
+        cutoff = now - _SNAPSHOT_BUFFER_SEC
+        while self._snapshot_buffer and self._snapshot_buffer[0][0] < cutoff:
+            self._snapshot_buffer.popleft()
 
     def _compute_vol_locked(self) -> float:
         """

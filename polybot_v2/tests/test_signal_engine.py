@@ -25,8 +25,9 @@ def make_settings() -> Settings:
 
 def make_components(cfg: Settings):
     fee_engine = FeeEngine(
-        taker_fee_rate=cfg.taker_fee_rate,
-        maker_rebate_rate=cfg.maker_rebate_rate,
+        fee_rate_base=cfg.fee_rate_base,
+        fee_exponent=cfg.fee_exponent,
+        maker_rebate_share=cfg.maker_rebate_share,
     )
     fair_engine = FairProbEngine(
         sigma_floor=cfg.sigma_floor,
@@ -91,34 +92,58 @@ def make_risk_state() -> RiskState:
 class TestRegimeClassification:
     def test_quiet(self):
         cfg = make_settings()
-        r = _classify_regime(0.0001, 0.5, cfg.extreme_upper, cfg.extreme_lower, cfg.sigma_floor, cfg.sigma_floor)
+        r = _classify_regime(
+            0.0001, 0.5, cfg.extreme_upper, cfg.extreme_lower,
+            cfg.sigma_floor, cfg.sigma_floor,
+            cfg.trending_abs_delta, cfg.quiet_abs_delta, cfg.high_vol_sigma_multiple,
+        )
         assert r == "QUIET"
 
     def test_extreme_upper(self):
         cfg = make_settings()
-        r = _classify_regime(0.01, 0.90, cfg.extreme_upper, cfg.extreme_lower, 0.003, cfg.sigma_floor)
+        r = _classify_regime(
+            0.01, 0.90, cfg.extreme_upper, cfg.extreme_lower, 0.003, cfg.sigma_floor,
+            cfg.trending_abs_delta, cfg.quiet_abs_delta, cfg.high_vol_sigma_multiple,
+        )
         assert r == "EXTREME_ZONE"
 
     def test_extreme_lower(self):
         cfg = make_settings()
-        r = _classify_regime(-0.01, 0.10, cfg.extreme_upper, cfg.extreme_lower, 0.003, cfg.sigma_floor)
+        r = _classify_regime(
+            -0.01, 0.10, cfg.extreme_upper, cfg.extreme_lower, 0.003, cfg.sigma_floor,
+            cfg.trending_abs_delta, cfg.quiet_abs_delta, cfg.high_vol_sigma_multiple,
+        )
         assert r == "EXTREME_ZONE"
 
     def test_trending(self):
         cfg = make_settings()
-        r = _classify_regime(0.005, 0.6, cfg.extreme_upper, cfg.extreme_lower, cfg.sigma_floor * 4, cfg.sigma_floor)
+        r = _classify_regime(
+            0.005, 0.6, cfg.extreme_upper, cfg.extreme_lower,
+            cfg.sigma_floor * 4, cfg.sigma_floor,
+            cfg.trending_abs_delta, cfg.quiet_abs_delta, cfg.high_vol_sigma_multiple,
+        )
         assert r == "TRENDING"
 
 
 class TestPatternClassification:
     def test_noise_default(self):
         cfg = make_settings()
-        p = _classify_pattern(0.0001, cfg.sigma_floor, cfg.sigma_floor)
+        p = _classify_pattern(
+            0.0001, cfg.sigma_floor, cfg.sigma_floor,
+            cfg.sustained_move_abs_delta, cfg.sustained_move_vol_ratio,
+            cfg.burst_abs_delta, cfg.burst_vol_ratio,
+            cfg.fade_abs_delta, cfg.fade_vol_ratio_max,
+        )
         assert p == "NOISE"
 
     def test_sustained_move(self):
         cfg = make_settings()
-        p = _classify_pattern(0.005, cfg.sigma_floor * 3, cfg.sigma_floor)
+        p = _classify_pattern(
+            0.005, cfg.sigma_floor * 3, cfg.sigma_floor,
+            cfg.sustained_move_abs_delta, cfg.sustained_move_vol_ratio,
+            cfg.burst_abs_delta, cfg.burst_vol_ratio,
+            cfg.fade_abs_delta, cfg.fade_vol_ratio_max,
+        )
         assert p == "SUSTAINED_MOVE"
 
 

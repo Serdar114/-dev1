@@ -65,6 +65,26 @@ class PolymarketClient:
             log.warning("get_market_by_condition_id(%s) failed: %s", condition_id, exc)
             return None
 
+    def get_market_by_slug(self, slug: str) -> Optional[dict[str, Any]]:
+        """
+        Fetch a single market from Gamma API by its slug (deterministic primary path).
+        Returns the raw market dict or None if not found / on error.
+        """
+        try:
+            resp = self._session.get(
+                f"{_GAMMA_BASE}/markets",
+                params={"slug": slug, "closed": "false", "limit": 1},
+                timeout=_TIMEOUT,
+            )
+            resp.raise_for_status()
+            results = resp.json()
+            if isinstance(results, list) and results:
+                return results[0]
+            return None
+        except requests.RequestException as exc:
+            log.debug("get_market_by_slug(%r) failed: %s", slug, exc)
+            return None
+
     def search_markets(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
         """Search Gamma API for markets matching a text query."""
         try:
