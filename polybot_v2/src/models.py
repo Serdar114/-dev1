@@ -106,9 +106,16 @@ class SignalDecision:
     pattern: str = "UNKNOWN"
     # Diagnostic flags — set False when fields could not be computed this tick
     # (e.g. early guard before fair_prob engine ran)
-    fair_computed: bool = False       # True iff fair_yes_prob is freshly computed
+    fair_computed: bool = False           # True iff analytical fields are available (fresh or cached)
+    fair_computed_fresh: bool = False     # True iff fair engine ran THIS tick (not from cache)
+    context_from_cache: bool = False      # True iff analytical fields come from previous-tick cache
     # Compact confidence breakdown for debugging: "div=X;base=X;reg=X;pat=X;dq=X;raw=X"
     confidence_components: str = ""
+    # Side-specific fee breakdown (fee curve evaluated at actual market ask prices)
+    fee_per_share_yes: float = 0.0        # fee at best_ask_yes
+    fee_per_share_no: float = 0.0         # fee at best_ask_no
+    effective_fee_rate_yes: float = 0.0   # fee_per_share_yes / best_ask_yes
+    effective_fee_rate_no: float = 0.0    # fee_per_share_no / best_ask_no
 
 
 @dataclass

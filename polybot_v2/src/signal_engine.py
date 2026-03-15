@@ -249,19 +249,8 @@ class SignalEngine:
 
         best = self._edge.best_side(yes_edge, no_edge)
 
-        if best is None:
-            reject = yes_edge.reject_reason or no_edge.reject_reason or "no_edge"
-            return self._make_decision(
-                ts=ts, window_ts=window_ts, lane="selective_taker",
-                action="NO_TRADE", chosen_side=None, reason=reject,
-                price_snap=price_snap, market_snap=market_snap,
-                window_open=window_open, fair_result=fair_result,
-                yes_edge=yes_edge, no_edge=no_edge,
-                bankroll_state=bankroll_state, binance_age_ms=binance_age_ms,
-                regime=regime, pattern=pattern, confidence=0.0,
-            )
-
-        # Compute confidence score with component breakdown
+        # Compute confidence BEFORE the no_edge early-return so NO_TRADE(no_edge) carries
+        # a real confidence score instead of the default 0.0
         confidence, conf_components = _compute_confidence(
             fair_yes_prob=fair_result.fair_yes_prob,
             implied_yes_prob=market_snap.implied_yes_prob,
@@ -271,6 +260,19 @@ class SignalEngine:
             min_edge=self._edge._min_edge,
             min_abs_delta=self._cfg.min_abs_delta_for_taker,
         )
+
+        if best is None:
+            reject = yes_edge.reject_reason or no_edge.reject_reason or "no_edge"
+            return self._make_decision(
+                ts=ts, window_ts=window_ts, lane="selective_taker",
+                action="NO_TRADE", chosen_side=None, reason=reject,
+                price_snap=price_snap, market_snap=market_snap,
+                window_open=window_open, fair_result=fair_result,
+                yes_edge=yes_edge, no_edge=no_edge,
+                bankroll_state=bankroll_state, binance_age_ms=binance_age_ms,
+                regime=regime, pattern=pattern, confidence=confidence,
+                confidence_components=conf_components,
+            )
 
         # --- Taker conviction guards ---
 
@@ -519,7 +521,9 @@ class SignalEngine:
             pattern=self._last_pattern,
             bankroll=bankroll_state.bankroll,
             data_age_ms=max(0.0, binance_age_ms),
-            fair_computed=(lf is not None),   # False only on very first tick
+            fair_computed=(lf is not None),       # True iff any analytical values are available
+            fair_computed_fresh=False,            # always False in _no_trade (engine did not run this tick)
+            context_from_cache=(lf is not None),  # True iff values come from previous-tick cache
         )
 
     def _make_simple(self, ts, window_ts, lane, action, reason) -> SignalDecision:
@@ -539,6 +543,9 @@ class SignalEngine:
         ste = market_snap.seconds_to_expiry
         elapsed = max(0.0, self._cfg.window_sec - ste)
         fee_est = self._edge._fee.taker_estimate(fair_result.fair_yes_prob)
+        # Side-specific fees at actual market ask prices
+        fee_yes = self._edge._fee.taker_estimate(market_snap.best_ask_yes)
+        fee_no = self._edge._fee.taker_estimate(market_snap.best_ask_no)
         return SignalDecision(
             ts=ts,
             window_ts=window_ts,
@@ -562,11 +569,17 @@ class SignalEngine:
             after_fee_edge_no=no_edge.after_fee_edge,
             fee_per_share=round(fee_est.fee_per_share, 8),
             effective_rate=round(fee_est.effective_rate, 6),
+            fee_per_share_yes=round(fee_yes.fee_per_share, 8),
+            fee_per_share_no=round(fee_no.fee_per_share, 8),
+            effective_fee_rate_yes=round(fee_yes.effective_rate, 6),
+            effective_fee_rate_no=round(fee_no.effective_rate, 6),
             confidence_score=round(confidence, 4),
             bankroll=bankroll_state.bankroll,
             data_age_ms=max(0.0, binance_age_ms),
             regime=regime,
             pattern=pattern,
             fair_computed=True,
+            fair_computed_fresh=True,   # engine ran this tick
+            context_from_cache=False,
             confidence_components=confidence_components,
         )

@@ -369,6 +369,8 @@ class PolybotV2:
                 bankroll=self._bankroll.bankroll,
                 data_age_ms=binance_age_ms,
                 fair_computed=(lf is not None),
+                fair_computed_fresh=False,
+                context_from_cache=(lf is not None),
             )
         else:
             taker_decision = self._signal_engine.evaluate_taker(
@@ -643,10 +645,11 @@ class PolybotV2:
         Fields always available (btc_mid, delta, implied_yes, etc.) are
         always written.
         """
-        fc = d.fair_computed  # True when analytical fields are freshly computed
+        # Analytical fields are available when engine ran this tick OR values come from cache
+        fc = d.fair_computed_fresh or d.context_from_cache
         sd = self._last_sanity_details  # market sanity numerics from current tick
 
-        # Helper: return value or null depending on whether it was computed
+        # Helper: return value or null depending on whether analytical fields are available
         def _or_null(v, precision: int = 5):
             return round(v, precision) if fc else None
 
@@ -678,10 +681,14 @@ class PolybotV2:
             # ── Market sanity ─────────────────────────────────────────
             "sanity_status": "reject" if sd.get("reject") else "pass",
             "sanity_reason": sd.get("reject"),
-            # ── Fair vs implied (null when not computed) ──────────────
-            "fair_yes_prob": round(d.fair_yes_prob, 4) if d.fair_yes_prob > 0 else None,
+            # ── Fair vs implied ───────────────────────────────────────
+            # fair_yes_prob: null when engine hasn't run and no cache available
+            "fair_yes_prob": _or_null(d.fair_yes_prob, 4),
+            # implied_yes_prob: always from live order book, never null
             "implied_yes_prob": round(d.implied_yes_prob, 4) if d.implied_yes_prob > 0 else None,
             "fair_computed": fc,
+            "fair_computed_fresh": d.fair_computed_fresh,
+            "context_from_cache": d.context_from_cache,
             # ── Edge (null when not computed) ─────────────────────────
             "raw_edge_yes":       _or_null(d.raw_edge_yes),
             "raw_edge_no":        _or_null(d.raw_edge_no),
@@ -689,6 +696,11 @@ class PolybotV2:
             "after_fee_edge_no":  _or_null(d.after_fee_edge_no),
             "fee_per_share":      _or_null(d.fee_per_share, 8),
             "effective_rate":     _or_null(d.effective_rate, 6),
+            # Side-specific fees at actual market ask prices (null when not computed)
+            "fee_per_share_yes":      _or_null(d.fee_per_share_yes, 8),
+            "fee_per_share_no":       _or_null(d.fee_per_share_no, 8),
+            "effective_fee_rate_yes": _or_null(d.effective_fee_rate_yes, 6),
+            "effective_fee_rate_no":  _or_null(d.effective_fee_rate_no, 6),
             # ── Confidence (null when not computed) ───────────────────
             "confidence_score":      _or_null(d.confidence_score, 4),
             "confidence_components": d.confidence_components if fc else None,
