@@ -350,6 +350,7 @@ class PolybotV2:
             # Synthetic NO_TRADE — still carry as much diagnostic context as possible
             from models import SignalDecision as _SD
             lf = self._signal_engine._last_fair_result
+            lc = self._signal_engine._last_decision_context
             taker_decision = _SD(
                 ts=now, window_ts=current_window_end,
                 lane="selective_taker", action="NO_TRADE",
@@ -364,6 +365,16 @@ class PolybotV2:
                 realized_vol_60s=realized_vol,
                 implied_yes_prob=market.implied_yes_prob,
                 fair_yes_prob=lf.fair_yes_prob if lf else 0.0,
+                raw_edge_yes=lc["raw_edge_yes"] if lc else 0.0,
+                raw_edge_no=lc["raw_edge_no"] if lc else 0.0,
+                after_fee_edge_yes=lc["after_fee_edge_yes"] if lc else 0.0,
+                after_fee_edge_no=lc["after_fee_edge_no"] if lc else 0.0,
+                confidence_score=lc["confidence_score"] if lc else 0.0,
+                confidence_components=lc["confidence_components"] if lc else "",
+                fee_per_share_yes=lc["fee_per_share_yes"] if lc else 0.0,
+                fee_per_share_no=lc["fee_per_share_no"] if lc else 0.0,
+                effective_fee_rate_yes=lc["effective_fee_rate_yes"] if lc else 0.0,
+                effective_fee_rate_no=lc["effective_fee_rate_no"] if lc else 0.0,
                 regime=self._signal_engine._last_regime,
                 pattern=self._signal_engine._last_pattern,
                 bankroll=self._bankroll.bankroll,
@@ -694,8 +705,9 @@ class PolybotV2:
             "raw_edge_no":        _or_null(d.raw_edge_no),
             "after_fee_edge_yes": _or_null(d.after_fee_edge_yes),
             "after_fee_edge_no":  _or_null(d.after_fee_edge_no),
-            "fee_per_share":      _or_null(d.fee_per_share, 8),
-            "effective_rate":     _or_null(d.effective_rate, 6),
+            # Generic fee = fee for the executed side; null for NO_TRADE (chosen_side is None)
+            "fee_per_share":  round(d.fee_per_share, 8) if (fc and d.chosen_side is not None) else None,
+            "effective_rate": round(d.effective_rate, 6) if (fc and d.chosen_side is not None) else None,
             # Side-specific fees at actual market ask prices (null when not computed)
             "fee_per_share_yes":      _or_null(d.fee_per_share_yes, 8),
             "fee_per_share_no":       _or_null(d.fee_per_share_no, 8),

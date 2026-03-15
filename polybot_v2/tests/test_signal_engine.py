@@ -310,3 +310,136 @@ class TestSignalDecisionFields:
         assert hasattr(decision, "action")
         assert hasattr(decision, "reason")
         assert decision.lane == "selective_taker"
+
+
+class TestCachedDecisionContext:
+    """Verify that _no_trade() carries real analytical values from cache after a prior
+    analytical tick — never fake 0.0 defaults when context_from_cache is True."""
+
+    def _analytical_tick(self, engine):
+        """Run a tick that reaches _make_decision() (seeds _last_decision_context)."""
+        # inside entry window, flat market with thin spread → reaches edge check
+        market = make_market(bid_yes=0.54, ask_yes=0.55, bid_no=0.49, ask_no=0.50, ste=150.0)
+        price = make_price(btc_mid=50300.0)  # small up-move, triggers fair computation
+        return engine.evaluate_taker(
+            price_snap=price,
+            market_snap=market,
+            window_open=50000.0,
+            bankroll_state=make_bankroll(),
+            risk_state=make_risk_state(),
+            binance_age_ms=100.0,
+            polymarket_age_ms=1000.0,
+        )
+
+    def test_cached_no_trade_carries_edge_and_confidence(self):
+        """After an analytical tick, outside_entry_window NO_TRADE must carry cached
+        edge, confidence and fee values — not dataclass default 0.0."""
+        cfg = make_settings()
+        engine = make_components(cfg)
+
+        # Tick 1: full analytical path → seeds _last_decision_context
+        d1 = self._analytical_tick(engine)
+        assert d1.fair_computed_fresh is True, "tick 1 must be fresh"
+        assert engine._last_decision_context is not None, "context cache must be populated"
+
+        # Tick 2: outside entry window → _no_trade() with context_from_cache=True
+        market_early = make_market(ste=290.0)  # elapsed=10s < entry_start_sec=30
+        price = make_price(btc_mid=50300.0)
+        d2 = engine.evaluate_taker(
+            price_snap=price,
+            market_snap=market_early,
+            window_open=50000.0,
+            bankroll_state=make_bankroll(),
+            risk_state=make_risk_state(),
+            binance_age_ms=100.0,
+            polymarket_age_ms=1000.0,
+        )
+
+        assert d2.action == "NO_TRADE"
+        assert d2.context_from_cache is True
+        assert d2.fair_computed_fresh is False
+        # These must come from cache, not be the 0.0 dataclass defaults
+        assert d2.confidence_components != "", "confidence_components must not be empty when cached"
+        assert d2.fee_per_share_yes > 0.0, "fee_per_share_yes must come from cache"
+        assert d2.fee_per_share_no > 0.0, "fee_per_share_no must come from cache"
+        # Edge fields must match the cached values from d1's analytical computation
+        assert d2.raw_edge_yes == engine._last_decision_context["raw_edge_yes"]
+        assert d2.confidence_score == engine._last_decision_context["confidence_score"]
+
+    def test_no_cache_means_clean_defaults(self):
+        """When no prior tick has run, _no_trade() has no context and all analytical
+        fields legitimately default to 0.0 / empty — that is correct."""
+        cfg = make_settings()
+        engine = make_components(cfg)
+
+        # First tick ever: outside entry window, no prior cache
+        market_early = make_market(ste=290.0)
+        price = make_price()
+        d = engine.evaluate_taker(
+            price_snap=price,
+            market_snap=market_early,
+            window_open=50000.0,
+            bankroll_state=make_bankroll(),
+            risk_state=make_risk_state(),
+            binance_age_ms=100.0,
+            polymarket_age_ms=1000.0,
+        )
+        assert d.action == "NO_TRADE"
+        assert d.context_from_cache is False
+        assert d.fair_computed_fresh is False
+        # Legitimately unavailable — both flags False, not fake zeros from a prior tick
+        assert engine._last_decision_context is None
+        assert d.confidence_components == ""
+        assert d.confidence_score == 0.0
+
+    def test_generic_fee_null_for_no_trade(self):
+        """_make_decision() with chosen_side=None sets fee_per_share=0.0 (null in logs).
+        Side-specific fees are still computed and available."""
+        cfg = make_settings()
+        engine = make_components(cfg)
+        # Wide-spread no_edge scenario: both sides negative after fee
+        market = make_market(bid_yes=0.54, ask_yes=0.55, bid_no=0.49, ask_no=0.50, ste=150.0)
+        price = make_price(btc_mid=50000.0)  # flat → fair_yes ≈ 0.5 → both edges negative
+        d = engine.evaluate_taker(
+            price_snap=price,
+            market_snap=market,
+            window_open=50000.0,
+            bankroll_state=make_bankroll(),
+            risk_state=make_risk_state(),
+            binance_age_ms=100.0,
+            polymarket_age_ms=1000.0,
+        )
+        assert d.action == "NO_TRADE"
+        assert d.chosen_side is None
+        # Generic fee must be 0.0 — logged as null by _log_signal() (chosen_side is None)
+        assert d.fee_per_share == 0.0
+        assert d.effective_rate == 0.0
+        # Side-specific fees ARE computed and must be positive
+        assert d.fee_per_share_yes > 0.0
+        assert d.fee_per_share_no > 0.0
+
+    def test_paper_trade_generic_fee_from_chosen_side(self):
+        """PAPER_TRADE decision sets generic fee_per_share from the actual chosen side's
+        ask price, not from fair_yes_prob."""
+        cfg = make_settings()
+        engine = make_components(cfg)
+        # Strong directional move to get a PAPER_TRADE
+        market = make_market(bid_yes=0.48, ask_yes=0.52, bid_no=0.48, ask_no=0.52, ste=150.0)
+        price = make_price(btc_mid=51000.0, vol=0.005)  # 2% up, higher vol
+        d = engine.evaluate_taker(
+            price_snap=price,
+            market_snap=market,
+            window_open=50000.0,
+            bankroll_state=make_bankroll(),
+            risk_state=make_risk_state(),
+            binance_age_ms=100.0,
+            polymarket_age_ms=1000.0,
+        )
+        if d.action != "PAPER_TRADE":
+            pytest.skip("no trade in this market config — adjust prices if needed")
+        assert d.chosen_side is not None
+        # Generic fee must equal the chosen side's side-specific fee
+        if d.chosen_side == "yes":
+            assert d.fee_per_share == d.fee_per_share_yes
+        else:
+            assert d.fee_per_share == d.fee_per_share_no

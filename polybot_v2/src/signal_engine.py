@@ -158,6 +158,9 @@ class SignalEngine:
         self._last_fair_result = None
         self._last_regime: str = "UNKNOWN"
         self._last_pattern: str = "UNKNOWN"
+        # Cache last decision's analytical payload (edge, confidence, fees) so that
+        # subsequent _no_trade() calls can carry real values instead of default 0.0
+        self._last_decision_context: Optional[dict] = None
 
     def evaluate_taker(
         self,
@@ -496,6 +499,7 @@ class SignalEngine:
         elapsed = max(0.0, self._cfg.window_sec - ste)
         # Use last-known fair/regime/pattern so NO_TRADE log lines carry full context
         lf = self._last_fair_result
+        lc = self._last_decision_context  # edge, confidence, fees from last analytical tick
         # delta can always be computed if window_open is set
         wo = window_open or 0.0
         if wo > 0 and price_snap.btc_mid > 0:
@@ -514,16 +518,27 @@ class SignalEngine:
             delta_raw_fraction=raw_d,
             delta_pct_display=raw_d * 100.0,
             realized_vol_60s=price_snap.realized_vol_60s,
-            # Use freshly computed values where available, else cached from last tick
             fair_yes_prob=lf.fair_yes_prob if lf else 0.0,
             implied_yes_prob=market_snap.implied_yes_prob,
+            # Populate analytical payload from last decision context so cache path
+            # never emits fake 0.0 defaults when lc is available
+            raw_edge_yes=lc["raw_edge_yes"] if lc else 0.0,
+            raw_edge_no=lc["raw_edge_no"] if lc else 0.0,
+            after_fee_edge_yes=lc["after_fee_edge_yes"] if lc else 0.0,
+            after_fee_edge_no=lc["after_fee_edge_no"] if lc else 0.0,
+            confidence_score=lc["confidence_score"] if lc else 0.0,
+            confidence_components=lc["confidence_components"] if lc else "",
+            fee_per_share_yes=lc["fee_per_share_yes"] if lc else 0.0,
+            fee_per_share_no=lc["fee_per_share_no"] if lc else 0.0,
+            effective_fee_rate_yes=lc["effective_fee_rate_yes"] if lc else 0.0,
+            effective_fee_rate_no=lc["effective_fee_rate_no"] if lc else 0.0,
             regime=self._last_regime,
             pattern=self._last_pattern,
             bankroll=bankroll_state.bankroll,
             data_age_ms=max(0.0, binance_age_ms),
-            fair_computed=(lf is not None),       # True iff any analytical values are available
-            fair_computed_fresh=False,            # always False in _no_trade (engine did not run this tick)
-            context_from_cache=(lf is not None),  # True iff values come from previous-tick cache
+            fair_computed=(lf is not None),
+            fair_computed_fresh=False,
+            context_from_cache=(lf is not None),
         )
 
     def _make_simple(self, ts, window_ts, lane, action, reason) -> SignalDecision:
@@ -542,11 +557,17 @@ class SignalEngine:
     ) -> SignalDecision:
         ste = market_snap.seconds_to_expiry
         elapsed = max(0.0, self._cfg.window_sec - ste)
-        fee_est = self._edge._fee.taker_estimate(fair_result.fair_yes_prob)
         # Side-specific fees at actual market ask prices
         fee_yes = self._edge._fee.taker_estimate(market_snap.best_ask_yes)
         fee_no = self._edge._fee.taker_estimate(market_snap.best_ask_no)
-        return SignalDecision(
+        # Generic fee = fee for the chosen execution side; 0.0 (null in logs) for NO_TRADE
+        if chosen_side == "yes":
+            fee_generic = fee_yes
+        elif chosen_side == "no":
+            fee_generic = fee_no
+        else:
+            fee_generic = None  # NO_TRADE: no execution side
+        decision = SignalDecision(
             ts=ts,
             window_ts=window_ts,
             lane=lane,
@@ -567,8 +588,8 @@ class SignalEngine:
             raw_edge_no=no_edge.raw_edge,
             after_fee_edge_yes=yes_edge.after_fee_edge,
             after_fee_edge_no=no_edge.after_fee_edge,
-            fee_per_share=round(fee_est.fee_per_share, 8),
-            effective_rate=round(fee_est.effective_rate, 6),
+            fee_per_share=round(fee_generic.fee_per_share, 8) if fee_generic else 0.0,
+            effective_rate=round(fee_generic.effective_rate, 6) if fee_generic else 0.0,
             fee_per_share_yes=round(fee_yes.fee_per_share, 8),
             fee_per_share_no=round(fee_no.fee_per_share, 8),
             effective_fee_rate_yes=round(fee_yes.effective_rate, 6),
@@ -583,3 +604,17 @@ class SignalEngine:
             context_from_cache=False,
             confidence_components=confidence_components,
         )
+        # Persist analytical payload for subsequent _no_trade() calls in the same tick
+        self._last_decision_context = {
+            "raw_edge_yes": yes_edge.raw_edge,
+            "raw_edge_no": no_edge.raw_edge,
+            "after_fee_edge_yes": yes_edge.after_fee_edge,
+            "after_fee_edge_no": no_edge.after_fee_edge,
+            "confidence_score": round(confidence, 4),
+            "confidence_components": confidence_components,
+            "fee_per_share_yes": round(fee_yes.fee_per_share, 8),
+            "fee_per_share_no": round(fee_no.fee_per_share, 8),
+            "effective_fee_rate_yes": round(fee_yes.effective_rate, 6),
+            "effective_fee_rate_no": round(fee_no.effective_rate, 6),
+        }
+        return decision
