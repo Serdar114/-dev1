@@ -165,9 +165,13 @@ class PolybotV2:
         if self._cfg.ui_enabled:
             try:
                 from ui_dashboard import UIDashboard
-                from ui_state import UIState
+                from ui_state import UIState, UILogHandler
                 self._ui_state = UIState()
                 self._ui = UIDashboard(self._cfg, self._ui_state)
+                # Route all log records to the live log panel
+                _ui_handler = UILogHandler(self._ui_state)
+                _ui_handler.setLevel(logging.DEBUG)
+                logging.getLogger().addHandler(_ui_handler)
             except Exception as exc:
                 log.warning("UI dashboard unavailable: %s", exc)
                 self._ui = None
@@ -181,6 +185,8 @@ class PolybotV2:
         self._current_market_age: float = 0.0
         self._window_open_price: Optional[float] = None
         self._running = False
+        # Last sanity check details for UI diagnostics
+        self._last_sanity_details: dict = {}
 
     # ------------------------------------------------------------------ #
     # Main loop
@@ -273,14 +279,18 @@ class PolybotV2:
 
         market = self._current_market
 
-        # Get Binance snapshot
+        # Get Binance snapshot — compute age with a FRESH time.time() taken after
+        # the snapshot call.  Using the stale 'now' from tick-start risks negative
+        # data_age_ms if the WS callback fires between 'now = time.time()' and
+        # 'get_snapshot()' and updates _last_ts to a value > now.
         btc_mid, btc_ts, realized_vol = self._binance.get_snapshot()
+        _snap_read_ts = time.time()
         if btc_mid is None:
             log.warning("No Binance price, skipping tick")
             return
 
-        binance_age_ms = (now - btc_ts) * 1000
-        polymarket_age_ms = (now - market.fetched_at) * 1000
+        binance_age_ms = (_snap_read_ts - btc_ts) * 1000   # always >= 0
+        polymarket_age_ms = (_snap_read_ts - market.fetched_at) * 1000
 
         # Set / maintain window open price — frozen at first tick of each window
         if self._window_open_price is None:
@@ -378,6 +388,7 @@ class PolybotV2:
                     elapsed=elapsed_in_window,
                     taker_decision=taker_decision,
                     binance_age_ms=binance_age_ms,
+                    realized_vol=realized_vol,
                 )
             except Exception as exc:
                 log.debug("UI state update failed: %s", exc)
@@ -392,28 +403,49 @@ class PolybotV2:
         """
         Hard sanity gate for market data quality.
         Returns a reject reason string if market should be skipped, else None.
-        Wide spread and YES/NO complement skew both produce hard rejects
-        (not just warnings) — trading on unreliable pricing is worse than missing a trade.
+        Stores numerical diagnostics in self._last_sanity_details for UI display.
         """
-        spread_yes = market.best_ask_yes - market.best_bid_yes
-        if spread_yes > self._cfg.max_spread_warn:
-            reason = f"wide_spread_reject(spread={spread_yes:.4f})"
-            log.warning(
-                "Market sanity REJECT: %s bid=%.4f ask=%.4f",
-                reason, market.best_bid_yes, market.best_ask_yes,
-            )
-            return reason
-
         yes_mid = market.implied_yes_prob
         no_mid = (market.best_bid_no + market.best_ask_no) / 2.0 if (
             market.best_bid_no > 0 and market.best_ask_no > 0
         ) else 0.5
-        skew = abs(yes_mid + no_mid - 1.0)
-        if skew > self._cfg.max_complement_skew:
-            reason = f"complement_skew_reject(skew={skew:.4f})"
+        spread_yes = market.best_ask_yes - market.best_bid_yes
+        spread_no = market.best_ask_no - market.best_bid_no
+        midpoint_sum = yes_mid + no_mid
+        skew = abs(midpoint_sum - 1.0)
+
+        # Always update diagnostics so UI shows current numbers
+        self._last_sanity_details = {
+            "yes_bid": market.best_bid_yes,
+            "yes_ask": market.best_ask_yes,
+            "no_bid": market.best_bid_no,
+            "no_ask": market.best_ask_no,
+            "yes_mid": yes_mid,
+            "no_mid": no_mid,
+            "midpoint_sum": midpoint_sum,
+            "spread_yes": spread_yes,
+            "spread_no": spread_no,
+            "complement_skew": skew,
+            "spread_threshold": self._cfg.max_spread_warn,
+            "skew_threshold": self._cfg.max_complement_skew,
+            "reject": None,
+        }
+
+        if spread_yes > self._cfg.max_spread_warn:
+            reason = f"wide_spread_reject(spread_yes={spread_yes:.4f} > thr={self._cfg.max_spread_warn:.4f})"
+            self._last_sanity_details["reject"] = reason
             log.warning(
-                "Market sanity REJECT: %s yes_mid=%.4f no_mid=%.4f",
-                reason, yes_mid, no_mid,
+                "Market sanity REJECT: %s bid=%.4f ask=%.4f spread=%.4f",
+                reason, market.best_bid_yes, market.best_ask_yes, spread_yes,
+            )
+            return reason
+
+        if skew > self._cfg.max_complement_skew:
+            reason = f"complement_skew_reject(skew={skew:.4f} > thr={self._cfg.max_complement_skew:.4f})"
+            self._last_sanity_details["reject"] = reason
+            log.warning(
+                "Market sanity REJECT: %s yes_mid=%.4f no_mid=%.4f sum=%.4f skew=%.4f",
+                reason, yes_mid, no_mid, midpoint_sum, skew,
             )
             return reason
 
@@ -533,10 +565,12 @@ class PolybotV2:
             # Window position
             "elapsed_from_window_start": round(d.elapsed_from_window_start, 1),
             "seconds_to_expiry": round(d.seconds_to_expiry, 1),
-            # BTC price
+            # BTC price — dual representation to eliminate unit ambiguity
             "btc_mid": d.btc_mid,
             "window_open": d.window_open,
-            "delta_pct": round(d.delta_pct, 6),
+            "delta_raw_fraction": round(d.delta_raw_fraction, 6),   # e.g. 0.001000
+            "delta_pct_display": round(d.delta_pct_display, 4),     # e.g. 0.1000 (%)
+            "delta_pct": round(d.delta_pct, 6),                     # legacy alias
             "realized_vol_60s": round(d.realized_vol_60s, 8),
             # Fair vs implied
             "fair_yes_prob": round(d.fair_yes_prob, 4),
@@ -565,9 +599,12 @@ class PolybotV2:
     def _update_ui_state(
         self, now, btc_mid, market, current_window_start,
         current_window_end, elapsed, taker_decision, binance_age_ms,
+        realized_vol: float = 0.0,
     ) -> None:
         """Push a snapshot to the UI state object for rendering."""
         state = self._ui_state
+        sd = self._last_sanity_details
+        d = taker_decision
         state.update(
             ts=now,
             mode=self._cfg.mode,
@@ -593,6 +630,23 @@ class PolybotV2:
             binance_age_ms=binance_age_ms,
             cooldown_remaining=self._risk_state.cooldown_windows_remaining,
             consecutive_losses=self._risk_state.consecutive_losses,
+            # Market microstructure diagnostics
+            yes_mid=sd.get("yes_mid", market.implied_yes_prob),
+            no_mid=sd.get("no_mid", 0.5),
+            spread_yes=sd.get("spread_yes", market.best_ask_yes - market.best_bid_yes),
+            spread_no=sd.get("spread_no", market.best_ask_no - market.best_bid_no),
+            midpoint_sum=sd.get("midpoint_sum", 0.0),
+            complement_skew=sd.get("complement_skew", 0.0),
+            sanity_reject=sd.get("reject"),
+            # BTC delta (explicit units)
+            delta_raw_fraction=getattr(d, "delta_raw_fraction", 0.0),
+            delta_pct_display=getattr(d, "delta_pct_display", 0.0),
+            realized_vol_60s=realized_vol,
+            # Market slug
+            market_slug=getattr(market, "slug", ""),
+            # Window config
+            entry_start_sec=self._cfg.entry_start_sec,
+            entry_end_sec=self._cfg.entry_end_sec,
         )
 
     def _log_paper_trade(self, trade, event: str) -> None:

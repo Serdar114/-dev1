@@ -94,4 +94,5 @@ class FairProbEngine:
             sigma_eff=sigma_eff,
             tau_eff=tau_eff,
             z_score=z,
+            delta_pct_display=delta_pct * 100.0,
         )

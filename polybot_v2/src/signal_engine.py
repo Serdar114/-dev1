@@ -140,6 +140,10 @@ class SignalEngine:
         self._edge = edge_engine
         self._stake = stake_policy
         self._risk = risk_manager
+        # Cache last valid fair/regime/pattern for diagnostic NO_TRADE paths
+        self._last_fair_result = None
+        self._last_regime: str = "UNKNOWN"
+        self._last_pattern: str = "UNKNOWN"
 
     def evaluate_taker(
         self,
@@ -216,6 +220,10 @@ class SignalEngine:
             self._cfg.burst_abs_delta, self._cfg.burst_vol_ratio,
             self._cfg.fade_abs_delta, self._cfg.fade_vol_ratio_max,
         )
+        # Update cache so downstream NO_TRADE paths carry diagnostic context
+        self._last_fair_result = fair_result
+        self._last_regime = regime
+        self._last_pattern = pattern
 
         # Edge computation
         yes_edge, no_edge = self._edge.compute(
@@ -256,7 +264,11 @@ class SignalEngine:
             return self._make_decision(
                 ts=ts, window_ts=window_ts, lane="selective_taker",
                 action="NO_TRADE", chosen_side=None,
-                reason=f"delta_too_small({abs(fair_result.delta_pct):.5f})",
+                reason=(
+                    f"delta_too_small(raw={abs(fair_result.delta_pct):.5f}"
+                    f"|{abs(fair_result.delta_pct_display):.3f}%"
+                    f" < thr={self._cfg.min_abs_delta_for_taker:.5f})"
+                ),
                 price_snap=price_snap, market_snap=market_snap,
                 window_open=window_open, fair_result=fair_result,
                 yes_edge=yes_edge, no_edge=no_edge,
@@ -283,7 +295,11 @@ class SignalEngine:
                 return self._make_decision(
                     ts=ts, window_ts=window_ts, lane="selective_taker",
                     action="NO_TRADE", chosen_side=None,
-                    reason=f"neutral_band:delta_too_small({abs(fair_result.delta_pct):.5f})",
+                    reason=(
+                        f"neutral_band:delta_too_small(raw={abs(fair_result.delta_pct):.5f}"
+                        f"|{abs(fair_result.delta_pct_display):.3f}%"
+                        f" < thr={self._cfg.neutral_band_min_delta:.5f})"
+                    ),
                     price_snap=price_snap, market_snap=market_snap,
                     window_open=window_open, fair_result=fair_result,
                     yes_edge=yes_edge, no_edge=no_edge,
@@ -451,6 +467,8 @@ class SignalEngine:
     ) -> SignalDecision:
         ste = market_snap.seconds_to_expiry
         elapsed = max(0.0, self._cfg.window_sec - ste)
+        # Use last-known fair/regime/pattern so NO_TRADE log lines carry full context
+        lf = self._last_fair_result
         return SignalDecision(
             ts=ts, window_ts=window_ts,
             lane="selective_taker", action="NO_TRADE",
@@ -458,7 +476,15 @@ class SignalEngine:
             seconds_to_expiry=ste,
             elapsed_from_window_start=elapsed,
             btc_mid=price_snap.btc_mid,
-            window_open=window_open,
+            window_open=window_open or 0.0,
+            delta_pct=lf.delta_pct if lf else 0.0,
+            delta_raw_fraction=lf.delta_pct if lf else 0.0,
+            delta_pct_display=lf.delta_pct_display if lf else 0.0,
+            realized_vol_60s=price_snap.realized_vol_60s,
+            fair_yes_prob=lf.fair_yes_prob if lf else 0.0,
+            implied_yes_prob=market_snap.implied_yes_prob,
+            regime=self._last_regime,
+            pattern=self._last_pattern,
             bankroll=bankroll_state.bankroll,
             data_age_ms=binance_age_ms,
         )
@@ -496,6 +522,8 @@ class SignalEngine:
             btc_mid=price_snap.btc_mid,
             window_open=window_open,
             delta_pct=fair_result.delta_pct,
+            delta_raw_fraction=fair_result.delta_pct,
+            delta_pct_display=fair_result.delta_pct_display,
             realized_vol_60s=price_snap.realized_vol_60s,
             fair_yes_prob=fair_result.fair_yes_prob,
             implied_yes_prob=market_snap.implied_yes_prob,

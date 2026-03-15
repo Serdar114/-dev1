@@ -23,6 +23,7 @@ class MarketSnapshot:
     last_trade_price_yes: Optional[float]
     window_end_ts: float         # unix ts when this window resolves
     fetched_at: float = field(default_factory=time.time)
+    slug: str = ""               # market slug for display (btc-updown-5m-<ts>)
 
     @property
     def implied_yes_prob(self) -> float:
@@ -50,10 +51,14 @@ class FairProbResult:
     fair_yes_prob: float
     fair_no_prob: float
     # debug fields
+    # delta_pct is the RAW FRACTION: (btc_mid - window_open) / window_open
+    # e.g. 0.00100 means +0.10% move. All threshold comparisons use this unit.
     delta_pct: float
     sigma_eff: float
     tau_eff: float
     z_score: float
+    # delta_pct_display = delta_pct * 100  — percentage form for UI/logs only
+    delta_pct_display: float = 0.0
 
 
 @dataclass
@@ -80,7 +85,11 @@ class SignalDecision:
     elapsed_from_window_start: float = 0.0   # seconds since window open
     btc_mid: float = 0.0
     window_open: float = 0.0
+    # delta_pct = raw fraction (same unit as FairProbResult.delta_pct); used for all guard comparisons
     delta_pct: float = 0.0
+    # delta_raw_fraction / delta_pct_display = unambiguous dual representation for logs/UI
+    delta_raw_fraction: float = 0.0   # (btc_mid - window_open) / window_open
+    delta_pct_display: float = 0.0    # delta_raw_fraction * 100, percentage for display
     realized_vol_60s: float = 0.0
     fair_yes_prob: float = 0.0
     implied_yes_prob: float = 0.0
