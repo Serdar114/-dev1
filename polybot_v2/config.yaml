@@ -1,6 +1,13 @@
 app:
   mode: paper_with_shadow_probe   # paper | paper_with_shadow_probe
   log_level: INFO
+  # Taker execution mode separation (Phase 3)
+  # taker_signal_eval_enabled: if true, taker fair/edge/confidence logic runs and
+  #   logs into signals.jsonl regardless of paper execution setting.
+  # taker_paper_execution_enabled: if false, taker PAPER_TRADE decisions do NOT
+  #   open trades or affect bankroll. Use false to demote taker to diagnostic-only.
+  taker_signal_eval_enabled: true
+  taker_paper_execution_enabled: true
 
 market:
   symbol: BTCUSDT
@@ -109,6 +116,23 @@ logging:
   jsonl_enabled: true
   # Log rotation: create a timestamped subdirectory per session so runs don't mix
   session_subdirs: true           # if true, logs go to logs/<session_ts>/
+
+verdict_thresholds:
+  # Taker: minimum expectancy (USDC per resolved trade) to move above baseline_only.
+  # Expectancy = avg_pnl_per_resolved_trade. Unit: USDC.
+  taker_min_expectancy_usdc: 0.005
+  # Maker: minimum number of resolved filled quotes before win-rate verdict is meaningful.
+  maker_min_resolved_fills: 20
+  # Maker: minimum boundary win rate (fraction 0-1) to consider conditionally_researchable.
+  maker_min_boundary_win_rate: 0.55
+  # Maker: minimum mean PnL-if-held (fraction, per-share) to consider positive expectation.
+  # e.g. 0.05 = mean 5 cents per share on a $1 contract.
+  maker_min_mean_pnl_if_held: 0.05
+  # Maker: maximum adverse fill ratio (fraction) still consistent with edge.
+  maker_max_adverse_fill_ratio: 0.60
+  # live_candidate: both taker and maker must clear their own thresholds, AND
+  # maker_min_resolved_fills must be met.
+  live_candidate_min_maker_fills: 50
 
 ui:
   enabled: true

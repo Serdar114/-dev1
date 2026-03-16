@@ -74,6 +74,14 @@ class Settings:
         return self._raw["app"].get("log_level", "INFO")
 
     @property
+    def taker_signal_eval_enabled(self) -> bool:
+        return bool(self._raw["app"].get("taker_signal_eval_enabled", True))
+
+    @property
+    def taker_paper_execution_enabled(self) -> bool:
+        return bool(self._raw["app"].get("taker_paper_execution_enabled", True))
+
+    @property
     def symbol(self) -> str:
         return self._raw["market"]["symbol"]
 
@@ -360,3 +368,34 @@ class Settings:
     @property
     def jsonl_enabled(self) -> bool:
         return bool(self._raw["logging"].get("jsonl_enabled", True))
+
+    # ------------------------------------------------------------------ #
+    # Verdict thresholds (Phase 3)
+    # ------------------------------------------------------------------ #
+
+    def _vt(self, key: str, default):
+        return self._raw.get("verdict_thresholds", {}).get(key, default)
+
+    @property
+    def verdict_taker_min_expectancy_usdc(self) -> float:
+        return float(self._vt("taker_min_expectancy_usdc", 0.005))
+
+    @property
+    def verdict_maker_min_resolved_fills(self) -> int:
+        return int(self._vt("maker_min_resolved_fills", 20))
+
+    @property
+    def verdict_maker_min_boundary_win_rate(self) -> float:
+        return float(self._vt("maker_min_boundary_win_rate", 0.55))
+
+    @property
+    def verdict_maker_min_mean_pnl_if_held(self) -> float:
+        return float(self._vt("maker_min_mean_pnl_if_held", 0.05))
+
+    @property
+    def verdict_maker_max_adverse_fill_ratio(self) -> float:
+        return float(self._vt("maker_max_adverse_fill_ratio", 0.60))
+
+    @property
+    def verdict_live_candidate_min_maker_fills(self) -> int:
+        return int(self._vt("live_candidate_min_maker_fills", 50))

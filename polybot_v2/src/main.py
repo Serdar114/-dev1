@@ -24,6 +24,7 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).parent))
 
 from binance_feed import BinanceFeed
+from session_verdict import build_session_summary
 from edge_engine import EdgeEngine
 from fair_prob_engine import FairProbEngine
 from fee_engine import FeeEngine
@@ -345,11 +346,30 @@ class PolybotV2:
             realized_vol_60s=realized_vol,
         )
 
-        # Lane 1: Selective Taker — hard sanity gate first
+        # Lane 1: Selective Taker
+        # taker_signal_eval_enabled controls whether fair/edge logic runs and logs.
+        # taker_paper_execution_enabled controls whether PAPER_TRADE opens real trades.
         wo = self._window_open_price or 0.0
         raw_d = (btc_mid - wo) / wo if wo > 0 else 0.0
-        if sanity_reject:
-            # Synthetic NO_TRADE — still carry as much diagnostic context as possible
+        if not self._cfg.taker_signal_eval_enabled:
+            # Taker eval disabled: emit a synthetic NO_TRADE so metrics/logs stay consistent
+            from models import SignalDecision as _SD
+            taker_decision = _SD(
+                ts=now, window_ts=current_window_end,
+                lane="selective_taker", action="NO_TRADE",
+                chosen_side=None, reason="taker_signal_eval_disabled",
+                seconds_to_expiry=market.seconds_to_expiry,
+                elapsed_from_window_start=elapsed_in_window,
+                btc_mid=btc_mid, window_open=wo,
+                delta_pct=raw_d, delta_raw_fraction=raw_d,
+                delta_pct_display=raw_d * 100.0,
+                realized_vol_60s=realized_vol,
+                implied_yes_prob=market.implied_yes_prob,
+                bankroll=self._bankroll.bankroll,
+                data_age_ms=binance_age_ms,
+            )
+        elif sanity_reject:
+            # Hard sanity gate — synthetic NO_TRADE, carry diagnostic context
             from models import SignalDecision as _SD
             lf = self._signal_engine._last_fair_result
             lc = self._signal_engine._last_decision_context
@@ -398,7 +418,7 @@ class PolybotV2:
         self._metrics.on_signal(taker_decision)
         self._log_signal(taker_decision)
 
-        if taker_decision.action == "PAPER_TRADE":
+        if taker_decision.action == "PAPER_TRADE" and self._cfg.taker_paper_execution_enabled:
             entry_price = (
                 market.best_ask_yes
                 if taker_decision.chosen_side == "yes"
@@ -920,6 +940,23 @@ class PolybotV2:
         })
         self._store.save()
         self._structured.close()
+
+        # Phase 3: write session_summary.json + session_summary.txt
+        try:
+            import datetime as _dt
+            session_log_dir = self._cfg.log_dir_for_session(self._session_ts)
+            ts_str = _dt.datetime.utcfromtimestamp(self._session_ts).strftime("%Y%m%d_%H%M%S")
+            summary = build_session_summary(session_log_dir, self._cfg, session_ts=ts_str)
+            verdict = summary.get("verdict", {})
+            log.info(
+                "Session summary written | taker=%s maker=%s live=%s",
+                verdict.get("taker_status"),
+                verdict.get("maker_status"),
+                verdict.get("live_candidate_status"),
+            )
+        except Exception as exc:
+            log.warning("Session summary generation failed: %s", exc)
+
         log.info("Shutdown complete. Bankroll: %.4f USDC", self._bankroll.bankroll)
 
 
