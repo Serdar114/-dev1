@@ -1,11 +1,11 @@
 """
-polybot_v2 Phase 1 – main entry point.
+polybot_v2 Phase 2 - main entry point.
 
-Two-lane paper trading system:
-  Lane 1: Selective Taker Paper Engine
-  Lane 2: Maker Shadow Probe
+Two-lane paper evaluation system:
+  Lane 1 (baseline):    Selective Taker Paper Engine
+  Lane 2 (primary):     Maker Shadow Evaluation Lane
 
-No real orders are placed.
+No real orders are placed. Phase 2 measures whether maker has edge.
 """
 
 from __future__ import annotations
@@ -206,7 +206,8 @@ class PolybotV2:
 
     def run(self) -> None:
         log.info(
-            "polybot_v2 Phase 1 starting | mode=%s bankroll=%.2f USDC",
+            "polybot_v2 Phase 2 starting | mode=%s bankroll=%.2f USDC "
+            "| taker=baseline maker=primary_eval",
             self._cfg.mode,
             self._bankroll.bankroll,
         )
@@ -617,26 +618,26 @@ class PolybotV2:
             self._last_window_ts, new_window_end, boundary_ts,
         )
 
-        # Resolve any open paper trades from previous window.
+        # Resolve boundary outcome — needed for both paper trades and shadow quote attribution.
         # Use Binance snapshot nearest to boundary_ts for accurate resolution.
-        if self._paper_exec.get_open_trades():
-            resolve_price, snapshot_ts = self._binance.get_snapshot_near(boundary_ts)
-            if resolve_price is not None and self._window_open_price is not None:
-                outcome_yes = 1.0 if resolve_price > self._window_open_price else 0.0
-                log.info(
-                    "Resolve: window_open=%.2f resolve_price=%.2f "
-                    "snapshot_ts=%.3f boundary_ts=%.3f outcome=%s",
-                    self._window_open_price, resolve_price,
-                    snapshot_ts, boundary_ts,
-                    "YES" if outcome_yes == 1.0 else "NO",
-                )
-            else:
-                outcome_yes = 0.5  # fallback: neutral
-                log.warning(
-                    "Resolve fallback: no Binance snapshot near boundary_ts=%.3f",
-                    boundary_ts,
-                )
+        resolve_price, snapshot_ts = self._binance.get_snapshot_near(boundary_ts)
+        if resolve_price is not None and self._window_open_price is not None:
+            outcome_yes = 1.0 if resolve_price > self._window_open_price else 0.0
+            log.info(
+                "Resolve: window_open=%.2f resolve_price=%.2f "
+                "snapshot_ts=%.3f boundary_ts=%.3f outcome=%s",
+                self._window_open_price, resolve_price,
+                snapshot_ts, boundary_ts,
+                "YES" if outcome_yes == 1.0 else "NO",
+            )
+        else:
+            outcome_yes = 0.5  # fallback: neutral
+            log.warning(
+                "Resolve fallback: no Binance snapshot near boundary_ts=%.3f",
+                boundary_ts,
+            )
 
+        if self._paper_exec.get_open_trades():
             resolved = self._paper_exec.resolve_all_pending(outcome_yes, self._bankroll)
             for trade in resolved:
                 self._metrics.on_trade_resolved(trade, self._bankroll.bankroll)
@@ -657,6 +658,13 @@ class PolybotV2:
             )
         else:
             self._window_open_price = None
+
+        # Phase 2: resolve shadow quotes with boundary outcome before resetting probe
+        if self._cfg.mode == "paper_with_shadow_probe":
+            boundary_quotes = self._shadow_probe.resolve_boundary(outcome_yes)
+            for bq in boundary_quotes:
+                self._metrics.on_boundary_resolved(bq)
+                self._log_shadow_quote(bq, event="boundary_resolved")
 
         # Reset per-window state
         self._risk_mgr.on_window_reset(self._risk_state)
@@ -838,10 +846,55 @@ class PolybotV2:
         record["event"] = event
         self._structured.log("paper_trades", record)
 
-    def _log_shadow_quote(self, quote) -> None:
-        from dataclasses import asdict
-        record = asdict(quote)
-        self._structured.log("shadow_quotes", record)
+    def _log_shadow_quote(self, quote, event: str = "lifecycle") -> None:
+        """
+        Write shadow quote event to JSONL.
+        Phase 2: enriched record with full maker evaluation context.
+        All fields serialized; None values are preserved as null (not 0.0).
+        """
+        self._structured.log("shadow_quotes", {
+            # Identity
+            "event": event,
+            "quote_id": quote.quote_id,
+            "ts": quote.ts,
+            "window_ts": quote.window_ts,
+            "market_slug": quote.market_slug,
+            # Quote placement
+            "side": quote.side,
+            "quote_price": quote.quote_price,
+            "best_bid": quote.best_bid,
+            "best_ask": quote.best_ask,
+            "tick_size": quote.tick_size,
+            "crossed": quote.crossed,
+            "fill_status": quote.fill_status,
+            "reject_reason": quote.reject_reason,
+            # Window context at quote time
+            "seconds_to_expiry": quote.seconds_to_expiry,
+            "elapsed_from_window_start": quote.elapsed_from_window_start,
+            # Market and model state at quote time
+            "implied_yes_prob": quote.implied_yes_prob,
+            "fair_yes_prob": quote.fair_yes_prob,
+            "delta_raw_fraction": quote.delta_raw_fraction,
+            "delta_pct_display": round(quote.delta_pct_display, 4),
+            "confidence_score": quote.confidence_score,
+            "confidence_components": quote.confidence_components,
+            "regime": quote.regime,
+            "pattern": quote.pattern,
+            # Maker economics at quote time
+            "intended_passive_edge": quote.intended_passive_edge,
+            "intended_notional": quote.intended_notional,
+            # Fill lifecycle
+            "fill_ts": quote.fill_ts,
+            "fill_mid": quote.fill_mid,
+            "next_mid_after_fill": quote.next_mid_after_fill,
+            "adverse_move_after_fill": quote.adverse_move_after_fill,
+            "favorable_move_after_fill": quote.favorable_move_after_fill,
+            # Boundary resolution
+            "boundary_outcome_yes": quote.boundary_outcome_yes,
+            "boundary_outcome_for_side": quote.boundary_outcome_for_side,
+            "maker_pnl_if_held": quote.maker_pnl_if_held,
+            "maker_edge_realized_vs_expected": quote.maker_edge_realized_vs_expected,
+        })
 
     # ------------------------------------------------------------------ #
     # Shutdown

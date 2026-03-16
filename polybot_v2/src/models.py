@@ -1,10 +1,12 @@
 """
-Core data models for polybot_v2 Phase 1.
+Core data models for polybot_v2.
+Phase 2: maker-first evaluation data model with full quote lifecycle tracing.
 All domain objects live here; nothing imports from each other here.
 """
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 import time
@@ -138,7 +140,20 @@ class PaperTrade:
 
 @dataclass
 class ShadowQuote:
-    """A theoretical maker quote (no real order)."""
+    """
+    A theoretical maker quote (no real order). Phase 2: full evaluation lifecycle.
+
+    fill_status states:
+      pending           - quote is alive, waiting for fill or expiry
+      crossed_rejected  - quote crossed the book at placement (post-only rejected)
+      expired_unfilled  - TTL elapsed without a fill
+      filled            - best_ask touched quote_price within TTL (interim; pending adverse measure)
+      filled_adverse    - filled and next-tick mid moved against us
+      filled_favorable  - filled and next-tick mid moved in our favor
+      boundary_resolved - window ended while quote was still pending or in flight
+
+    Fields that cannot be computed until a later event are None (never default 0.0 to pollute data).
+    """
     ts: float
     window_ts: float
     seconds_to_expiry: float
@@ -147,17 +162,44 @@ class ShadowQuote:
     best_bid: float
     best_ask: float
     tick_size: float
-    crossed: bool                # would this quote cross the book?
-    fill_would_happen: bool      # was best bid/ask at or better than quote? (deprecated; use fill_status)
-    # Forward simulation result states:
-    #   pending           — quote is alive, waiting for fill or expiry
-    #   filled            — best_ask touched quote_price within TTL
-    #   expired           — TTL elapsed without a fill
-    #   crossed           — quote crossed the book at placement (would be taker)
-    #   adverse_fill      — filled and adverse move measured
+    crossed: bool                # would this quote cross the book? (retained for compat)
+    # fill_status is authoritative for lifecycle state
     fill_status: str = "pending"
     fill_ts: Optional[float] = None              # unix ts when fill condition was met
-    adverse_move_after_fill: Optional[float] = None   # price move post-fill (negative = adverse for buyer)
+    adverse_move_after_fill: Optional[float] = None   # price move post-fill (negative = adverse for YES buyer)
+
+    # ── Phase 2: quote identity ──────────────────────────────────────────
+    quote_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    market_slug: str = ""
+
+    # ── Phase 2: decision context (copied from SignalDecision at quote time) ──
+    regime: str = "UNKNOWN"
+    pattern: str = "UNKNOWN"
+    elapsed_from_window_start: float = 0.0
+    implied_yes_prob: float = 0.0
+    fair_yes_prob: float = 0.0
+    delta_raw_fraction: float = 0.0
+    delta_pct_display: float = 0.0
+    confidence_score: float = 0.0
+    confidence_components: str = ""
+
+    # ── Phase 2: maker economics at quote time ───────────────────────────
+    intended_passive_edge: Optional[float] = None   # fair_for_side - quote_price at placement
+    intended_notional: float = 1.0                  # reference notional USDC for PnL calc
+
+    # ── Phase 2: fill quality ────────────────────────────────────────────
+    fill_mid: Optional[float] = None                # mid at time of fill
+    next_mid_after_fill: Optional[float] = None     # mid on next tick after fill
+    favorable_move_after_fill: Optional[float] = None   # positive = favorable for our side
+
+    # ── Phase 2: boundary resolution ────────────────────────────────────
+    boundary_outcome_yes: Optional[float] = None    # 1.0 if BTC up, 0.0 if BTC down
+    boundary_outcome_for_side: Optional[float] = None   # outcome from our side's perspective
+    maker_pnl_if_held: Optional[float] = None       # per-share PnL if held to resolution
+    maker_edge_realized_vs_expected: Optional[float] = None  # realized - intended_passive_edge
+
+    # ── Phase 2: reject reason (when placement was rejected) ─────────────
+    reject_reason: Optional[str] = None             # why quote was rejected at build time
 
 
 @dataclass
@@ -181,19 +223,18 @@ class BankrollState:
 
 @dataclass
 class MetricsSnapshot:
-    """Aggregated session metrics."""
+    """Aggregated session metrics. Phase 2: maker-first evaluation metrics."""
     total_signals: int = 0
     taker_trade_count: int = 0
     taker_no_trade_count: int = 0
     no_trade_reasons: dict = field(default_factory=dict)
-    # Shadow quote state counters
+    # Taker shadow/shadow quote legacy counters (kept for compat)
     shadow_quote_count: int = 0
     shadow_pending_count: int = 0
     shadow_filled_count: int = 0
     shadow_expired_count: int = 0
     shadow_adverse_fill_count: int = 0
     shadow_crossed_count: int = 0
-    shadow_fillable_count: int = 0   # legacy: kept for compatibility
     # Reject counters
     stale_reject_count: int = 0
     spread_reject_count: int = 0
@@ -206,3 +247,30 @@ class MetricsSnapshot:
     fair_prob_distribution: list = field(default_factory=list)
     taker_win_count: int = 0
     taker_loss_count: int = 0
+    # ── Phase 2: Maker first-class metrics ──────────────────────────────
+    # maker_quote_count = quotes placed (pending + crossed_rejected)
+    maker_quote_count: int = 0
+    # maker_no_quote_count = signals where maker lane decided NO_QUOTE
+    maker_no_quote_count: int = 0
+    # placement lifecycle
+    maker_crossed_reject_count: int = 0
+    maker_pending_count: int = 0
+    # fill lifecycle
+    maker_fill_count: int = 0           # total fills (filled_adverse + filled_favorable)
+    maker_adverse_fill_count: int = 0
+    maker_favorable_fill_count: int = 0
+    # expiry
+    maker_expired_count: int = 0
+    # boundary resolution
+    maker_boundary_resolved_count: int = 0
+    maker_boundary_win_count: int = 0   # boundary_outcome_for_side == 1.0
+    maker_boundary_loss_count: int = 0  # boundary_outcome_for_side == 0.0
+    # PnL if held
+    maker_pnl_if_held_list: list = field(default_factory=list)
+    # Edge tracking (per-quote values for mean computation)
+    maker_expected_edge_list: list = field(default_factory=list)  # intended_passive_edge
+    maker_realized_edge_list: list = field(default_factory=list)  # maker_edge_realized_vs_expected
+    # Breakdown accumulators (side/regime/pattern -> fill counts, boundary wins)
+    maker_by_side: dict = field(default_factory=dict)
+    maker_by_regime: dict = field(default_factory=dict)
+    maker_by_pattern: dict = field(default_factory=dict)

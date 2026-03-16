@@ -22,7 +22,7 @@ def setup_console_logger(level: str = "INFO") -> None:
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(
         logging.Formatter(
-            fmt="%(asctime)s [%(levelname)-5s] %(name)s – %(message)s",
+            fmt="%(asctime)s [%(levelname)-5s] %(name)s - %(message)s",
             datefmt="%H:%M:%S",
         )
     )

@@ -408,8 +408,10 @@ class SignalEngine:
     ) -> SignalDecision:
         """
         Evaluate maker shadow probe lane.
+        Phase 2: explicit passive edge guard and full maker decision path.
         Returns SignalDecision with action SHADOW_QUOTE or NO_QUOTE.
         """
+        import math as _math
         ts = time.time()
         window_ts = market_snap.window_end_ts
         ste = market_snap.seconds_to_expiry
@@ -417,6 +419,11 @@ class SignalEngine:
         elapsed = self._cfg.window_sec - ste
         if elapsed < self._cfg.shadow_start_sec or elapsed > self._cfg.shadow_end_sec:
             return self._make_simple(ts, window_ts, "maker_shadow", "NO_QUOTE", "outside_shadow_window")
+
+        # Guard: minimum seconds to expiry — no point quoting in the last few seconds
+        if ste < self._cfg.maker_allowed_ste_min:
+            return self._make_simple(ts, window_ts, "maker_shadow", "NO_QUOTE",
+                                     f"ste_too_low({ste:.1f}<{self._cfg.maker_allowed_ste_min:.1f})")
 
         risk_dec = self._risk.check_shadow(
             state=risk_state,
@@ -436,7 +443,7 @@ class SignalEngine:
         except ValueError as exc:
             return self._make_simple(ts, window_ts, "maker_shadow", "NO_QUOTE", f"fair_prob_error({exc})")
 
-        # Shadow: we want to be a maker on the side where we have edge
+        # Compute edge (for logging context, not the primary maker gate)
         yes_edge, no_edge = self._edge.compute(
             fair_yes_prob=fair_result.fair_yes_prob,
             fair_no_prob=fair_result.fair_no_prob,
@@ -444,15 +451,20 @@ class SignalEngine:
             best_ask_no=market_snap.best_ask_no,
         )
 
-        # For maker shadow, pick the side where fair_prob gives us theoretical edge
-        # as a passive liquidity provider (buying below fair value)
-        if fair_result.fair_yes_prob > market_snap.implied_yes_prob:
+        # Determine candidate side: the side where fair > implied (we're underpriced as maker)
+        implied_yes = market_snap.implied_yes_prob
+        fair_yes = fair_result.fair_yes_prob
+        fair_no = fair_result.fair_no_prob
+        implied_no = 1.0 - implied_yes
+
+        if fair_yes > implied_yes and (fair_yes - implied_yes) >= (fair_no - implied_no):
             chosen_side = "yes"
-        elif fair_result.fair_no_prob > (1 - market_snap.implied_yes_prob):
+        elif fair_no > implied_no:
             chosen_side = "no"
         else:
             return self._make_simple(ts, window_ts, "maker_shadow", "NO_QUOTE", "no_maker_edge")
 
+        # Classify regime and pattern BEFORE passive edge guard so NO_QUOTE carries context
         regime = _classify_regime(
             fair_result.delta_pct, fair_result.fair_yes_prob,
             self._cfg.extreme_upper, self._cfg.extreme_lower,
@@ -469,16 +481,92 @@ class SignalEngine:
 
         shadow_confidence, shadow_conf_components = _compute_confidence(
             fair_yes_prob=fair_result.fair_yes_prob,
-            implied_yes_prob=market_snap.implied_yes_prob,
+            implied_yes_prob=implied_yes,
             delta_pct=fair_result.delta_pct,
             regime=regime,
             pattern=pattern,
             min_edge=self._edge._min_edge,
             min_abs_delta=self._cfg.min_abs_delta_for_taker,
         )
+
+        # Compute passive quote price explicitly (mirror of what MakerShadowProbe will do)
+        implied_prob_for_tick = market_snap.implied_yes_prob
+        tick_size = (
+            self._cfg.extreme_tick_size
+            if (implied_prob_for_tick >= self._cfg.extreme_upper
+                or implied_prob_for_tick <= self._cfg.extreme_lower)
+            else self._cfg.default_tick_size
+        )
+        if chosen_side == "yes":
+            raw_bid = market_snap.best_bid_yes
+            best_ask_for_side = market_snap.best_ask_yes
+            fair_for_side = fair_yes
+        else:
+            raw_bid = market_snap.best_bid_no
+            best_ask_for_side = market_snap.best_ask_no
+            fair_for_side = fair_no
+
+        quote_price = (
+            _math.floor(raw_bid / tick_size) * tick_size if tick_size > 0 else raw_bid
+        )
+
+        # Guard: degenerate book for maker side
+        if raw_bid <= 0 or best_ask_for_side <= 0 or raw_bid >= best_ask_for_side:
+            return self._make_decision(
+                ts=ts, window_ts=window_ts, lane="maker_shadow",
+                action="NO_QUOTE",
+                chosen_side=None,
+                reason=f"maker_degenerate_book(bid={raw_bid:.4f} ask={best_ask_for_side:.4f})",
+                price_snap=price_snap, market_snap=market_snap,
+                window_open=window_open, fair_result=fair_result,
+                yes_edge=yes_edge, no_edge=no_edge,
+                bankroll_state=bankroll_state, binance_age_ms=binance_age_ms,
+                regime=regime, pattern=pattern, confidence=shadow_confidence,
+                confidence_components=shadow_conf_components,
+            )
+
+        # Guard: maker spread
+        maker_spread = best_ask_for_side - raw_bid
+        if maker_spread > self._cfg.max_spread_maker:
+            return self._make_decision(
+                ts=ts, window_ts=window_ts, lane="maker_shadow",
+                action="NO_QUOTE",
+                chosen_side=None,
+                reason=f"maker_spread_too_wide(spread={maker_spread:.4f}>max={self._cfg.max_spread_maker:.4f})",
+                price_snap=price_snap, market_snap=market_snap,
+                window_open=window_open, fair_result=fair_result,
+                yes_edge=yes_edge, no_edge=no_edge,
+                bankroll_state=bankroll_state, binance_age_ms=binance_age_ms,
+                regime=regime, pattern=pattern, confidence=shadow_confidence,
+                confidence_components=shadow_conf_components,
+            )
+
+        # Guard: minimum passive edge
+        passive_edge = fair_for_side - quote_price
+        if passive_edge < self._cfg.min_passive_edge:
+            return self._make_decision(
+                ts=ts, window_ts=window_ts, lane="maker_shadow",
+                action="NO_QUOTE",
+                chosen_side=None,
+                reason=(
+                    f"min_passive_edge_reject("
+                    f"edge={passive_edge:.4f}<thr={self._cfg.min_passive_edge:.4f})"
+                ),
+                price_snap=price_snap, market_snap=market_snap,
+                window_open=window_open, fair_result=fair_result,
+                yes_edge=yes_edge, no_edge=no_edge,
+                bankroll_state=bankroll_state, binance_age_ms=binance_age_ms,
+                regime=regime, pattern=pattern, confidence=shadow_confidence,
+                confidence_components=shadow_conf_components,
+            )
+
         return self._make_decision(
             ts=ts, window_ts=window_ts, lane="maker_shadow",
-            action="SHADOW_QUOTE", chosen_side=chosen_side, reason="shadow_edge_identified",
+            action="SHADOW_QUOTE", chosen_side=chosen_side,
+            reason=(
+                f"maker_edge_ok(passive={passive_edge:.4f}"
+                f" side={chosen_side} regime={regime})"
+            ),
             price_snap=price_snap, market_snap=market_snap,
             window_open=window_open, fair_result=fair_result,
             yes_edge=yes_edge, no_edge=no_edge,

@@ -218,6 +218,23 @@ class Settings:
     def quote_ttl_sec(self) -> float:
         return float(self._raw["maker_shadow"].get("quote_ttl_sec", 20.0))
 
+    # Phase 2 maker evaluation guards
+    @property
+    def min_passive_edge(self) -> float:
+        return float(self._raw["maker_shadow"].get("min_passive_edge", 0.02))
+
+    @property
+    def max_spread_maker(self) -> float:
+        return float(self._raw["maker_shadow"].get("max_spread_maker", 0.06))
+
+    @property
+    def maker_allowed_ste_min(self) -> float:
+        return float(self._raw["maker_shadow"].get("allowed_ste_min", 15.0))
+
+    @property
+    def maker_intended_notional(self) -> float:
+        return float(self._raw["maker_shadow"].get("intended_notional", 1.0))
+
     # Signal thresholds (regime/pattern classifiers)
     def _sig(self, key: str, default: float) -> float:
         return float(self._raw.get("signal", {}).get(key, default))
