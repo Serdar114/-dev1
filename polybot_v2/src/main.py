@@ -71,6 +71,7 @@ def build_market_snapshot(
         best_ask_no=ask_no,
         last_trade_price_yes=last_price,
         window_end_ts=market_info.window_end_ts,
+        slug=market_info.slug,
     )
 
 
@@ -497,21 +498,64 @@ class PolybotV2:
         Returns a reject reason string if market should be skipped, else None.
         Stores numerical diagnostics in self._last_sanity_details for UI display.
         """
-        yes_mid = market.implied_yes_prob
-        no_mid = (market.best_bid_no + market.best_ask_no) / 2.0 if (
-            market.best_bid_no > 0 and market.best_ask_no > 0
-        ) else 0.5
-        spread_yes = market.best_ask_yes - market.best_bid_yes
-        spread_no = market.best_ask_no - market.best_bid_no
+        # ── Degenerate book guard ─────────────────────────────────────────
+        # Must run BEFORE mid computations to avoid logging internally
+        # inconsistent fields (raw bid/ask contradicting the fallback mid).
+        bid_yes = market.best_bid_yes
+        ask_yes = market.best_ask_yes
+        bid_no  = market.best_bid_no
+        ask_no  = market.best_ask_no
+        if bid_yes <= 0 or ask_yes <= 0 or bid_yes >= ask_yes:
+            reason = (
+                f"degenerate_book_reject(yes_bid={bid_yes:.4f}"
+                f" yes_ask={ask_yes:.4f})"
+            )
+            self._last_sanity_details = {
+                "yes_bid": bid_yes, "yes_ask": ask_yes,
+                "no_bid": bid_no, "no_ask": ask_no,
+                "yes_mid": None, "no_mid": None,
+                "midpoint_sum": None, "spread_yes": None, "spread_no": None,
+                "complement_skew": None,
+                "spread_threshold": self._cfg.max_spread_warn,
+                "skew_threshold": self._cfg.max_complement_skew,
+                "reject": reason,
+            }
+            log.warning("Market sanity REJECT: %s", reason)
+            return reason
+        if bid_no <= 0 or ask_no <= 0 or bid_no >= ask_no:
+            reason = (
+                f"degenerate_book_reject(no_bid={bid_no:.4f}"
+                f" no_ask={ask_no:.4f})"
+            )
+            self._last_sanity_details = {
+                "yes_bid": bid_yes, "yes_ask": ask_yes,
+                "no_bid": bid_no, "no_ask": ask_no,
+                "yes_mid": None, "no_mid": None,
+                "midpoint_sum": None, "spread_yes": None, "spread_no": None,
+                "complement_skew": None,
+                "spread_threshold": self._cfg.max_spread_warn,
+                "skew_threshold": self._cfg.max_complement_skew,
+                "reject": reason,
+            }
+            log.warning("Market sanity REJECT: %s", reason)
+            return reason
+
+        # ── Mid computations — derived directly from raw quotes ───────────
+        # Never use implied_yes_prob (which has a silent 0.5 fallback) so that
+        # yes_mid in diagnostics is always consistent with yes_bid/yes_ask.
+        yes_mid = (bid_yes + ask_yes) / 2.0
+        no_mid  = (bid_no  + ask_no)  / 2.0
+        spread_yes = ask_yes - bid_yes
+        spread_no  = ask_no  - bid_no
         midpoint_sum = yes_mid + no_mid
         skew = abs(midpoint_sum - 1.0)
 
         # Always update diagnostics so UI shows current numbers
         self._last_sanity_details = {
-            "yes_bid": market.best_bid_yes,
-            "yes_ask": market.best_ask_yes,
-            "no_bid": market.best_bid_no,
-            "no_ask": market.best_ask_no,
+            "yes_bid": bid_yes,
+            "yes_ask": ask_yes,
+            "no_bid": bid_no,
+            "no_ask": ask_no,
             "yes_mid": yes_mid,
             "no_mid": no_mid,
             "midpoint_sum": midpoint_sum,
