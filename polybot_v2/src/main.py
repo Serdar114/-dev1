@@ -613,7 +613,7 @@ class PolybotV2:
         new_window_end: end timestamp of the new (current) window.
         """
         log.info(
-            "Window boundary crossed: %.0f → %.0f (boundary_ts=%.0f)",
+            "Window boundary crossed: %.0f -> %.0f (boundary_ts=%.0f)",
             self._last_window_ts, new_window_end, boundary_ts,
         )
 
@@ -708,6 +708,13 @@ class PolybotV2:
         def _or_null(v, precision: int = 5):
             return round(v, precision) if fc else None
 
+        # Helper: round only if value is not None — sd fields may legitimately be None
+        # (e.g. degenerate book path sets spread/mid/skew to None).
+        # sd.get(key, 0.0) does NOT protect against this: if key exists with None,
+        # .get() returns None, not the default.
+        def _rn(v, precision: int = 5):
+            return round(v, precision) if v is not None else None
+
         self._structured.log("signals", {
             # ── Identity ──────────────────────────────────────────────
             "ts": d.ts,
@@ -728,11 +735,11 @@ class PolybotV2:
             "yes_ask": sd.get("yes_ask"),
             "no_bid":  sd.get("no_bid"),
             "no_ask":  sd.get("no_ask"),
-            "yes_mid": sd.get("yes_mid"),
-            "no_mid":  sd.get("no_mid"),
-            "spread_yes": round(sd.get("spread_yes", 0.0), 5) if sd else None,
-            "spread_no":  round(sd.get("spread_no",  0.0), 5) if sd else None,
-            "complement_skew": round(sd.get("complement_skew", 0.0), 5) if sd else None,
+            "yes_mid": _rn(sd.get("yes_mid"), 4),
+            "no_mid":  _rn(sd.get("no_mid"),  4),
+            "spread_yes":      _rn(sd.get("spread_yes"),      5),
+            "spread_no":       _rn(sd.get("spread_no"),       5),
+            "complement_skew": _rn(sd.get("complement_skew"), 5),
             # ── Market sanity ─────────────────────────────────────────
             "sanity_status": "reject" if sd.get("reject") else "pass",
             "sanity_reason": sd.get("reject"),

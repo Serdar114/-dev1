@@ -1,6 +1,7 @@
 """
-Tests for main.py: build_market_snapshot slug propagation and
-_sanity_check_market degenerate-book / mid-consistency behaviour.
+Tests for main.py: build_market_snapshot slug propagation,
+_sanity_check_market degenerate-book / mid-consistency behaviour,
+and _log_signal null-safety.
 """
 import sys, time
 from pathlib import Path
@@ -203,3 +204,91 @@ class TestSanityMidConsistency:
         sd = bot._last_sanity_details
         expected_skew = abs((0.50 + 0.52) / 2 + (0.51 + 0.53) / 2 - 1.0)
         assert sd["complement_skew"] == pytest.approx(expected_skew, abs=1e-6)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# D) _log_signal null-safety: degenerate book must not crash round()
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestLogSignalNullSafe:
+    """
+    After a degenerate_book_reject, _last_sanity_details contains
+    spread_yes=None, spread_no=None, complement_skew=None, yes_mid=None,
+    no_mid=None.  The previous code did round(sd.get("spread_yes", 0.0), 5)
+    which returned None (key exists) and then round(None, 5) threw TypeError.
+    """
+
+    def _make_logged_signals(self, bot, decision):
+        """Run _log_signal and return the captured JSONL record (no real file I/O)."""
+        captured = {}
+
+        class _CapturingLogger:
+            def log(self, channel, record):
+                captured.update(record)
+
+        bot._structured = _CapturingLogger()
+        bot._current_market = None
+        bot._log_signal(decision)
+        return captured
+
+    def _make_decision_for_bot(self):
+        """Minimal SignalDecision with degenerate-book context."""
+        from models import SignalDecision
+        return SignalDecision(
+            ts=time.time(), window_ts=time.time() + 150,
+            lane="selective_taker", action="NO_TRADE",
+            chosen_side=None, reason="degenerate_book_reject(yes_bid=0.0000 yes_ask=0.0100)",
+            seconds_to_expiry=150.0,
+            elapsed_from_window_start=30.0,
+            btc_mid=84000.0, window_open=84000.0,
+            delta_pct=0.0, delta_raw_fraction=0.0, delta_pct_display=0.0,
+            realized_vol_60s=0.001,
+            implied_yes_prob=0.5,
+            fair_computed_fresh=False, context_from_cache=False,
+        )
+
+    def test_degenerate_book_no_crash_on_log_signal(self):
+        """_log_signal must not raise TypeError when spread/mid/skew are None in sd."""
+        bot = make_bot()
+        # Seed _last_sanity_details exactly as degenerate path produces it
+        bot._last_sanity_details = {
+            "yes_bid": 0.0, "yes_ask": 0.01,
+            "no_bid": 0.48, "no_ask": 0.52,
+            "yes_mid": None, "no_mid": None,
+            "midpoint_sum": None, "spread_yes": None, "spread_no": None,
+            "complement_skew": None,
+            "spread_threshold": 0.05, "skew_threshold": 0.05,
+            "reject": "degenerate_book_reject(yes_bid=0.0000 yes_ask=0.0100)",
+        }
+        decision = self._make_decision_for_bot()
+        # Must not raise — this was the crash site
+        record = self._make_logged_signals(bot, decision)
+        assert record["spread_yes"] is None
+        assert record["spread_no"] is None
+        assert record["complement_skew"] is None
+        assert record["yes_mid"] is None
+        assert record["no_mid"] is None
+        assert record["sanity_status"] == "reject"
+
+    def test_valid_book_spread_rounded(self):
+        """After a normal sanity pass, spread fields are numeric and rounded."""
+        bot = make_bot()
+        market = make_market(bid_yes=0.4712345, ask_yes=0.5287655)
+        bot._sanity_check_market(market)
+        decision = self._make_decision_for_bot()
+        decision.implied_yes_prob = market.implied_yes_prob
+        record = self._make_logged_signals(bot, decision)
+        assert record["spread_yes"] is not None
+        assert isinstance(record["spread_yes"], float)
+        # 5 decimal places
+        assert record["spread_yes"] == round(0.5287655 - 0.4712345, 5)
+
+    def test_yes_mid_rounded_on_valid_book(self):
+        """yes_mid is rounded to 4dp on a valid book."""
+        bot = make_bot()
+        market = make_market(bid_yes=0.4812345, ask_yes=0.5187655)
+        bot._sanity_check_market(market)
+        decision = self._make_decision_for_bot()
+        record = self._make_logged_signals(bot, decision)
+        expected = round((0.4812345 + 0.5187655) / 2.0, 4)
+        assert record["yes_mid"] == expected
