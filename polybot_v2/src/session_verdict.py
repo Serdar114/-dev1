@@ -65,7 +65,7 @@ def _build_taker_summary(
     candidate_yes_count = sum(1 for r in candidate_sigs if r.get("chosen_side") == "yes")
     candidate_no_count = sum(1 for r in candidate_sigs if r.get("chosen_side") == "no")
 
-    # Candidate edge — from PAPER_TRADE signals directly
+    # Candidate edge  - from PAPER_TRADE signals directly
     cand_afe_list: list[float] = []
     for r in candidate_sigs:
         side = r.get("chosen_side")
@@ -142,7 +142,7 @@ def _build_taker_summary(
         reason = r.get("reason") or "unknown"
         reason_counts[reason] = reason_counts.get(reason, 0) + 1
 
-    # Entry blocker breakdown — canonical keys
+    # Entry blocker breakdown  - canonical keys
     blocker_keys = [
         "position_policy:max_open_trades(1)",
         "outside_entry_window",
@@ -169,7 +169,7 @@ def _build_taker_summary(
         "execution_mode": execution_mode,
         "signal_count": signal_count,
         "no_trade_count": no_trade_count,
-        # Candidate fields — from signals.jsonl; populated regardless of execution state.
+        # Candidate fields  - from signals.jsonl; populated regardless of execution state.
         # When execution_mode="candidate_only", these are the primary taker evidence.
         "paper_trade_candidate_count": candidate_count,
         "paper_trade_candidate_yes_count": candidate_yes_count,
@@ -177,7 +177,7 @@ def _build_taker_summary(
         "candidate_reason_breakdown": candidate_reason_breakdown,
         "candidate_avg_after_fee_edge_pct": candidate_avg_after_fee_edge_pct,
         "candidate_avg_entry_second_into_window": candidate_avg_entry_sec,
-        # Execution fields — from paper_trades.jsonl; meaningful only when execution active.
+        # Execution fields  - from paper_trades.jsonl; meaningful only when execution active.
         "trade_open_count": trade_open_count,
         "trade_resolve_count": trade_resolve_count,
         "win_count": win_count,
@@ -439,13 +439,13 @@ def _build_regime_bias_note(taker: dict, maker: dict) -> dict:
             signal_side_bias = f"YES-biased ({yes_signal_frac:.0%} of {cand_total} candidates)"
             notes.append(
                 f"Signal distribution is YES-biased: {cand_yes}/{cand_total} "
-                f"candidates chose YES — possible bullish BTC regime during sample"
+                f"candidates chose YES  - possible bullish BTC regime during sample"
             )
         elif yes_signal_frac < 0.35:
             signal_side_bias = f"NO-biased ({1 - yes_signal_frac:.0%} of {cand_total} candidates)"
             notes.append(
                 f"Signal distribution is NO-biased: {cand_no}/{cand_total} "
-                f"candidates chose NO — possible bearish BTC regime during sample"
+                f"candidates chose NO  - possible bearish BTC regime during sample"
             )
         else:
             signal_side_bias = f"balanced ({yes_signal_frac:.0%} YES / {1-yes_signal_frac:.0%} NO)"
@@ -485,14 +485,14 @@ def _build_regime_bias_note(taker: dict, maker: dict) -> dict:
                 side_asymmetry_assessment = "likely_regime_artifact"
                 notes.append(
                     f"YES maker pnl_mean={yes_pnl:+.4f} > NO pnl_mean={no_pnl:+.4f}, "
-                    "AND fills are YES-biased — side asymmetry is likely a sample/regime "
+                    "AND fills are YES-biased  - side asymmetry is likely a sample/regime "
                     "artifact. Do NOT interpret as structural YES edge."
                 )
             else:
                 side_asymmetry_assessment = "possible_structural_requires_more_data"
                 notes.append(
                     f"YES maker pnl_mean={yes_pnl:+.4f} > NO pnl_mean={no_pnl:+.4f} "
-                    "with balanced fill distribution — may have structural component; "
+                    "with balanced fill distribution  - may have structural component; "
                     "requires balanced-regime sample to confirm."
                 )
         elif no_pnl > yes_pnl:
@@ -577,7 +577,7 @@ def _build_verdict(
             reasons.append(
                 f"taker: execution disabled; {candidate_count} candidates generated "
                 f"(yes={cand_yes}, no={cand_no}); "
-                "no economic verdict possible without execution — "
+                "no economic verdict possible without execution  - "
                 "candidate data shows signal engine activity only"
             )
     elif n_resolved == 0:
@@ -631,7 +631,7 @@ def _build_verdict(
     else:
         maker_status = "conditionally_researchable"
         reasons.append(
-            f"maker: win_rate={bwr:.3f} mean_pnl={mean_pnl:.4f} adverse={adverse_ratio:.3f} — thresholds met"
+            f"maker: win_rate={bwr:.3f} mean_pnl={mean_pnl:.4f} adverse={adverse_ratio:.3f}  - thresholds met"
         )
 
     # --- Live candidate ---
@@ -657,18 +657,18 @@ def _build_verdict(
 
     if fill_count > 0 and (bwr is None or bwr < 0.5):
         strongest_false_hope = (
-            "maker fills are occurring but boundary_win_rate < 0.5 — "
+            "maker fills are occurring but boundary_win_rate < 0.5  - "
             "adverse selection dominates any fill activity"
         )
     if mean_pnl is not None and mean_pnl < 0:
         strongest_false_hope = (
-            "maker shows fills but mean_pnl_if_held is negative — "
+            "maker shows fills but mean_pnl_if_held is negative  - "
             "quoting at these prices destroys value on average"
         )
 
     if fill_count > 0 and adverse_ratio is not None and adverse_ratio < max_adv:
         strongest_real_opportunity = (
-            f"maker adverse_fill_ratio={adverse_ratio:.3f} is within acceptable range — "
+            f"maker adverse_fill_ratio={adverse_ratio:.3f} is within acceptable range  - "
             "structure allows further evaluation with more data"
         )
     if (
@@ -678,7 +678,7 @@ def _build_verdict(
     ):
         strongest_real_opportunity = (
             f"maker has {resolved_fills} resolved fills with "
-            f"boundary_win_rate={bwr:.3f} — warrants controlled expansion of evaluation sample"
+            f"boundary_win_rate={bwr:.3f}  - warrants controlled expansion of evaluation sample"
         )
 
     return {
@@ -714,7 +714,7 @@ def _render_txt(
     lines.append(f"  Signals evaluated    : {taker['signal_count']}")
     lines.append(f"  No-trade decisions   : {taker['no_trade_count']}")
 
-    # Candidate block — always shown; primary taker evidence when execution disabled
+    # Candidate block  - always shown; primary taker evidence when execution disabled
     cand_count = taker.get("paper_trade_candidate_count", 0)
     cand_yes = taker.get("paper_trade_candidate_yes_count", 0)
     cand_no = taker.get("paper_trade_candidate_no_count", 0)
@@ -737,7 +737,7 @@ def _render_txt(
             "        No economic verdict possible from taker until execution is re-enabled."
         )
 
-    # Executed trade block — meaningful only when execution active
+    # Executed trade block  - meaningful only when execution active
     lines.append(f"  Trades opened        : {taker['trade_open_count']}")
     lines.append(f"  Trades resolved      : {taker['trade_resolve_count']}")
     lines.append(f"  Win / Loss           : {taker['win_count']} / {taker['loss_count']}")
@@ -811,14 +811,14 @@ def _render_txt(
         if yes_pnl is not None and no_pnl is not None:
             if yes_pnl > no_pnl:
                 lines.append(
-                    "  → In this sample YES-side appears better than NO-side."
+                    "  -> In this sample YES-side appears better than NO-side."
                 )
             elif no_pnl > yes_pnl:
                 lines.append(
-                    "  → In this sample NO-side appears better than YES-side."
+                    "  -> In this sample NO-side appears better than YES-side."
                 )
             else:
-                lines.append("  → YES/NO sides roughly equal in this sample.")
+                lines.append("  -> YES/NO sides roughly equal in this sample.")
     else:
         lines.append("  YES/NO side breakdown: insufficient fill data")
 
@@ -921,9 +921,9 @@ def build_session_summary(
     with open(json_path, "w") as fh:
         json.dump(summary, fh, indent=2, default=str)
 
-    # Write TXT
+    # Write TXT  - explicit utf-8 encoding for Windows cp125x compatibility
     txt_path = log_dir / "session_summary.txt"
-    with open(txt_path, "w") as fh:
+    with open(txt_path, "w", encoding="utf-8") as fh:
         fh.write(_render_txt(taker, maker, verdict, session_ts, regime_bias=regime_bias))
 
     return summary

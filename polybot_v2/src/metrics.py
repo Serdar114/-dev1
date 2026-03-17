@@ -77,20 +77,33 @@ class MetricsCollector:
             self._data.maker_expected_edge_list.append(quote.intended_passive_edge)
 
     def on_shadow_state_change(self, quote: ShadowQuote) -> None:
-        """Called when process_pending() yields a completed quote."""
+        """Called when process_pending() yields a completed quote.
+
+        NOTE: process_pending() emits the same physical quote TWICE for a full-lifecycle
+        fill: first as "filled" (intermediate, queued for next-tick measurement) and then
+        as "filled_adverse" or "filled_favorable" (terminal, after next-tick measurement).
+        To avoid double-counting, fill counts are incremented ONLY at terminal states.
+        Quotes that hit boundary while still in "filled" state (never measured) are
+        counted separately in on_boundary_resolved.
+        """
         status = quote.fill_status
         # --- Legacy shadow counters (kept for compat) ---
-        if status in ("filled", "filled_adverse", "filled_favorable"):
+        # Count only terminal fill states to avoid double-counting with "filled" intermediate.
+        if status in ("filled_adverse", "filled_favorable"):
             self._data.shadow_filled_count += 1
+        if status == "filled_adverse":
+            self._data.shadow_adverse_fill_count += 1
         elif status == "expired_unfilled":
             self._data.shadow_expired_count += 1
-        elif status in ("filled_adverse",):
-            self._data.shadow_adverse_fill_count += 1
         elif status == "crossed_rejected":
             self._data.shadow_crossed_count += 1
 
         # --- Phase 2 maker metrics ---
-        if status in ("filled", "filled_adverse", "filled_favorable"):
+        # Count only terminal fill states ("filled_adverse", "filled_favorable").
+        # "filled" is an intermediate state; the same quote will emit a terminal state
+        # on the next tick. Boundary-cut fills (status="filled" at window end) are
+        # counted in on_boundary_resolved instead.
+        if status in ("filled_adverse", "filled_favorable"):
             self._data.maker_fill_count += 1
         if status == "filled_adverse":
             self._data.maker_adverse_fill_count += 1
@@ -107,8 +120,20 @@ class MetricsCollector:
         """
         Called for each quote returned from MakerShadowProbe.resolve_boundary().
         Updates boundary outcome tracking and PnL-if-held aggregation.
+
+        Boundary-cut fills: quotes that fill but hit the window boundary before the
+        next-tick adverse/favorable measurement completes keep fill_status="filled".
+        These are not counted by on_shadow_state_change (which only counts terminal
+        states), so we count them here exactly once.
         """
         self._data.maker_boundary_resolved_count += 1
+
+        # Count fills that were boundary-cut before quality measurement.
+        # fill_status="filled" means the quote filled but the window ended before
+        # the next tick could classify it as filled_adverse or filled_favorable.
+        if quote.fill_status == "filled":
+            self._data.maker_fill_count += 1
+            self._data.shadow_filled_count += 1
 
         outcome = quote.boundary_outcome_for_side
         if outcome is not None:

@@ -716,15 +716,19 @@ class TestMetricsAggregation:
         assert snap["maker_no_quote_count"] == 1
 
     def test_maker_fill_count_increments(self):
+        # Full lifecycle: pending -> filled (intermediate) -> filled_adverse (terminal).
+        # fill should be counted ONCE, at the terminal state only.
         m = MetricsCollector()
         q = self._make_shadow_quote(fill_status="pending")
         m.on_shadow_fill(q)
+        # Intermediate "filled" — must NOT increment maker_fill_count
         filled = replace(q, fill_status="filled")
         m.on_shadow_state_change(filled)
+        # Terminal "filled_adverse" — increments maker_fill_count exactly once
         adverse = replace(q, fill_status="filled_adverse")
         m.on_shadow_state_change(adverse)
         snap = m.snapshot()
-        assert snap["maker_fill_count"] == 2
+        assert snap["maker_fill_count"] == 1  # one fill, not two (was 2 before bug fix)
         assert snap["maker_adverse_fill_count"] == 1
 
     def test_maker_expired_count_increments(self):
@@ -785,6 +789,55 @@ class TestMetricsAggregation:
         assert snap["maker_pnl_if_held_total"] == pytest.approx(0.60 - 0.40 + 0.60, abs=1e-5)
         assert snap["maker_pnl_if_held_avg"] == pytest.approx((0.60 - 0.40 + 0.60) / 3.0, abs=1e-5)
 
+    def test_fill_count_not_double_counted_across_lifecycle(self):
+        """Regression: pending->filled->filled_adverse lifecycle counts as ONE fill, not two."""
+        m = MetricsCollector()
+        q = self._make_shadow_quote(fill_status="pending")
+        m.on_shadow_fill(q)
+        # Intermediate state emitted first by process_pending
+        m.on_shadow_state_change(replace(q, fill_status="filled"))
+        # Terminal state emitted on next tick by process_pending
+        m.on_shadow_state_change(replace(q, fill_status="filled_adverse"))
+        snap = m.snapshot()
+        # fill_rate = maker_fill_count / maker_pending_count = 1/1 = 1.0 (not > 1)
+        assert snap["maker_fill_count"] == 1
+        assert snap["maker_fill_rate"] <= 1.0
+
+    def test_fill_rate_never_exceeds_one(self):
+        """Regression: fill_rate must always be <= 1.0 regardless of lifecycle events."""
+        m = MetricsCollector()
+        # 3 pending quotes
+        for _ in range(3):
+            q = self._make_shadow_quote(fill_status="pending")
+            m.on_shadow_fill(q)
+        # All 3 fill through full lifecycle (would have been 6 fills before fix)
+        for _ in range(3):
+            q = self._make_shadow_quote(fill_status="pending")
+            m.on_shadow_state_change(replace(q, fill_status="filled"))
+            m.on_shadow_state_change(replace(q, fill_status="filled_adverse"))
+        snap = m.snapshot()
+        assert snap["maker_fill_rate"] <= 1.0
+        assert snap["maker_fill_count"] == 3
+
+    def test_boundary_cut_fill_counted_once_in_on_boundary_resolved(self):
+        """A quote that fills but hits boundary before quality measurement is counted once."""
+        m = MetricsCollector()
+        q = self._make_shadow_quote(fill_status="pending")
+        m.on_shadow_fill(q)
+        # Fill occurs but boundary arrives before next-tick measurement
+        m.on_shadow_state_change(replace(q, fill_status="filled"))  # NOT counted here
+        # Boundary resolution: fill_status remains "filled" (not measured)
+        boundary_q = replace(
+            q,
+            fill_status="filled",
+            boundary_outcome_yes=1.0,
+            boundary_outcome_for_side=1.0,
+            maker_pnl_if_held=0.60,
+        )
+        m.on_boundary_resolved(boundary_q)
+        snap = m.snapshot()
+        assert snap["maker_fill_count"] == 1  # counted once, in on_boundary_resolved
+
     def test_by_side_breakdown_populated(self):
         m = MetricsCollector()
         q = self._make_shadow_quote(side="yes")
@@ -813,12 +866,13 @@ class TestMetricsAggregation:
 
     def test_fill_rate_computed(self):
         m = MetricsCollector()
-        # 2 pending, 1 fills
+        # 2 pending, 1 fills completely (terminal state = filled_adverse after measurement)
         for _ in range(2):
             q = self._make_shadow_quote(fill_status="pending")
             m.on_shadow_fill(q)
-        filled = self._make_shadow_quote(fill_status="filled")
-        m.on_shadow_state_change(filled)
+        # Use terminal fill state, not intermediate "filled"
+        filled_final = self._make_shadow_quote(fill_status="filled_adverse")
+        m.on_shadow_state_change(filled_final)
         snap = m.snapshot()
         assert snap["maker_fill_rate"] == pytest.approx(1 / 2, abs=1e-3)
 

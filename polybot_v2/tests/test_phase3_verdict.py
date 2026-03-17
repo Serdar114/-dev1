@@ -547,6 +547,45 @@ class TestBuildSessionSummaryIO:
         assert "MAKER" in txt
         assert "PROVISIONAL VERDICT" in txt
 
+    def test_txt_file_is_ascii_safe(self, tmp_path):
+        """session_summary.txt must contain only ASCII characters for Windows compatibility."""
+        cfg = Settings(CONFIG_PATH)
+        signals = [
+            {"lane": "selective_taker", "action": "PAPER_TRADE",
+             "chosen_side": "yes", "after_fee_edge_yes": 0.06,
+             "elapsed_from_window_start": 55.0},
+            {"lane": "selective_taker", "action": "PAPER_TRADE",
+             "chosen_side": "no", "after_fee_edge_no": 0.04,
+             "elapsed_from_window_start": 60.0},
+        ]
+        quotes = [
+            {"quote_id": "q1", "fill_status": "filled_favorable", "side": "yes",
+             "regime": "TRENDING", "seconds_to_expiry": 80.0,
+             "intended_passive_edge": 0.10, "maker_pnl_if_held": 0.50,
+             "boundary_outcome_for_side": 1.0},
+            {"quote_id": "q2", "fill_status": "filled_adverse", "side": "no",
+             "regime": "CHOP", "seconds_to_expiry": 40.0,
+             "intended_passive_edge": 0.05, "maker_pnl_if_held": -0.30,
+             "boundary_outcome_for_side": 0.0},
+        ]
+        for fname, records in [
+            ("signals.jsonl", signals),
+            ("paper_trades.jsonl", []),
+            ("shadow_quotes.jsonl", quotes),
+            ("bankroll.jsonl", []),
+        ]:
+            with open(tmp_path / fname, "w") as fh:
+                for r in records:
+                    fh.write(json.dumps(r) + "\n")
+
+        build_session_summary(tmp_path, cfg, session_ts="20260317_100000")
+        txt = (tmp_path / "session_summary.txt").read_text(encoding="utf-8")
+        # Every character must be encodable as ASCII (Windows cp125x safe)
+        try:
+            txt.encode("ascii")
+        except UnicodeEncodeError as e:
+            pytest.fail(f"session_summary.txt contains non-ASCII character: {e}")
+
     def test_handles_missing_files_gracefully(self, tmp_path):
         cfg = Settings(CONFIG_PATH)
         # No files at all — should not raise, should write empty summaries
