@@ -1,0 +1,142 @@
+app:
+  mode: paper_with_shadow_probe   # paper | paper_with_shadow_probe
+  log_level: INFO
+  # Taker execution mode separation (Phase 3)
+  # taker_signal_eval_enabled: if true, taker fair/edge/confidence logic runs and
+  #   logs into signals.jsonl regardless of paper execution setting.
+  # taker_paper_execution_enabled: if false, taker PAPER_TRADE decisions do NOT
+  #   open trades or affect bankroll. Use false to demote taker to diagnostic-only.
+  taker_signal_eval_enabled: true
+  taker_paper_execution_enabled: true
+
+market:
+  symbol: BTCUSDT
+  window_sec: 300                 # 5-minute window
+  # entry_start_sec / entry_end_sec: seconds ELAPSED from window START (T+0).
+  # e.g. entry_start_sec=30 means entry opens 30s after window starts.
+  # These are NOT seconds_to_expiry — they measure forward from the open.
+  entry_start_sec: 30             # open taker entry from T+30s into window
+  entry_end_sec: 240              # close taker entry at T+240s (60s buffer before close)
+  # shadow_start_sec / shadow_end_sec: same convention (elapsed from window start).
+  shadow_start_sec: 10            # shadow probe from T+10s into window
+  shadow_end_sec: 270             # shadow probe until T+270s (30s buffer before close)
+  # Adaptive Polymarket refresh cadence:
+  #   During active window (inside entry/shadow bounds) refresh aggressively.
+  #   Outside active window, refresh slowly to avoid rate limits.
+  refresh_active_sec: 2.0         # refresh interval when inside active window
+  refresh_inactive_sec: 15.0      # refresh interval when outside active window
+
+feeds:
+  stale_binance_ms: 3000          # max age for Binance mid-price
+  stale_polymarket_ms: 10000      # max age for Polymarket book (must be >= refresh_active_sec + latency)
+
+fair_prob:
+  sigma_floor: 0.0008             # min effective vol (~0.08% per sqrt-window)
+  tau_floor: 0.05                 # min effective tau fraction
+  zscore_clip: 8.0                # z-score clamping bound
+  prob_clip_min: 0.01             # minimum output probability
+  prob_clip_max: 0.99             # maximum output probability
+
+fees:
+  # Polymarket crypto market fee curve:
+  #   fee_per_share = p * fee_rate_base * (p * (1 - p)) ^ fee_exponent
+  # Examples at fee_rate_base=0.25, fee_exponent=2:
+  #   p=0.50 -> 0.0078125 USDC/share
+  #   p=0.90 -> 0.0018225 USDC/share
+  #   p=0.10 -> 0.0002025 USDC/share
+  fee_rate_base: 0.25             # C in fee formula
+  fee_exponent: 2                 # n in (p*(1-p))^n
+  maker_rebate_share: 0.20        # informational only; Phase 1 shadow economic reference
+
+zones:
+  taker_min_prob: 0.10            # ignore near-0 markets (taker)
+  taker_max_prob: 0.90            # ignore near-1 markets (taker)
+  extreme_upper: 0.85             # shadow: extreme zone threshold (YES)
+  extreme_lower: 0.15             # shadow: extreme zone threshold (NO)
+  # Spread sanity — hard reject (not just warning)
+  max_spread_warn: 0.05           # reject if yes bid-ask spread exceeds this
+  max_complement_skew: 0.05       # reject if |yes_mid + no_mid - 1| exceeds this
+
+signal:
+  # Regime thresholds
+  trending_abs_delta: 0.003       # min |delta_pct| to classify as TRENDING
+  quiet_abs_delta: 0.0005         # max |delta_pct| to classify as QUIET
+  high_vol_sigma_multiple: 3.0    # sigma multiple above floor to be "high vol"
+  # Pattern thresholds
+  sustained_move_abs_delta: 0.004
+  sustained_move_vol_ratio: 2.0
+  burst_abs_delta: 0.002
+  burst_vol_ratio: 4.0
+  fade_abs_delta: 0.002
+  fade_vol_ratio_max: 1.5
+  # Taker conviction guards
+  min_abs_delta_for_taker: 0.0005  # minimum |delta_pct| to allow taker entry
+  min_confidence_for_taker: 0.20   # minimum confidence_score (0-1) for PAPER_TRADE
+  allow_quiet_noise_trades: false   # reject PAPER_TRADE when regime=QUIET and pattern=NOISE
+  # Neutral probability band: near p=0.50 require extra evidence
+  neutral_prob_band_low: 0.47       # lower bound of neutral zone
+  neutral_prob_band_high: 0.53      # upper bound of neutral zone
+  neutral_band_min_delta: 0.001     # extra delta requirement inside neutral zone
+  neutral_band_min_confidence: 0.30 # extra confidence requirement inside neutral zone
+
+stake:
+  bankroll: 30.0                  # starting bankroll USDC
+  min_notional: 0.50              # smallest trade allowed
+  max_risk_fraction: 0.05         # max 5% bankroll per trade
+  drawdown_reduce_factor: 0.5     # halve size if in drawdown
+  scale_tiers:
+    - { min_bankroll: 0,   max_bankroll: 30,   fraction: 0.02 }
+    - { min_bankroll: 30,  max_bankroll: 60,   fraction: 0.03 }
+    - { min_bankroll: 60,  max_bankroll: 120,  fraction: 0.04 }
+    - { min_bankroll: 120, max_bankroll: 9999, fraction: 0.05 }
+
+risk:
+  max_actions_per_window: 2
+  max_consecutive_losses: 4
+  cooldown_windows: 2
+  max_shadow_quotes_per_window: 5
+  max_open_paper_trades_per_window: 1   # single open position policy per window
+
+edge:
+  min_after_fee_edge: 0.03        # require at least 3% after-fee edge
+
+maker_shadow:
+  default_tick_size: 0.01
+  extreme_tick_size: 0.005        # finer tick in extreme zones
+  post_only: true
+  quote_ttl_sec: 20               # seconds before unmatched shadow quote expires
+  # Phase 2 evaluation guards
+  min_passive_edge: 0.02          # minimum (fair_for_side - quote_price) to bother quoting
+  max_spread_maker: 0.06          # reject if bid-ask spread too wide for maker placement
+  allowed_ste_min: 15.0           # reject if fewer than N seconds remain to expiry
+  intended_notional: 1.0          # reference notional in USDC for maker PnL-if-held calc
+
+logging:
+  directory: logs
+  jsonl_enabled: true
+  # Log rotation: create a timestamped subdirectory per session so runs don't mix
+  session_subdirs: true           # if true, logs go to logs/<session_ts>/
+
+verdict_thresholds:
+  # Taker: minimum expectancy (USDC per resolved trade) to move above baseline_only.
+  # Expectancy = avg_pnl_per_resolved_trade. Unit: USDC.
+  taker_min_expectancy_usdc: 0.005
+  # Maker: minimum number of resolved filled quotes before win-rate verdict is meaningful.
+  maker_min_resolved_fills: 20
+  # Maker: minimum boundary win rate (fraction 0-1) to consider conditionally_researchable.
+  maker_min_boundary_win_rate: 0.55
+  # Maker: minimum mean PnL-if-held (fraction, per-share) to consider positive expectation.
+  # e.g. 0.05 = mean 5 cents per share on a $1 contract.
+  maker_min_mean_pnl_if_held: 0.05
+  # Maker: maximum adverse fill ratio (fraction) still consistent with edge.
+  maker_max_adverse_fill_ratio: 0.60
+  # live_candidate: both taker and maker must clear their own thresholds, AND
+  # maker_min_resolved_fills must be met.
+  live_candidate_min_maker_fills: 50
+
+ui:
+  enabled: true
+  refresh_sec: 1.0
+  show_log_lines: 20
+  theme: sniper_red               # sniper_red | plain
+  compact_mode: false
