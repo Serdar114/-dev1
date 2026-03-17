@@ -277,6 +277,9 @@ def _build_maker_summary(quotes: list[dict]) -> dict:
         if bucket not in by_ste:
             by_ste[bucket] = _empty_group()
         _update_group(by_ste[bucket], q)
+    for g in by_ste.values():
+        plist = g.pop("pnl_if_held_list", [])
+        g["pnl_if_held_mean"] = round(statistics.mean(plist), 6) if plist else None
 
     # Passive edge bucket breakdown
     def _edge_bucket(edge: Optional[float]) -> str:
@@ -296,6 +299,9 @@ def _build_maker_summary(quotes: list[dict]) -> dict:
         if bucket not in by_passive_edge:
             by_passive_edge[bucket] = _empty_group()
         _update_group(by_passive_edge[bucket], q)
+    for g in by_passive_edge.values():
+        plist = g.pop("pnl_if_held_list", [])
+        g["pnl_if_held_mean"] = round(statistics.mean(plist), 6) if plist else None
 
     return {
         "unique_quote_count": unique_quote_count,
