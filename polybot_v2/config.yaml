@@ -110,6 +110,16 @@ maker_shadow:
   max_spread_maker: 0.06          # reject if bid-ask spread too wide for maker placement
   allowed_ste_min: 15.0           # reject if fewer than N seconds remain to expiry
   intended_notional: 1.0          # reference notional in USDC for maker PnL-if-held calc
+  # Phase 3 focused evaluation controls.
+  # These allow narrowing the evaluation scope for hypothesis testing WITHOUT
+  # changing the core quoting logic. Default = broad (all sides, full edge range).
+  # Change only to test a specific hypothesis (e.g., "does YES-only show edge?").
+  # IMPORTANT: Do not treat focused config results as structural conclusions until
+  # confirmed with a balanced-regime sample.
+  evaluation_tag: "broad"                      # label for this eval run (e.g., broad / yes_focus / high_edge_focus)
+  allowed_sides_for_evaluation: ["yes", "no"]  # sides to include; restrict to ["yes"] or ["no"] for focused test
+  min_passive_edge_for_evaluation: 0.02        # minimum passive edge to include in eval (same as min_passive_edge by default)
+  max_passive_edge_for_evaluation: null        # null = no upper bound; set e.g. 0.08 for narrow edge band test
 
 logging:
   directory: logs

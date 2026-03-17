@@ -26,6 +26,7 @@ from session_verdict import (
     _build_maker_summary,
     _build_taker_summary,
     _build_verdict,
+    _build_regime_bias_note,
     build_session_summary,
 )
 
@@ -552,3 +553,246 @@ class TestBuildSessionSummaryIO:
         summary = build_session_summary(tmp_path, cfg)
         assert summary["taker"]["signal_count"] == 0
         assert summary["maker"]["unique_quote_count"] == 0
+
+    def test_summary_includes_regime_bias(self, tmp_path):
+        cfg = Settings(CONFIG_PATH)
+        for fname in ("signals.jsonl", "paper_trades.jsonl", "shadow_quotes.jsonl", "bankroll.jsonl"):
+            (tmp_path / fname).write_text("")
+        summary = build_session_summary(tmp_path, cfg)
+        assert "regime_bias" in summary
+        assert "summary" in summary["regime_bias"]
+
+    def test_txt_contains_regime_bias_section(self, tmp_path):
+        cfg = Settings(CONFIG_PATH)
+        signals = [
+            {"lane": "selective_taker", "action": "PAPER_TRADE",
+             "chosen_side": "yes", "after_fee_edge_yes": 0.04,
+             "elapsed_from_window_start": 60.0},
+        ]
+        for fname in ("paper_trades.jsonl", "shadow_quotes.jsonl", "bankroll.jsonl"):
+            (tmp_path / fname).write_text("")
+        with open(tmp_path / "signals.jsonl", "w") as fh:
+            fh.write(json.dumps(signals[0]) + "\n")
+        build_session_summary(tmp_path, cfg, session_ts="20260316_130000")
+        txt = (tmp_path / "session_summary.txt").read_text()
+        assert "REGIME" in txt or "BIAS" in txt
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# H) Taker candidate fields and execution-disabled framing
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestTakerCandidateFields:
+    def _make_signals(self) -> list[dict]:
+        return [
+            {"lane": "selective_taker", "action": "PAPER_TRADE",
+             "chosen_side": "yes", "after_fee_edge_yes": 0.05,
+             "elapsed_from_window_start": 45.0},
+            {"lane": "selective_taker", "action": "PAPER_TRADE",
+             "chosen_side": "yes", "after_fee_edge_yes": 0.06,
+             "elapsed_from_window_start": 80.0},
+            {"lane": "selective_taker", "action": "PAPER_TRADE",
+             "chosen_side": "no", "after_fee_edge_no": 0.04,
+             "elapsed_from_window_start": 60.0},
+            {"lane": "selective_taker", "action": "NO_TRADE",
+             "reason": "outside_entry_window"},
+        ]
+
+    def test_candidate_count(self):
+        t = _build_taker_summary(self._make_signals(), [], execution_enabled=True)
+        assert t["paper_trade_candidate_count"] == 3
+
+    def test_candidate_yes_no_counts(self):
+        t = _build_taker_summary(self._make_signals(), [], execution_enabled=True)
+        assert t["paper_trade_candidate_yes_count"] == 2
+        assert t["paper_trade_candidate_no_count"] == 1
+
+    def test_candidate_reason_breakdown_keys(self):
+        t = _build_taker_summary(self._make_signals(), [], execution_enabled=True)
+        assert "chosen_side:yes" in t["candidate_reason_breakdown"]
+        assert t["candidate_reason_breakdown"]["chosen_side:yes"] == 2
+        assert t["candidate_reason_breakdown"]["chosen_side:no"] == 1
+
+    def test_candidate_avg_after_fee_edge_pct(self):
+        t = _build_taker_summary(self._make_signals(), [], execution_enabled=True)
+        # (0.05 + 0.06 + 0.04) / 3 * 100 = 5.0%
+        assert t["candidate_avg_after_fee_edge_pct"] == pytest.approx(5.0, abs=0.01)
+
+    def test_candidate_avg_entry_sec(self):
+        t = _build_taker_summary(self._make_signals(), [], execution_enabled=True)
+        assert t["candidate_avg_entry_second_into_window"] == pytest.approx(61.7, abs=0.2)
+
+    def test_execution_mode_active(self):
+        t = _build_taker_summary(self._make_signals(), [], execution_enabled=True)
+        assert t["execution_mode"] == "active"
+
+    def test_execution_mode_candidate_only(self):
+        t = _build_taker_summary(self._make_signals(), [], execution_enabled=False)
+        assert t["execution_mode"] == "candidate_only"
+
+    def test_candidate_only_zero_resolved_trades(self):
+        """When execution disabled, resolved trades must be zero."""
+        t = _build_taker_summary(self._make_signals(), [], execution_enabled=False)
+        assert t["trade_resolve_count"] == 0
+        assert t["paper_trade_candidate_count"] == 3
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# I) Verdict framing for candidate_only execution mode
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestVerdictCandidateOnlyFraming:
+    def _cfg(self) -> Settings:
+        return Settings(CONFIG_PATH)
+
+    def _maker_empty(self) -> dict:
+        return {
+            "unique_quote_count": 0, "fill_count": 0, "expiry_count": 0,
+            "fill_rate": None, "expiry_rate": None,
+            "adverse_fill_count": 0, "favorable_fill_count": 0,
+            "adverse_fill_ratio": None, "favorable_fill_ratio": None,
+            "resolved_filled_count": 0, "boundary_win_count": 0,
+            "boundary_loss_count": 0, "boundary_win_rate": None,
+            "maker_pnl_if_held_total": 0.0, "maker_pnl_if_held_mean": None,
+            "maker_pnl_if_held_median": None,
+            "reject_breakdown": {}, "reject_breakdown_raw": {},
+            "by_side": {}, "by_regime": {}, "by_ste_bucket": {},
+            "by_passive_edge_bucket": {},
+        }
+
+    def test_candidate_only_with_candidates_gives_candidate_only_status(self):
+        taker = {
+            "execution_mode": "candidate_only",
+            "trade_resolve_count": 0,
+            "paper_trade_candidate_count": 5,
+            "paper_trade_candidate_yes_count": 3,
+            "paper_trade_candidate_no_count": 2,
+            "expectancy_per_resolved_trade_usdc": None,
+        }
+        v = _build_verdict(taker, self._maker_empty(), self._cfg())
+        assert v["taker_status"] == "candidate_only"
+        basis = " ".join(v["verdict_basis"])
+        assert "execution disabled" in basis.lower()
+        assert "5" in basis
+
+    def test_candidate_only_zero_candidates_gives_no_data(self):
+        taker = {
+            "execution_mode": "candidate_only",
+            "trade_resolve_count": 0,
+            "paper_trade_candidate_count": 0,
+            "paper_trade_candidate_yes_count": 0,
+            "paper_trade_candidate_no_count": 0,
+            "expectancy_per_resolved_trade_usdc": None,
+        }
+        v = _build_verdict(taker, self._maker_empty(), self._cfg())
+        assert v["taker_status"] == "no_data"
+
+    def test_active_mode_zero_resolved_gives_no_data(self):
+        taker = {
+            "execution_mode": "active",
+            "trade_resolve_count": 0,
+            "paper_trade_candidate_count": 5,
+            "paper_trade_candidate_yes_count": 3,
+            "paper_trade_candidate_no_count": 2,
+            "expectancy_per_resolved_trade_usdc": None,
+        }
+        v = _build_verdict(taker, self._maker_empty(), self._cfg())
+        assert v["taker_status"] == "no_data"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# J) Regime bias note
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestRegimeBiasNote:
+    def _taker(self, yes: int, no: int) -> dict:
+        return {
+            "paper_trade_candidate_yes_count": yes,
+            "paper_trade_candidate_no_count": no,
+        }
+
+    def _maker_with_fills(self, yes_fills: int, no_fills: int,
+                          yes_pnl: float = 0.0, no_pnl: float = 0.0) -> dict:
+        return {
+            "by_side": {
+                "yes": {"fill_count": yes_fills, "pnl_if_held_mean": yes_pnl,
+                        "boundary_win_count": 0},
+                "no": {"fill_count": no_fills, "pnl_if_held_mean": no_pnl,
+                       "boundary_win_count": 0},
+            }
+        }
+
+    def test_yes_biased_signals_flagged(self):
+        bias = _build_regime_bias_note(self._taker(8, 2), self._maker_with_fills(5, 5))
+        assert bias["signal_side_bias"] is not None
+        assert "YES-biased" in bias["signal_side_bias"]
+
+    def test_balanced_signals_not_flagged(self):
+        bias = _build_regime_bias_note(self._taker(5, 5), self._maker_with_fills(5, 5))
+        assert bias["signal_side_bias"] is not None
+        assert "balanced" in bias["signal_side_bias"]
+
+    def test_yes_biased_fills_flagged(self):
+        bias = _build_regime_bias_note(self._taker(5, 5), self._maker_with_fills(9, 1))
+        assert "YES-biased" in (bias["fill_side_bias"] or "")
+
+    def test_double_bias_flag_triggered(self):
+        bias = _build_regime_bias_note(self._taker(9, 1), self._maker_with_fills(9, 1))
+        assert bias["both_signal_and_fill_biased_yes"] is True
+        assert any("CRITICAL BIAS FLAG" in n for n in bias["notes"])
+
+    def test_no_double_bias_when_fills_balanced(self):
+        bias = _build_regime_bias_note(self._taker(9, 1), self._maker_with_fills(5, 5))
+        assert bias["both_signal_and_fill_biased_yes"] is False
+
+    def test_yes_outperforms_no_with_biased_fills_assessed_as_regime_artifact(self):
+        # YES pnl > NO pnl AND fills YES-biased => likely_regime_artifact
+        bias = _build_regime_bias_note(
+            self._taker(5, 5),
+            self._maker_with_fills(yes_fills=9, no_fills=1, yes_pnl=0.08, no_pnl=-0.02),
+        )
+        assert bias["side_asymmetry_assessment"] == "likely_regime_artifact"
+
+    def test_yes_outperforms_with_balanced_fills_assessed_as_possible_structural(self):
+        bias = _build_regime_bias_note(
+            self._taker(5, 5),
+            self._maker_with_fills(yes_fills=5, no_fills=5, yes_pnl=0.08, no_pnl=-0.02),
+        )
+        assert bias["side_asymmetry_assessment"] == "possible_structural_requires_more_data"
+
+    def test_summary_field_always_populated(self):
+        bias = _build_regime_bias_note(self._taker(0, 0), {"by_side": {}})
+        assert isinstance(bias["summary"], str)
+        assert len(bias["summary"]) > 0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# K) Focused eval config loading
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestFocusedEvalConfig:
+    def test_defaults_load(self):
+        cfg = Settings(CONFIG_PATH)
+        assert cfg.maker_evaluation_tag == "broad"
+        assert cfg.maker_allowed_sides_for_evaluation == ["yes", "no"]
+        assert cfg.maker_min_passive_edge_for_evaluation == pytest.approx(0.02)
+        assert cfg.maker_max_passive_edge_for_evaluation is None
+
+    def test_evaluation_tag_override(self):
+        cfg = Settings(CONFIG_PATH)
+        cfg._raw["maker_shadow"]["evaluation_tag"] = "yes_focus"
+        assert cfg.maker_evaluation_tag == "yes_focus"
+
+    def test_allowed_sides_override(self):
+        cfg = Settings(CONFIG_PATH)
+        cfg._raw["maker_shadow"]["allowed_sides_for_evaluation"] = ["yes"]
+        assert cfg.maker_allowed_sides_for_evaluation == ["yes"]
+
+    def test_max_passive_edge_override(self):
+        cfg = Settings(CONFIG_PATH)
+        cfg._raw["maker_shadow"]["max_passive_edge_for_evaluation"] = 0.08
+        assert cfg.maker_max_passive_edge_for_evaluation == pytest.approx(0.08)
+
+    def test_max_passive_edge_null_by_default(self):
+        cfg = Settings(CONFIG_PATH)
+        assert cfg.maker_max_passive_edge_for_evaluation is None

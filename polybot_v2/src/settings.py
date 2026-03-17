@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import yaml
 
@@ -344,6 +344,25 @@ class Settings:
     @property
     def ui_compact_mode(self) -> bool:
         return bool(self._ui("compact_mode", False))
+
+    # Phase 3 focused evaluation controls
+    @property
+    def maker_evaluation_tag(self) -> str:
+        return str(self._raw["maker_shadow"].get("evaluation_tag", "broad"))
+
+    @property
+    def maker_allowed_sides_for_evaluation(self) -> list[str]:
+        val = self._raw["maker_shadow"].get("allowed_sides_for_evaluation", ["yes", "no"])
+        return list(val) if val else ["yes", "no"]
+
+    @property
+    def maker_min_passive_edge_for_evaluation(self) -> float:
+        return float(self._raw["maker_shadow"].get("min_passive_edge_for_evaluation", 0.02))
+
+    @property
+    def maker_max_passive_edge_for_evaluation(self) -> Optional[float]:
+        val = self._raw["maker_shadow"].get("max_passive_edge_for_evaluation", None)
+        return float(val) if val is not None else None
 
     @property
     def session_subdirs(self) -> bool:

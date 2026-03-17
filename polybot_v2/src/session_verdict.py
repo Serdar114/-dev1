@@ -45,14 +45,57 @@ def _read_jsonl(path: Path) -> list[dict]:
 # Taker summary
 # ------------------------------------------------------------------ #
 
-def _build_taker_summary(signals: list[dict], trades: list[dict]) -> dict:
+def _build_taker_summary(
+    signals: list[dict],
+    trades: list[dict],
+    execution_enabled: bool = True,
+) -> dict:
     taker_sigs = [r for r in signals if r.get("lane") == "selective_taker"]
     signal_count = len(taker_sigs)
-    trade_open_signals = [r for r in taker_sigs if r.get("action") == "PAPER_TRADE"]
+
+    # Candidates = all PAPER_TRADE decisions logged to signals.jsonl.
+    # These exist regardless of whether paper execution is enabled.
+    # When execution is disabled, candidates are the only taker evidence.
+    candidate_sigs = [r for r in taker_sigs if r.get("action") == "PAPER_TRADE"]
     no_trade_sigs = [r for r in taker_sigs if r.get("action") == "NO_TRADE"]
     no_trade_count = len(no_trade_sigs)
 
-    # Trade counts from paper_trades.jsonl
+    # Candidate counts by side
+    candidate_count = len(candidate_sigs)
+    candidate_yes_count = sum(1 for r in candidate_sigs if r.get("chosen_side") == "yes")
+    candidate_no_count = sum(1 for r in candidate_sigs if r.get("chosen_side") == "no")
+
+    # Candidate edge — from PAPER_TRADE signals directly
+    cand_afe_list: list[float] = []
+    for r in candidate_sigs:
+        side = r.get("chosen_side")
+        if side == "yes":
+            v = r.get("after_fee_edge_yes")
+        elif side == "no":
+            v = r.get("after_fee_edge_no")
+        else:
+            v = None
+        if v is not None:
+            cand_afe_list.append(float(v))
+    candidate_avg_after_fee_edge_pct = (
+        round(statistics.mean(cand_afe_list) * 100.0, 4) if cand_afe_list else None
+    )
+
+    # Candidate avg seconds elapsed from window start
+    cand_elapsed = [float(r.get("elapsed_from_window_start", 0)) for r in candidate_sigs]
+    candidate_avg_entry_sec = round(statistics.mean(cand_elapsed), 1) if cand_elapsed else None
+
+    # Candidate reason breakdown: counts by chosen_side
+    candidate_reason_breakdown: dict[str, int] = {}
+    for r in candidate_sigs:
+        side = r.get("chosen_side") or "unknown"
+        key = f"chosen_side:{side}"
+        candidate_reason_breakdown[key] = candidate_reason_breakdown.get(key, 0) + 1
+
+    # Execution mode tag
+    execution_mode = "active" if execution_enabled else "candidate_only"
+
+    # Trade counts from paper_trades.jsonl (actual executed trades)
     opened = [t for t in trades if t.get("event") == "open"]
     resolved = [t for t in trades if t.get("event") == "resolve"]
     trade_open_count = len(opened)
@@ -71,9 +114,9 @@ def _build_taker_summary(signals: list[dict], trades: list[dict]) -> dict:
     # Expectancy = avg_pnl_per_resolved_trade (USDC)
     expectancy_usdc = avg_pnl
 
-    # avg_entry_edge: use after_fee_edge for the chosen side from trade_thesis signals
+    # avg_entry_edge: prefer trade_thesis from paper_trades.jsonl, fall back to candidates
     thesis_sigs = [t for t in trades if t.get("event") == "trade_thesis"]
-    afe_list = []
+    afe_list: list[float] = []
     for t in thesis_sigs:
         side = t.get("side")
         if side == "yes":
@@ -84,25 +127,14 @@ def _build_taker_summary(signals: list[dict], trades: list[dict]) -> dict:
             v = None
         if v is not None:
             afe_list.append(float(v))
-    # Also try from PAPER_TRADE signals if thesis not available
     if not afe_list:
-        for r in trade_open_signals:
-            side = r.get("chosen_side")
-            if side == "yes":
-                v = r.get("after_fee_edge_yes")
-            elif side == "no":
-                v = r.get("after_fee_edge_no")
-            else:
-                v = None
-            if v is not None:
-                afe_list.append(float(v))
+        afe_list = cand_afe_list[:]
     avg_entry_edge_pct = (
         round(statistics.mean(afe_list) * 100.0, 4) if afe_list else None
     )
 
-    # avg_entry_second_into_window
-    elapsed_list = [float(r.get("elapsed_from_window_start", 0)) for r in trade_open_signals]
-    avg_entry_elapsed = round(statistics.mean(elapsed_list), 1) if elapsed_list else None
+    # avg_entry_elapsed_sec: from candidates (same data source, kept for compatibility)
+    avg_entry_elapsed = candidate_avg_entry_sec
 
     # No-trade reason breakdown
     reason_counts: dict[str, int] = {}
@@ -122,11 +154,9 @@ def _build_taker_summary(signals: list[dict], trades: list[dict]) -> dict:
     ]
     entry_blocker_breakdown = {}
     for k in blocker_keys:
-        # sum all reasons that start with / contain the key fragment
         total = sum(v for rk, v in reason_counts.items() if k in rk or rk.startswith(k))
         if total > 0:
             entry_blocker_breakdown[k] = total
-    # Also include anything not matched by canonical keys
     matched = set()
     for k in blocker_keys:
         for rk in reason_counts:
@@ -135,8 +165,19 @@ def _build_taker_summary(signals: list[dict], trades: list[dict]) -> dict:
     other_blockers = {rk: rv for rk, rv in reason_counts.items() if rk not in matched}
 
     return {
+        # Execution context
+        "execution_mode": execution_mode,
         "signal_count": signal_count,
         "no_trade_count": no_trade_count,
+        # Candidate fields — from signals.jsonl; populated regardless of execution state.
+        # When execution_mode="candidate_only", these are the primary taker evidence.
+        "paper_trade_candidate_count": candidate_count,
+        "paper_trade_candidate_yes_count": candidate_yes_count,
+        "paper_trade_candidate_no_count": candidate_no_count,
+        "candidate_reason_breakdown": candidate_reason_breakdown,
+        "candidate_avg_after_fee_edge_pct": candidate_avg_after_fee_edge_pct,
+        "candidate_avg_entry_second_into_window": candidate_avg_entry_sec,
+        # Execution fields — from paper_trades.jsonl; meaningful only when execution active.
         "trade_open_count": trade_open_count,
         "trade_resolve_count": trade_resolve_count,
         "win_count": win_count,
@@ -146,7 +187,6 @@ def _build_taker_summary(signals: list[dict], trades: list[dict]) -> dict:
         "avg_pnl_per_resolved_trade_usdc": round(avg_pnl, 6) if avg_pnl is not None else None,
         "median_pnl_per_resolved_trade_usdc": round(median_pnl, 6) if median_pnl is not None else None,
         "expectancy_per_resolved_trade_usdc": round(expectancy_usdc, 6) if expectancy_usdc is not None else None,
-        # after-fee edge expressed as percent (e.g. 3.2 means 3.2%)
         "avg_entry_after_fee_edge_pct": avg_entry_edge_pct,
         "avg_entry_elapsed_sec": avg_entry_elapsed,
         "no_trade_reason_breakdown": dict(sorted(reason_counts.items(), key=lambda x: -x[1])),
@@ -372,6 +412,140 @@ def _group_breakdown(quotes: list[dict], key: str) -> dict[str, dict]:
 
 
 # ------------------------------------------------------------------ #
+# Regime / sample bias assessment
+# ------------------------------------------------------------------ #
+
+def _build_regime_bias_note(taker: dict, maker: dict) -> dict:
+    """
+    Assess whether observed side outperformance is likely structural or
+    a sample/regime artifact.
+
+    This is NOT a trading signal. It is a diagnostic that flags when the
+    current sample appears directionally biased (e.g., BTC was bullish during
+    the observation window), which would make YES-side outperformance unreliable
+    as a generalizable conclusion.
+    """
+    notes: list[str] = []
+
+    # 1. Taker candidate side distribution
+    cand_yes = taker.get("paper_trade_candidate_yes_count", 0)
+    cand_no = taker.get("paper_trade_candidate_no_count", 0)
+    cand_total = cand_yes + cand_no
+    signal_side_bias: Optional[str] = None
+    yes_signal_frac: Optional[float] = None
+    if cand_total > 0:
+        yes_signal_frac = cand_yes / cand_total
+        if yes_signal_frac > 0.65:
+            signal_side_bias = f"YES-biased ({yes_signal_frac:.0%} of {cand_total} candidates)"
+            notes.append(
+                f"Signal distribution is YES-biased: {cand_yes}/{cand_total} "
+                f"candidates chose YES — possible bullish BTC regime during sample"
+            )
+        elif yes_signal_frac < 0.35:
+            signal_side_bias = f"NO-biased ({1 - yes_signal_frac:.0%} of {cand_total} candidates)"
+            notes.append(
+                f"Signal distribution is NO-biased: {cand_no}/{cand_total} "
+                f"candidates chose NO — possible bearish BTC regime during sample"
+            )
+        else:
+            signal_side_bias = f"balanced ({yes_signal_frac:.0%} YES / {1-yes_signal_frac:.0%} NO)"
+
+    # 2. Maker fill side distribution
+    by_side = maker.get("by_side", {})
+    yes_fills = by_side.get("yes", {}).get("fill_count", 0)
+    no_fills = by_side.get("no", {}).get("fill_count", 0)
+    total_fills = yes_fills + no_fills
+    fill_side_bias: Optional[str] = None
+    yes_fill_frac: Optional[float] = None
+    if total_fills > 0:
+        yes_fill_frac = yes_fills / total_fills
+        if yes_fill_frac > 0.65:
+            fill_side_bias = f"YES-biased ({yes_fill_frac:.0%} of fills)"
+            notes.append(
+                f"Maker fill distribution is YES-biased: {yes_fills}/{total_fills} fills on YES side"
+            )
+        elif yes_fill_frac < 0.35:
+            fill_side_bias = f"NO-biased ({1 - yes_fill_frac:.0%} of fills)"
+            notes.append(
+                f"Maker fill distribution is NO-biased: {no_fills}/{total_fills} fills on NO side"
+            )
+        else:
+            fill_side_bias = f"balanced ({yes_fill_frac:.0%} YES)"
+
+    # 3. YES vs NO pnl comparison and structural assessment
+    yes_data = by_side.get("yes", {})
+    no_data_m = by_side.get("no", {})
+    yes_pnl = yes_data.get("pnl_if_held_mean")
+    no_pnl = no_data_m.get("pnl_if_held_mean")
+    side_asymmetry_assessment: Optional[str] = None
+
+    if yes_pnl is not None and no_pnl is not None:
+        if yes_pnl > no_pnl:
+            if yes_fill_frac is not None and yes_fill_frac > 0.65:
+                side_asymmetry_assessment = "likely_regime_artifact"
+                notes.append(
+                    f"YES maker pnl_mean={yes_pnl:+.4f} > NO pnl_mean={no_pnl:+.4f}, "
+                    "AND fills are YES-biased — side asymmetry is likely a sample/regime "
+                    "artifact. Do NOT interpret as structural YES edge."
+                )
+            else:
+                side_asymmetry_assessment = "possible_structural_requires_more_data"
+                notes.append(
+                    f"YES maker pnl_mean={yes_pnl:+.4f} > NO pnl_mean={no_pnl:+.4f} "
+                    "with balanced fill distribution — may have structural component; "
+                    "requires balanced-regime sample to confirm."
+                )
+        elif no_pnl > yes_pnl:
+            side_asymmetry_assessment = "no_side_appears_better_in_sample"
+            notes.append(
+                f"NO maker pnl_mean={no_pnl:+.4f} > YES pnl_mean={yes_pnl:+.4f} in this sample."
+            )
+        else:
+            side_asymmetry_assessment = "sides_roughly_equal"
+
+    # 4. Double-bias flag: both signal AND fill distribution biased same direction
+    both_biased_yes = (
+        yes_signal_frac is not None and yes_signal_frac > 0.65
+        and yes_fill_frac is not None and yes_fill_frac > 0.65
+    )
+    both_biased_no = (
+        yes_signal_frac is not None and yes_signal_frac < 0.35
+        and yes_fill_frac is not None and yes_fill_frac < 0.35
+    )
+    if both_biased_yes:
+        notes.append(
+            "CRITICAL BIAS FLAG: Both signal generation AND maker fills are YES-biased. "
+            "Current BTC regime appears bullish/YES-favoring. "
+            "Observed YES outperformance MUST NOT be interpreted as structural trading edge "
+            "until confirmed with a balanced or NO-biased regime sample."
+        )
+    if both_biased_no:
+        notes.append(
+            "CRITICAL BIAS FLAG: Both signal generation AND maker fills are NO-biased. "
+            "Current BTC regime appears bearish/NO-favoring. "
+            "Observed NO outperformance MUST NOT be interpreted as structural trading edge "
+            "until confirmed with a balanced or YES-biased regime sample."
+        )
+
+    summary = (
+        " | ".join(notes) if notes
+        else "No strong directional bias detected in current sample."
+    )
+
+    return {
+        "yes_signal_fraction": round(yes_signal_frac, 4) if yes_signal_frac is not None else None,
+        "signal_side_bias": signal_side_bias,
+        "yes_fill_fraction": round(yes_fill_frac, 4) if yes_fill_frac is not None else None,
+        "fill_side_bias": fill_side_bias,
+        "side_asymmetry_assessment": side_asymmetry_assessment,
+        "both_signal_and_fill_biased_yes": both_biased_yes,
+        "both_signal_and_fill_biased_no": both_biased_no,
+        "notes": notes,
+        "summary": summary,
+    }
+
+
+# ------------------------------------------------------------------ #
 # Provisional verdict
 # ------------------------------------------------------------------ #
 
@@ -387,9 +561,26 @@ def _build_verdict(
     reasons: list[str] = []
 
     # --- Taker status ---
+    execution_mode = taker.get("execution_mode", "active")
     exp = taker.get("expectancy_per_resolved_trade_usdc")
     n_resolved = taker.get("trade_resolve_count", 0)
-    if n_resolved == 0:
+    candidate_count = taker.get("paper_trade_candidate_count", 0)
+    cand_yes = taker.get("paper_trade_candidate_yes_count", 0)
+    cand_no = taker.get("paper_trade_candidate_no_count", 0)
+
+    if execution_mode == "candidate_only":
+        if candidate_count == 0:
+            taker_status = "no_data"
+            reasons.append("taker: execution disabled; zero candidates generated")
+        else:
+            taker_status = "candidate_only"
+            reasons.append(
+                f"taker: execution disabled; {candidate_count} candidates generated "
+                f"(yes={cand_yes}, no={cand_no}); "
+                "no economic verdict possible without execution — "
+                "candidate data shows signal engine activity only"
+            )
+    elif n_resolved == 0:
         taker_status = "no_data"
         reasons.append("taker: zero resolved trades")
     elif exp is None or exp <= cfg.verdict_taker_min_expectancy_usdc:
@@ -505,15 +696,48 @@ def _build_verdict(
 # Text summary renderer
 # ------------------------------------------------------------------ #
 
-def _render_txt(taker: dict, maker: dict, verdict: dict, session_ts: str) -> str:
+def _render_txt(
+    taker: dict,
+    maker: dict,
+    verdict: dict,
+    session_ts: str,
+    regime_bias: Optional[dict] = None,
+) -> str:
     lines = []
     lines.append("=" * 70)
     lines.append(f"SESSION SUMMARY  [{session_ts}]")
     lines.append("=" * 70)
 
+    exec_mode = taker.get("execution_mode", "active")
     lines.append("\n-- TAKER (benchmark lane) --")
+    lines.append(f"  Execution mode       : {exec_mode}")
     lines.append(f"  Signals evaluated    : {taker['signal_count']}")
     lines.append(f"  No-trade decisions   : {taker['no_trade_count']}")
+
+    # Candidate block — always shown; primary taker evidence when execution disabled
+    cand_count = taker.get("paper_trade_candidate_count", 0)
+    cand_yes = taker.get("paper_trade_candidate_yes_count", 0)
+    cand_no = taker.get("paper_trade_candidate_no_count", 0)
+    cand_edge = taker.get("candidate_avg_after_fee_edge_pct")
+    cand_elapsed = taker.get("candidate_avg_entry_second_into_window")
+    lines.append(f"  Candidates generated : {cand_count}  (yes={cand_yes}, no={cand_no})")
+    lines.append(
+        f"  Candidate avg edge   : {cand_edge:.4f}%" if cand_edge is not None
+        else "  Candidate avg edge   : n/a"
+    )
+    lines.append(
+        f"  Candidate avg elapsed: {cand_elapsed:.1f}s" if cand_elapsed is not None
+        else "  Candidate avg elapsed: n/a"
+    )
+    if exec_mode == "candidate_only":
+        lines.append(
+            "  NOTE: Execution disabled. Candidates are signal evidence only."
+        )
+        lines.append(
+            "        No economic verdict possible from taker until execution is re-enabled."
+        )
+
+    # Executed trade block — meaningful only when execution active
     lines.append(f"  Trades opened        : {taker['trade_open_count']}")
     lines.append(f"  Trades resolved      : {taker['trade_resolve_count']}")
     lines.append(f"  Win / Loss           : {taker['win_count']} / {taker['loss_count']}")
@@ -561,6 +785,80 @@ def _render_txt(taker: dict, maker: dict, verdict: dict, session_ts: str) -> str
             if v > 0:
                 lines.append(f"    {k}: {v}")
 
+    # Maker strategic interpretation
+    lines.append("\n-- MAKER STRATEGIC INTERPRETATION --")
+    by_side = maker.get("by_side", {})
+    yes_m = by_side.get("yes", {})
+    no_m = by_side.get("no", {})
+    yes_pnl = yes_m.get("pnl_if_held_mean")
+    no_pnl = no_m.get("pnl_if_held_mean")
+    yes_bwins = yes_m.get("boundary_win_count", 0)
+    no_bwins = no_m.get("boundary_win_count", 0)
+
+    if yes_pnl is not None or no_pnl is not None:
+        lines.append(
+            f"  YES-side: fills={yes_m.get('fill_count',0)}  "
+            f"bwins={yes_bwins}  "
+            f"pnl_mean={yes_pnl:+.4f}" if yes_pnl is not None else
+            f"  YES-side: fills={yes_m.get('fill_count',0)}  bwins={yes_bwins}  pnl_mean=n/a"
+        )
+        lines.append(
+            f"  NO-side : fills={no_m.get('fill_count',0)}  "
+            f"bwins={no_bwins}  "
+            f"pnl_mean={no_pnl:+.4f}" if no_pnl is not None else
+            f"  NO-side : fills={no_m.get('fill_count',0)}  bwins={no_bwins}  pnl_mean=n/a"
+        )
+        if yes_pnl is not None and no_pnl is not None:
+            if yes_pnl > no_pnl:
+                lines.append(
+                    "  → In this sample YES-side appears better than NO-side."
+                )
+            elif no_pnl > yes_pnl:
+                lines.append(
+                    "  → In this sample NO-side appears better than YES-side."
+                )
+            else:
+                lines.append("  → YES/NO sides roughly equal in this sample.")
+    else:
+        lines.append("  YES/NO side breakdown: insufficient fill data")
+
+    # Passive edge bucket ranking
+    by_edge = maker.get("by_passive_edge_bucket", {})
+    if by_edge:
+        ranked = sorted(
+            by_edge.items(),
+            key=lambda x: x[1].get("pnl_if_held_mean") if x[1].get("pnl_if_held_mean") is not None else float("-inf"),
+            reverse=True,
+        )
+        lines.append("  Passive edge buckets (ranked by pnl_mean):")
+        for bucket, g in ranked:
+            pm = g.get("pnl_if_held_mean")
+            fc = g.get("fill_count", 0)
+            pm_str = f"{pm:+.4f}" if pm is not None else "n/a"
+            lines.append(f"    {bucket:12s}: pnl_mean={pm_str}  fills={fc}")
+
+    lines.append(
+        "  CAUTION: Side/edge comparisons above may reflect sample regime, not structural edge."
+    )
+    lines.append(
+        "           See REGIME BIAS ASSESSMENT below before drawing strategic conclusions."
+    )
+
+    # Regime bias assessment
+    if regime_bias:
+        lines.append("\n-- REGIME / SAMPLE BIAS ASSESSMENT --")
+        lines.append(f"  Signal side bias     : {regime_bias.get('signal_side_bias', 'n/a')}")
+        lines.append(f"  Fill side bias       : {regime_bias.get('fill_side_bias', 'n/a')}")
+        lines.append(f"  Side asymmetry       : {regime_bias.get('side_asymmetry_assessment', 'n/a')}")
+        if regime_bias.get("both_signal_and_fill_biased_yes") or regime_bias.get("both_signal_and_fill_biased_no"):
+            lines.append("  *** DOUBLE BIAS FLAG: Both signal and fill distributions are directionally biased ***")
+        bias_notes = regime_bias.get("notes", [])
+        if bias_notes:
+            lines.append("  Findings:")
+            for note in bias_notes:
+                for ln in textwrap.wrap(note, width=64):
+                    lines.append(f"    {ln}")
+
     lines.append("\n-- PROVISIONAL VERDICT --")
     lines.append(f"  NOTE: {verdict['_note']}")
     lines.append(f"  Taker status         : {verdict['taker_status']}")
@@ -599,8 +897,10 @@ def build_session_summary(
     quotes = _read_jsonl(log_dir / "shadow_quotes.jsonl")
     bankroll_events = _read_jsonl(log_dir / "bankroll.jsonl")
 
-    taker = _build_taker_summary(signals, trades)
+    execution_enabled = cfg.taker_paper_execution_enabled
+    taker = _build_taker_summary(signals, trades, execution_enabled=execution_enabled)
     maker = _build_maker_summary(quotes)
+    regime_bias = _build_regime_bias_note(taker, maker)
     verdict = _build_verdict(taker, maker, cfg)
 
     # Session duration from bankroll events if available
@@ -612,6 +912,7 @@ def build_session_summary(
         "windows_completed": windows_completed,
         "taker": taker,
         "maker": maker,
+        "regime_bias": regime_bias,
         "verdict": verdict,
     }
 
@@ -623,6 +924,6 @@ def build_session_summary(
     # Write TXT
     txt_path = log_dir / "session_summary.txt"
     with open(txt_path, "w") as fh:
-        fh.write(_render_txt(taker, maker, verdict, session_ts))
+        fh.write(_render_txt(taker, maker, verdict, session_ts, regime_bias=regime_bias))
 
     return summary
