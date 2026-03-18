@@ -835,3 +835,242 @@ class TestFocusedEvalConfig:
     def test_max_passive_edge_null_by_default(self):
         cfg = Settings(CONFIG_PATH)
         assert cfg.maker_max_passive_edge_for_evaluation is None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# L) Measurement / basis risk note
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestMeasurementNote:
+    from session_verdict import _build_measurement_note
+
+    def _make_boundary_events(self, n: int, with_resolve: bool = True) -> list:
+        events = []
+        for i in range(n):
+            e = {
+                "event": "window_boundary",
+                "boundary_ts": 1700000000.0 + i * 300,
+                "new_window_end": 1700000300.0 + i * 300,
+            }
+            if with_resolve:
+                e["resolve_price_usdc"] = 84000.0 + i * 10
+                e["snapshot_lag_sec"] = 0.8 + i * 0.1
+                e["measurement_source"] = "binance_spot_local_clock"
+                e["outcome_yes"] = 1.0 if i % 2 == 0 else 0.0
+            events.append(e)
+        return events
+
+    def test_outcome_source_is_binance(self):
+        from session_verdict import _build_measurement_note
+        note = _build_measurement_note(self._make_boundary_events(3))
+        assert note["outcome_source"] == "binance_spot_local_clock"
+
+    def test_settlement_reference_is_chainlink(self):
+        from session_verdict import _build_measurement_note
+        note = _build_measurement_note(self._make_boundary_events(3))
+        assert note["settlement_reference"] == "chainlink_oracle_canonical_expiry"
+
+    def test_basis_risk_is_present(self):
+        from session_verdict import _build_measurement_note
+        note = _build_measurement_note(self._make_boundary_events(3))
+        assert note["basis_risk"] == "PRESENT"
+
+    def test_avg_snapshot_lag_computed(self):
+        from session_verdict import _build_measurement_note
+        note = _build_measurement_note(self._make_boundary_events(3, with_resolve=True))
+        assert note["avg_snapshot_lag_sec"] is not None
+        assert note["avg_snapshot_lag_sec"] > 0
+
+    def test_no_lag_when_no_resolve_data(self):
+        from session_verdict import _build_measurement_note
+        note = _build_measurement_note(self._make_boundary_events(3, with_resolve=False))
+        assert note["avg_snapshot_lag_sec"] is None
+        assert note["fallback_windows"] == 3
+
+    def test_window_count_correct(self):
+        from session_verdict import _build_measurement_note
+        note = _build_measurement_note(self._make_boundary_events(5))
+        assert note["window_count"] == 5
+
+    def test_empty_bankroll_events_handled(self):
+        from session_verdict import _build_measurement_note
+        note = _build_measurement_note([])
+        assert note["window_count"] == 0
+        assert note["avg_snapshot_lag_sec"] is None
+
+    def test_summary_includes_measurement_note(self, tmp_path):
+        cfg = Settings(CONFIG_PATH)
+        for fname in ("signals.jsonl", "paper_trades.jsonl", "shadow_quotes.jsonl", "bankroll.jsonl"):
+            (tmp_path / fname).write_text("")
+        summary = build_session_summary(tmp_path, cfg)
+        assert "measurement_note" in summary
+        assert summary["measurement_note"]["basis_risk"] == "PRESENT"
+
+    def test_txt_contains_measurement_section(self, tmp_path):
+        cfg = Settings(CONFIG_PATH)
+        for fname in ("signals.jsonl", "paper_trades.jsonl", "shadow_quotes.jsonl", "bankroll.jsonl"):
+            (tmp_path / fname).write_text("")
+        build_session_summary(tmp_path, cfg, session_ts="20260318_000000")
+        txt = (tmp_path / "session_summary.txt").read_text(encoding="utf-8")
+        assert "MEASUREMENT" in txt or "BASIS RISK" in txt
+        assert "binance_spot_local_clock" in txt
+        assert "chainlink_oracle_canonical_expiry" in txt
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# M) Evidence vs diagnostics separation in maker summary
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestMakerEvidenceDiagnostics:
+    def _make_quotes_with_evidence(self) -> list:
+        return [
+            {"quote_id": "e1", "fill_status": "filled_favorable", "side": "yes",
+             "regime": "TRENDING", "seconds_to_expiry": 80.0,
+             "intended_passive_edge": 0.10, "maker_pnl_if_held": 0.50,
+             "boundary_outcome_for_side": 1.0},
+            {"quote_id": "e2", "fill_status": "filled_adverse", "side": "no",
+             "regime": "CHOP", "seconds_to_expiry": 40.0,
+             "intended_passive_edge": 0.05, "maker_pnl_if_held": -0.20,
+             "boundary_outcome_for_side": 0.0},
+        ]
+
+    def _make_quotes_diagnostics_only(self) -> list:
+        return [
+            {"quote_id": "d1", "fill_status": "expired_unfilled", "side": "yes",
+             "regime": "QUIET", "seconds_to_expiry": 90.0,
+             "intended_passive_edge": 0.05, "maker_pnl_if_held": None,
+             "boundary_outcome_for_side": None},
+        ]
+
+    def test_maker_summary_has_diagnostics_sub_dict(self):
+        from session_verdict import _build_maker_summary
+        m = _build_maker_summary(self._make_quotes_with_evidence())
+        assert "diagnostics" in m
+        assert "fill_rate" in m["diagnostics"]
+        assert "adverse_fill_ratio" in m["diagnostics"]
+        assert "expiry_rate" in m["diagnostics"]
+
+    def test_maker_summary_has_evidence_sub_dict(self):
+        from session_verdict import _build_maker_summary
+        m = _build_maker_summary(self._make_quotes_with_evidence())
+        assert "evidence" in m
+        assert "pnl_if_held_mean" in m["evidence"]
+        assert "boundary_win_rate" in m["evidence"]
+        assert "has_evidence" in m["evidence"]
+
+    def test_has_evidence_true_when_fills_and_pnl(self):
+        from session_verdict import _build_maker_summary
+        m = _build_maker_summary(self._make_quotes_with_evidence())
+        assert m["evidence"]["has_evidence"] is True
+
+    def test_has_evidence_false_when_no_fills(self):
+        from session_verdict import _build_maker_summary
+        m = _build_maker_summary(self._make_quotes_diagnostics_only())
+        assert m["evidence"]["has_evidence"] is False
+
+    def test_txt_labels_diagnostics_and_evidence(self, tmp_path):
+        cfg = Settings(CONFIG_PATH)
+        quotes = self._make_quotes_with_evidence()
+        for fname in ("signals.jsonl", "paper_trades.jsonl", "bankroll.jsonl"):
+            (tmp_path / fname).write_text("")
+        with open(tmp_path / "shadow_quotes.jsonl", "w") as fh:
+            for q in quotes:
+                fh.write(json.dumps(q) + "\n")
+        build_session_summary(tmp_path, cfg, session_ts="20260318_000001")
+        txt = (tmp_path / "session_summary.txt").read_text(encoding="utf-8")
+        assert "DIAGNOSTICS" in txt
+        assert "EVIDENCE" in txt
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# N) Evidence gate in verdict
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestEvidenceGateInVerdict:
+    def _cfg(self) -> Settings:
+        return Settings(CONFIG_PATH)
+
+    def _maker_no_evidence(self) -> dict:
+        """Maker with fills but no pnl_if_held data."""
+        return {
+            "unique_quote_count": 30, "fill_count": 15,
+            "expiry_count": 10, "fill_rate": 0.50, "expiry_rate": 0.33,
+            "adverse_fill_count": 5, "favorable_fill_count": 10,
+            "adverse_fill_ratio": 0.33, "favorable_fill_ratio": 0.67,
+            "resolved_filled_count": 0,  # no boundary-resolved fills
+            "boundary_win_count": 0, "boundary_loss_count": 0,
+            "boundary_win_rate": None,
+            "maker_pnl_if_held_total": 0.0,
+            "maker_pnl_if_held_mean": None,  # no pnl evidence
+            "maker_pnl_if_held_median": None,
+            "reject_breakdown": {}, "reject_breakdown_raw": {},
+            "by_side": {}, "by_regime": {}, "by_ste_bucket": {}, "by_passive_edge_bucket": {},
+            "diagnostics": {"fill_rate": 0.50, "expiry_rate": 0.33, "adverse_fill_ratio": 0.33, "note": ""},
+            "evidence": {"resolved_filled_count": 0, "has_evidence": False, "note": ""},
+        }
+
+    def _taker(self) -> dict:
+        return {
+            "execution_mode": "active",
+            "signal_count": 100, "no_trade_count": 80,
+            "trade_open_count": 20, "trade_resolve_count": 20,
+            "win_count": 10, "loss_count": 10,
+            "win_rate": 0.5, "total_pnl_usdc": 0.0,
+            "avg_pnl_per_resolved_trade_usdc": 0.0,
+            "expectancy_per_resolved_trade_usdc": 0.01,
+            "avg_entry_after_fee_edge_pct": 2.0,
+            "avg_entry_elapsed_sec": 60.0,
+            "paper_trade_candidate_count": 20,
+            "paper_trade_candidate_yes_count": 10,
+            "paper_trade_candidate_no_count": 10,
+            "no_trade_reason_breakdown": {},
+            "entry_blocker_breakdown": {},
+            "entry_blocker_other": {},
+        }
+
+    def test_no_evidence_gives_no_fill_data_not_candidate(self):
+        """Even with good diagnostics (fill_rate=0.5), no evidence => not candidate."""
+        from session_verdict import _build_verdict
+        v = _build_verdict(self._taker(), self._maker_no_evidence(), self._cfg())
+        # Must not be conditionally_researchable on diagnostics alone
+        assert v["maker_status"] in ("no_fill_data", "diagnostics_only_no_evidence")
+        assert v["live_candidate_status"] == "not_live_ready"
+
+    def test_diagnostics_only_status_label(self):
+        """When resolved_filled_count > 0 but no pnl, status = diagnostics_only_no_evidence."""
+        from session_verdict import _build_verdict
+        maker = self._maker_no_evidence()
+        maker["resolved_filled_count"] = 5  # fills exist, but pnl is None
+        maker["evidence"]["resolved_filled_count"] = 5
+        maker["evidence"]["has_evidence"] = False  # explicit: no pnl data
+        v = _build_verdict(self._taker(), maker, self._cfg())
+        assert v["maker_status"] == "diagnostics_only_no_evidence"
+
+    def test_evidence_present_proceeds_to_threshold_eval(self):
+        """When evidence is present, normal threshold evaluation applies."""
+        from session_verdict import _build_verdict
+        maker = {
+            "unique_quote_count": 30, "fill_count": 20,
+            "expiry_count": 10, "fill_rate": 0.67, "expiry_rate": 0.33,
+            "adverse_fill_count": 8, "favorable_fill_count": 12,
+            "adverse_fill_ratio": 0.4, "favorable_fill_ratio": 0.6,
+            "resolved_filled_count": 25, "boundary_win_count": 15,
+            "boundary_loss_count": 10, "boundary_win_rate": 0.60,
+            "maker_pnl_if_held_total": 1.5,
+            "maker_pnl_if_held_mean": 0.06,
+            "maker_pnl_if_held_median": 0.05,
+            "reject_breakdown": {}, "reject_breakdown_raw": {},
+            "by_side": {}, "by_regime": {}, "by_ste_bucket": {}, "by_passive_edge_bucket": {},
+            "diagnostics": {"fill_rate": 0.67, "expiry_rate": 0.33, "adverse_fill_ratio": 0.4, "note": ""},
+            "evidence": {"resolved_filled_count": 25, "has_evidence": True,
+                         "pnl_if_held_mean": 0.06, "boundary_win_rate": 0.60, "note": ""},
+        }
+        cfg = Settings(CONFIG_PATH)
+        cfg._raw.setdefault("verdict_thresholds", {}).update({
+            "maker_min_resolved_fills": 20,
+            "maker_min_boundary_win_rate": 0.55,
+            "maker_min_mean_pnl_if_held": 0.05,
+            "maker_max_adverse_fill_ratio": 0.60,
+        })
+        v = _build_verdict(self._taker(), maker, cfg)
+        assert v["maker_status"] == "conditionally_researchable"

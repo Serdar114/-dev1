@@ -641,17 +641,27 @@ class PolybotV2:
 
         # Resolve boundary outcome — needed for both paper trades and shadow quote attribution.
         # Use Binance snapshot nearest to boundary_ts for accurate resolution.
+        # NOTE ON MEASUREMENT BASIS: We resolve using Binance spot BTC price at our local clock
+        # boundary. Actual Polymarket settlement uses a Chainlink oracle price at the canonical
+        # market expiry. Basis differences (Binance vs Chainlink) and timing offsets (local clock
+        # vs canonical expiry) can flip binary outcomes in close-price windows. See basis_risk in
+        # session_summary.json for session-level visibility of this gap.
         resolve_price, snapshot_ts = self._binance.get_snapshot_near(boundary_ts)
         if resolve_price is not None and self._window_open_price is not None:
             outcome_yes = 1.0 if resolve_price > self._window_open_price else 0.0
+            snapshot_lag_sec = abs(snapshot_ts - boundary_ts) if snapshot_ts is not None else None
             log.info(
                 "Resolve: window_open=%.2f resolve_price=%.2f "
-                "snapshot_ts=%.3f boundary_ts=%.3f outcome=%s",
+                "snapshot_ts=%.3f boundary_ts=%.3f snapshot_lag_sec=%s outcome=%s",
                 self._window_open_price, resolve_price,
                 snapshot_ts, boundary_ts,
+                f"{snapshot_lag_sec:.2f}" if snapshot_lag_sec is not None else "unknown",
                 "YES" if outcome_yes == 1.0 else "NO",
             )
         else:
+            resolve_price = None
+            snapshot_ts = None
+            snapshot_lag_sec = None
             outcome_yes = 0.5  # fallback: neutral
             log.warning(
                 "Resolve fallback: no Binance snapshot near boundary_ts=%.3f",
@@ -685,7 +695,15 @@ class PolybotV2:
             boundary_quotes = self._shadow_probe.resolve_boundary(outcome_yes)
             for bq in boundary_quotes:
                 self._metrics.on_boundary_resolved(bq)
-                self._log_shadow_quote(bq, event="boundary_resolved")
+                # Log resolve metadata so auditors can assess basis risk between
+                # our Binance-based measurement and actual Chainlink oracle settlement.
+                self._log_shadow_quote(
+                    bq,
+                    event="boundary_resolved",
+                    measurement_source="binance_spot_local_clock",
+                    resolve_price_usdc=round(resolve_price, 2) if resolve_price is not None else None,
+                    snapshot_lag_sec=round(snapshot_lag_sec, 3) if snapshot_lag_sec is not None else None,
+                )
 
         # Reset per-window state
         self._risk_mgr.on_window_reset(self._risk_state)
@@ -714,6 +732,13 @@ class PolybotV2:
             "peak_bankroll": self._bankroll.peak_bankroll,
             "total_pnl": self._bankroll.total_pnl,
             "drawdown": self._bankroll.drawdown,
+            # Basis risk metadata: Binance snapshot used for outcome resolution.
+            # Auditors: compare resolve_price_usdc to Chainlink oracle at boundary_ts
+            # to assess measurement basis risk for this window.
+            "measurement_source": "binance_spot_local_clock",
+            "resolve_price_usdc": round(resolve_price, 2) if resolve_price is not None else None,
+            "snapshot_lag_sec": round(snapshot_lag_sec, 3) if snapshot_lag_sec is not None else None,
+            "outcome_yes": outcome_yes,
         })
 
     # ------------------------------------------------------------------ #
@@ -867,13 +892,16 @@ class PolybotV2:
         record["event"] = event
         self._structured.log("paper_trades", record)
 
-    def _log_shadow_quote(self, quote, event: str = "lifecycle") -> None:
+    def _log_shadow_quote(self, quote, event: str = "lifecycle", **extra) -> None:
         """
         Write shadow quote event to JSONL.
         Phase 2: enriched record with full maker evaluation context.
         All fields serialized; None values are preserved as null (not 0.0).
+        **extra: optional additional fields merged into the log record (e.g. measurement
+                 metadata for boundary_resolved events: measurement_source, resolve_price_usdc,
+                 snapshot_lag_sec). These augment the record without modifying ShadowQuote.
         """
-        self._structured.log("shadow_quotes", {
+        record = {
             # Identity
             "event": event,
             "quote_id": quote.quote_id,
@@ -915,7 +943,11 @@ class PolybotV2:
             "boundary_outcome_for_side": quote.boundary_outcome_for_side,
             "maker_pnl_if_held": quote.maker_pnl_if_held,
             "maker_edge_realized_vs_expected": quote.maker_edge_realized_vs_expected,
-        })
+        }
+        # Merge extra fields (e.g. measurement_source, resolve_price_usdc, snapshot_lag_sec
+        # from _on_new_window for boundary_resolved events).
+        record.update(extra)
+        self._structured.log("shadow_quotes", record)
 
     # ------------------------------------------------------------------ #
     # Shutdown

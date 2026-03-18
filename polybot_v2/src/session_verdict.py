@@ -42,6 +42,76 @@ def _read_jsonl(path: Path) -> list[dict]:
 
 
 # ------------------------------------------------------------------ #
+# Measurement / basis risk note
+# ------------------------------------------------------------------ #
+
+def _build_measurement_note(bankroll_events: list[dict]) -> dict:
+    """
+    Build a measurement methodology note documenting the basis risk between
+    the Binance-based boundary resolution used at runtime and the actual
+    Polymarket settlement mechanism (Chainlink oracle at canonical market expiry).
+
+    Basis risk sources:
+      1. PRICE SOURCE: We use Binance spot BTC. Polymarket uses Chainlink oracle BTC.
+         Binance-Chainlink spread is typically small but non-zero, and can flip
+         binary outcomes in windows that close within ~$5-10 of the opening price.
+      2. TIMING: We resolve at our local clock boundary. Polymarket resolves at the
+         canonical market expiry timestamp. Clock drift and network latency introduce
+         a timing offset that creates additional price uncertainty.
+      3. BINARY SENSITIVITY: Because outcomes are binary (price up = YES, down = NO),
+         any measurement difference near the open price is maximally impactful.
+
+    This does NOT invalidate the evaluation. It means: pnl_if_held values in
+    sessions where boundary_outcome was close-call (open price approx resolve price)
+    may not match what would have happened under actual Chainlink settlement.
+    """
+    boundary_events = [e for e in bankroll_events if e.get("event") == "window_boundary"]
+    window_count = len(boundary_events)
+
+    # Collect snapshot lag data from windows that have it
+    lag_values = [
+        float(e["snapshot_lag_sec"])
+        for e in boundary_events
+        if e.get("snapshot_lag_sec") is not None
+    ]
+    resolve_prices = [
+        float(e["resolve_price_usdc"])
+        for e in boundary_events
+        if e.get("resolve_price_usdc") is not None
+    ]
+    fallback_count = sum(
+        1 for e in boundary_events if e.get("resolve_price_usdc") is None
+    )
+    windows_with_resolve_data = len(resolve_prices)
+
+    avg_snapshot_lag_sec = round(statistics.mean(lag_values), 3) if lag_values else None
+    max_snapshot_lag_sec = round(max(lag_values), 3) if lag_values else None
+
+    return {
+        "outcome_source": "binance_spot_local_clock",
+        "settlement_reference": "chainlink_oracle_canonical_expiry",
+        "basis_risk": "PRESENT",
+        "basis_risk_description": (
+            "Boundary outcomes use Binance spot BTC price at local clock boundary. "
+            "Actual Polymarket settlement uses Chainlink oracle price at canonical "
+            "market expiry. Price-source basis and clock timing offset can flip binary "
+            "outcomes in close-price windows. pnl_if_held figures are indicative only."
+        ),
+        "window_count": window_count,
+        "windows_with_resolve_data": windows_with_resolve_data,
+        "fallback_windows": fallback_count,
+        "avg_snapshot_lag_sec": avg_snapshot_lag_sec,
+        "max_snapshot_lag_sec": max_snapshot_lag_sec,
+        "audit_note": (
+            "To assess basis risk per window: compare resolve_price_usdc in "
+            "bankroll.jsonl window_boundary events against Chainlink BTC/USD "
+            "at boundary_ts. Shadow quotes log measurement_source and "
+            "resolve_price_usdc for boundary_resolved events."
+        ),
+    }
+
+
+# ------------------------------------------------------------------ #
 # Taker summary
 # ------------------------------------------------------------------ #
 
@@ -366,6 +436,34 @@ def _build_maker_summary(quotes: list[dict]) -> dict:
         "by_regime": by_regime,
         "by_ste_bucket": by_ste,
         "by_passive_edge_bucket": by_passive_edge,
+        # ── Explicit diagnostics vs evidence classification ──────────────────
+        # diagnostics: operational health metrics. Tell you whether the probe is
+        #   working (fills occurring, not all rejected), NOT whether it has edge.
+        # evidence: fill-conditioned economic outcome. Populated only when fills
+        #   occur AND boundary outcomes are resolved. These are the actual edge signal.
+        "diagnostics": {
+            "fill_rate": round(fill_rate, 4) if fill_rate is not None else None,
+            "expiry_rate": round(expiry_rate, 4) if expiry_rate is not None else None,
+            "adverse_fill_ratio": round(adverse_ratio, 4) if adverse_ratio is not None else None,
+            "note": (
+                "Operational health only. High fill_rate means the probe is active, "
+                "NOT that it has edge. Evaluate evidence sub-dict for economic signal."
+            ),
+        },
+        "evidence": {
+            "resolved_filled_count": resolved_filled_count,
+            "boundary_win_count": boundary_win_count,
+            "boundary_loss_count": boundary_loss_count,
+            "boundary_win_rate": round(boundary_win_rate, 4) if boundary_win_rate is not None else None,
+            "pnl_if_held_total": round(pnl_total, 6),
+            "pnl_if_held_mean": round(pnl_mean, 6) if pnl_mean is not None else None,
+            "pnl_if_held_median": round(pnl_median, 6) if pnl_median is not None else None,
+            "has_evidence": resolved_filled_count > 0 and pnl_mean is not None,
+            "note": (
+                "Fill-conditioned economic outcomes. Only meaningful when "
+                "resolved_filled_count > 0. These drive the provisional verdict."
+            ),
+        },
     }
 
 
@@ -595,10 +693,14 @@ def _build_verdict(
         )
 
     # --- Maker status ---
+    # Evidence gate: diagnostics (fill_rate, expiry_rate) indicate operational health
+    # but are NOT edge evidence. Evidence requires fill-conditioned pnl (resolved_filled_count > 0
+    # and mean_pnl is not None). Never promote to candidate on diagnostics alone.
     resolved_fills = maker.get("resolved_filled_count", 0)
     bwr = maker.get("boundary_win_rate")
     mean_pnl = maker.get("maker_pnl_if_held_mean")
     adverse_ratio = maker.get("adverse_fill_ratio")
+    has_evidence = maker.get("evidence", {}).get("has_evidence", resolved_fills > 0 and mean_pnl is not None)
 
     min_fills = cfg.verdict_maker_min_resolved_fills
     min_bwr = cfg.verdict_maker_min_boundary_win_rate
@@ -607,7 +709,17 @@ def _build_verdict(
 
     if resolved_fills == 0:
         maker_status = "no_fill_data"
-        reasons.append("maker: zero resolved filled quotes")
+        reasons.append(
+            "maker: zero resolved filled quotes - diagnostics may be present "
+            "but fill-conditioned evidence requires at least one boundary-resolved fill"
+        )
+    elif not has_evidence:
+        # Fills exist but no pnl_if_held data — diagnostics present, evidence absent
+        maker_status = "diagnostics_only_no_evidence"
+        reasons.append(
+            f"maker: {resolved_fills} fills recorded but no fill-conditioned pnl evidence "
+            "(pnl_if_held is None) - cannot assess edge from diagnostics alone"
+        )
     elif resolved_fills < min_fills:
         maker_status = "insufficient_sample"
         reasons.append(
@@ -616,12 +728,14 @@ def _build_verdict(
     elif bwr is None or bwr < min_bwr:
         maker_status = "evaluation_only"
         reasons.append(
-            f"maker: boundary_win_rate={bwr} < threshold={min_bwr}"
+            f"maker: boundary_win_rate={bwr} < threshold={min_bwr} "
+            "(evidence present but win rate below threshold)"
         )
     elif mean_pnl is None or mean_pnl < min_pnl:
         maker_status = "evaluation_only"
         reasons.append(
-            f"maker: mean_pnl_if_held={mean_pnl} < threshold={min_pnl}"
+            f"maker: mean_pnl_if_held={mean_pnl} < threshold={min_pnl} "
+            "(evidence present but pnl below threshold)"
         )
     elif adverse_ratio is not None and adverse_ratio > max_adv:
         maker_status = "evaluation_only"
@@ -631,7 +745,8 @@ def _build_verdict(
     else:
         maker_status = "conditionally_researchable"
         reasons.append(
-            f"maker: win_rate={bwr:.3f} mean_pnl={mean_pnl:.4f} adverse={adverse_ratio:.3f}  - thresholds met"
+            f"maker: win_rate={bwr:.3f} mean_pnl={mean_pnl:.4f} "
+            f"adverse={adverse_ratio:.3f}  - fill-conditioned evidence thresholds met"
         )
 
     # --- Live candidate ---
@@ -702,6 +817,7 @@ def _render_txt(
     verdict: dict,
     session_ts: str,
     regime_bias: Optional[dict] = None,
+    measurement_note: Optional[dict] = None,
 ) -> str:
     lines = []
     lines.append("=" * 70)
@@ -759,24 +875,33 @@ def _render_txt(
 
     lines.append("\n-- MAKER (primary evaluation lane) --")
     lines.append(f"  Unique quotes placed : {maker['unique_quote_count']}")
-    lines.append(f"  Fills                : {maker['fill_count']}")
-    lines.append(f"  Expiries             : {maker['expiry_count']}")
+
+    lines.append("  [DIAGNOSTICS - operational health, NOT edge evidence]")
+    lines.append(f"    Fills              : {maker['fill_count']}")
+    lines.append(f"    Expiries           : {maker['expiry_count']}")
     fr = maker.get("fill_rate")
-    lines.append(f"  Fill rate            : {fr:.4f}" if fr is not None else "  Fill rate            : n/a")
-    lines.append(f"  Adverse fills        : {maker['adverse_fill_count']}")
-    lines.append(f"  Favorable fills      : {maker['favorable_fill_count']}")
+    lines.append(f"    Fill rate          : {fr:.4f}" if fr is not None else "    Fill rate          : n/a")
     af = maker.get("adverse_fill_ratio")
-    lines.append(f"  Adverse fill ratio   : {af:.4f}" if af is not None else "  Adverse fill ratio   : n/a")
-    lines.append(f"  Resolved filled      : {maker['resolved_filled_count']}")
-    lines.append(f"  Boundary wins        : {maker['boundary_win_count']}")
-    lines.append(f"  Boundary losses      : {maker['boundary_loss_count']}")
+    lines.append(f"    Adverse fill ratio : {af:.4f}" if af is not None else "    Adverse fill ratio : n/a")
+    lines.append(f"    Adverse fills      : {maker['adverse_fill_count']}")
+    lines.append(f"    Favorable fills    : {maker['favorable_fill_count']}")
+
+    lines.append("  [EVIDENCE - fill-conditioned economic outcomes]")
+    evid = maker.get("evidence", {})
+    has_ev = evid.get("has_evidence", False)
+    if not has_ev:
+        lines.append("    *** NO FILL-CONDITIONED EVIDENCE YET ***")
+        lines.append("    Requires boundary-resolved fills with pnl_if_held data.")
+    lines.append(f"    Resolved filled    : {maker['resolved_filled_count']}")
+    lines.append(f"    Boundary wins      : {maker['boundary_win_count']}")
+    lines.append(f"    Boundary losses    : {maker['boundary_loss_count']}")
     bwr = maker.get("boundary_win_rate")
-    lines.append(f"  Boundary win rate    : {bwr:.4f}" if bwr is not None else "  Boundary win rate    : n/a")
-    lines.append(f"  PnL-if-held total    : {maker['maker_pnl_if_held_total']:.6f}")
+    lines.append(f"    Boundary win rate  : {bwr:.4f}" if bwr is not None else "    Boundary win rate  : n/a")
+    lines.append(f"    PnL-if-held total  : {maker['maker_pnl_if_held_total']:.6f}")
     mp = maker.get("maker_pnl_if_held_mean")
-    lines.append(f"  PnL-if-held mean     : {mp:.6f}" if mp is not None else "  PnL-if-held mean     : n/a")
+    lines.append(f"    PnL-if-held mean   : {mp:.6f}" if mp is not None else "    PnL-if-held mean   : n/a")
     mpmed = maker.get("maker_pnl_if_held_median")
-    lines.append(f"  PnL-if-held median   : {mpmed:.6f}" if mpmed is not None else "  PnL-if-held median   : n/a")
+    lines.append(f"    PnL-if-held median : {mpmed:.6f}" if mpmed is not None else "    PnL-if-held median : n/a")
 
     rejects = maker.get("reject_breakdown", {})
     if any(v > 0 for v in rejects.values()):
@@ -844,6 +969,27 @@ def _render_txt(
         "           See REGIME BIAS ASSESSMENT below before drawing strategic conclusions."
     )
 
+    # Measurement / basis risk note
+    if measurement_note:
+        lines.append("\n-- MEASUREMENT / BASIS RISK --")
+        lines.append(f"  Outcome source   : {measurement_note.get('outcome_source', 'n/a')}")
+        lines.append(f"  Settlement ref   : {measurement_note.get('settlement_reference', 'n/a')}")
+        lines.append(f"  Basis risk       : {measurement_note.get('basis_risk', 'n/a')}")
+        avg_lag = measurement_note.get("avg_snapshot_lag_sec")
+        max_lag = measurement_note.get("max_snapshot_lag_sec")
+        lines.append(
+            f"  Snapshot lag     : avg={avg_lag:.3f}s  max={max_lag:.3f}s"
+            if avg_lag is not None and max_lag is not None
+            else "  Snapshot lag     : n/a (no windows with resolve data)"
+        )
+        fb = measurement_note.get("fallback_windows", 0)
+        if fb > 0:
+            lines.append(f"  *** {fb} window(s) used fallback outcome (no Binance snapshot) ***")
+        for ln in textwrap.wrap(
+            measurement_note.get("basis_risk_description", ""), width=64
+        ):
+            lines.append(f"  {ln}")
+
     # Regime bias assessment
     if regime_bias:
         lines.append("\n-- REGIME / SAMPLE BIAS ASSESSMENT --")
@@ -902,6 +1048,7 @@ def build_session_summary(
     maker = _build_maker_summary(quotes)
     regime_bias = _build_regime_bias_note(taker, maker)
     verdict = _build_verdict(taker, maker, cfg)
+    measurement_note = _build_measurement_note(bankroll_events)
 
     # Session duration from bankroll events if available
     boundary_events = [e for e in bankroll_events if e.get("event") == "window_boundary"]
@@ -914,6 +1061,7 @@ def build_session_summary(
         "maker": maker,
         "regime_bias": regime_bias,
         "verdict": verdict,
+        "measurement_note": measurement_note,
     }
 
     # Write JSON
@@ -924,6 +1072,10 @@ def build_session_summary(
     # Write TXT  - explicit utf-8 encoding for Windows cp125x compatibility
     txt_path = log_dir / "session_summary.txt"
     with open(txt_path, "w", encoding="utf-8") as fh:
-        fh.write(_render_txt(taker, maker, verdict, session_ts, regime_bias=regime_bias))
+        fh.write(_render_txt(
+            taker, maker, verdict, session_ts,
+            regime_bias=regime_bias,
+            measurement_note=measurement_note,
+        ))
 
     return summary
