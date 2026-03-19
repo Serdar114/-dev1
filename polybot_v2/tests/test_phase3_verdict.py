@@ -1128,17 +1128,17 @@ class TestHighEdgeSubset:
     def test_resolved_filled_count(self):
         """Only quotes with boundary_outcome_for_side set counted as resolved fills."""
         notes = _build_high_edge_subset_note(self._high_edge_quotes())
-        assert notes["resolved_filled_count"] == 3
+        assert notes["subset_resolved_filled_count"] == 3
 
     def test_pnl_mean_computed(self):
-        """pnl_if_held_mean is mean of pnl values in subset."""
+        """subset_pnl_if_held_mean is mean of pnl values in subset."""
         notes = _build_high_edge_subset_note(self._high_edge_quotes())
         expected_mean = (0.80 + 0.60 - 0.20) / 3.0
-        assert notes["pnl_if_held_mean"] == pytest.approx(expected_mean, abs=1e-5)
+        assert notes["subset_pnl_if_held_mean"] == pytest.approx(expected_mean, abs=1e-5)
 
     def test_pnl_total(self):
         notes = _build_high_edge_subset_note(self._high_edge_quotes())
-        assert notes["pnl_if_held_total"] == pytest.approx(0.80 + 0.60 - 0.20, abs=1e-5)
+        assert notes["subset_pnl_if_held_total"] == pytest.approx(0.80 + 0.60 - 0.20, abs=1e-5)
 
     def test_boundary_win_loss_counts(self):
         notes = _build_high_edge_subset_note(self._high_edge_quotes())
@@ -1147,19 +1147,19 @@ class TestHighEdgeSubset:
 
     def test_boundary_win_rate(self):
         notes = _build_high_edge_subset_note(self._high_edge_quotes())
-        assert notes["boundary_win_rate"] == pytest.approx(2.0 / 3.0, abs=1e-3)
+        assert notes["subset_boundary_win_rate"] == pytest.approx(2.0 / 3.0, abs=1e-3)
 
     def test_by_side_breakdown_present(self):
         notes = _build_high_edge_subset_note(self._high_edge_quotes())
-        assert "yes" in notes["by_side"]
-        assert "no" in notes["by_side"]
-        assert notes["by_side"]["yes"]["count"] == 2
-        assert notes["by_side"]["no"]["count"] == 1
+        assert "yes" in notes["subset_by_side"]
+        assert "no" in notes["subset_by_side"]
+        assert notes["subset_by_side"]["yes"]["count"] == 2
+        assert notes["subset_by_side"]["no"]["count"] == 1
 
     def test_by_side_yes_pnl_mean(self):
         notes = _build_high_edge_subset_note(self._high_edge_quotes())
         expected_yes = (0.80 + 0.60) / 2.0
-        assert notes["by_side"]["yes"]["pnl_if_held_mean"] == pytest.approx(expected_yes, abs=1e-5)
+        assert notes["subset_by_side"]["yes"]["pnl_if_held_mean"] == pytest.approx(expected_yes, abs=1e-5)
 
     def test_subset_positive_pnl_flag(self):
         notes = _build_high_edge_subset_note(self._high_edge_quotes())
@@ -1185,8 +1185,8 @@ class TestHighEdgeSubset:
         """No high-edge quotes -> subset_count=0, all None/zero."""
         notes = _build_high_edge_subset_note(self._low_edge_quotes())
         assert notes["subset_count"] == 0
-        assert notes["resolved_filled_count"] == 0
-        assert notes["pnl_if_held_mean"] is None
+        assert notes["subset_resolved_filled_count"] == 0
+        assert notes["subset_pnl_if_held_mean"] is None
         assert notes["candidate_promotion"] == "NOT_AUTO_PROMOTED"
 
     def test_empty_input_handled(self):
@@ -1275,3 +1275,157 @@ class TestHighEdgeSubset:
         # Both YES and NO sides should appear in the by-side breakdown
         assert "YES" in txt
         assert "NO" in txt
+
+    # ── New tests: subset_ field names, comparison fields, framing ──────────
+
+    def test_subset_framing_field(self):
+        """subset_framing must equal 'promising_subset_not_yet_proven_edge'."""
+        notes = _build_high_edge_subset_note(self._high_edge_quotes())
+        assert notes["subset_framing"] == "promising_subset_not_yet_proven_edge"
+
+    def test_subset_framing_field_empty_input(self):
+        """subset_framing must be set even when subset_count=0."""
+        notes = _build_high_edge_subset_note([])
+        assert notes["subset_framing"] == "promising_subset_not_yet_proven_edge"
+
+    def test_comparison_fields_injected_in_maker_summary(self):
+        """_build_maker_summary injects comparison fields into high_edge_subset."""
+        m = _build_maker_summary(self._high_edge_quotes() + self._low_edge_quotes())
+        hes = m["high_edge_subset"]
+        assert "broad_maker_pnl_if_held_mean" in hes
+        assert "subset_stronger_than_broad_maker" in hes
+        assert "still_sample_limited" in hes
+
+    def test_still_sample_limited_always_true(self):
+        """still_sample_limited must always be True (single-session)."""
+        m = _build_maker_summary(self._high_edge_quotes())
+        assert m["high_edge_subset"]["still_sample_limited"] is True
+
+    def test_still_sample_limited_true_with_no_subset(self):
+        """still_sample_limited is True even when no high-edge quotes."""
+        m = _build_maker_summary(self._low_edge_quotes())
+        assert m["high_edge_subset"]["still_sample_limited"] is True
+
+    def test_subset_stronger_when_subset_mean_higher(self):
+        """subset_stronger_than_broad_maker=True when subset mean > broad mean."""
+        # high-edge mean = (0.80+0.60-0.20)/3 = 0.4
+        # low-edge l1 has pnl -0.10; l2 has None
+        # broad mean = (0.80+0.60-0.20-0.10)/4 = 0.275
+        # 0.4 > 0.275 => True
+        all_quotes = self._high_edge_quotes() + self._low_edge_quotes()
+        m = _build_maker_summary(all_quotes)
+        assert m["high_edge_subset"]["subset_stronger_than_broad_maker"] is True
+
+    def test_subset_not_stronger_when_subset_mean_lower(self):
+        """subset_stronger_than_broad_maker=False when subset mean <= broad mean."""
+        low_pnl_subset = [
+            {"quote_id": "h1", "fill_status": "filled_adverse", "side": "yes",
+             "regime": "CHOP", "seconds_to_expiry": 90.0,
+             "intended_passive_edge": 0.12,
+             "maker_pnl_if_held": -0.50, "boundary_outcome_for_side": 0.0},
+        ]
+        high_pnl_low_edge = [
+            {"quote_id": "l1", "fill_status": "filled_favorable", "side": "yes",
+             "regime": "TRENDING", "seconds_to_expiry": 60.0,
+             "intended_passive_edge": 0.05,
+             "maker_pnl_if_held": 0.90, "boundary_outcome_for_side": 1.0},
+        ]
+        # subset mean = -0.50, broad mean = (-0.50+0.90)/2 = 0.20 => False
+        m = _build_maker_summary(low_pnl_subset + high_pnl_low_edge)
+        assert m["high_edge_subset"]["subset_stronger_than_broad_maker"] is False
+
+    def test_broad_maker_mean_matches_overall_mean(self):
+        """broad_maker_pnl_if_held_mean must equal maker_pnl_if_held_mean."""
+        all_quotes = self._high_edge_quotes() + self._low_edge_quotes()
+        m = _build_maker_summary(all_quotes)
+        assert (
+            m["high_edge_subset"]["broad_maker_pnl_if_held_mean"]
+            == m["maker_pnl_if_held_mean"]
+        )
+
+    def test_subset_stronger_none_when_no_data(self):
+        """subset_stronger_than_broad_maker=None when subset has no pnl data."""
+        # Only expired quote in high-edge band — no pnl_if_held
+        no_pnl_quotes = [
+            {"quote_id": "h1", "fill_status": "expired_unfilled", "side": "yes",
+             "regime": "QUIET", "seconds_to_expiry": 90.0,
+             "intended_passive_edge": 0.12,
+             "maker_pnl_if_held": None, "boundary_outcome_for_side": None},
+        ]
+        m = _build_maker_summary(no_pnl_quotes)
+        assert m["high_edge_subset"]["subset_stronger_than_broad_maker"] is None
+
+    def test_txt_shows_comparison_section(self, tmp_path):
+        """TXT must contain explicit comparison between broad maker and subset."""
+        cfg = Settings(CONFIG_PATH)
+        quotes = self._high_edge_quotes() + self._low_edge_quotes()
+        for fname in ("signals.jsonl", "paper_trades.jsonl", "bankroll.jsonl"):
+            (tmp_path / fname).write_text("")
+        with open(tmp_path / "shadow_quotes.jsonl", "w") as fh:
+            for q in quotes:
+                fh.write(json.dumps(q) + "\n")
+        build_session_summary(tmp_path, cfg, session_ts="20260319_000010")
+        txt = (tmp_path / "session_summary.txt").read_text(encoding="utf-8")
+        assert "COMPARISON" in txt
+        assert "Broad maker pnl_mean" in txt
+        assert "Subset pnl_mean" in txt
+
+    def test_txt_shows_sample_limited(self, tmp_path):
+        """TXT must state STILL SAMPLE-LIMITED."""
+        cfg = Settings(CONFIG_PATH)
+        quotes = self._high_edge_quotes()
+        for fname in ("signals.jsonl", "paper_trades.jsonl", "bankroll.jsonl"):
+            (tmp_path / fname).write_text("")
+        with open(tmp_path / "shadow_quotes.jsonl", "w") as fh:
+            for q in quotes:
+                fh.write(json.dumps(q) + "\n")
+        build_session_summary(tmp_path, cfg, session_ts="20260319_000011")
+        txt = (tmp_path / "session_summary.txt").read_text(encoding="utf-8")
+        assert "STILL SAMPLE-LIMITED" in txt
+        assert "Multi-session" in txt or "multi-session" in txt
+
+    def test_txt_subset_section_before_strategic_interpretation(self, tmp_path):
+        """HIGH PASSIVE-EDGE SUBSET section must appear before MAKER STRATEGIC INTERPRETATION."""
+        cfg = Settings(CONFIG_PATH)
+        quotes = self._high_edge_quotes() + self._low_edge_quotes()
+        for fname in ("signals.jsonl", "paper_trades.jsonl", "bankroll.jsonl"):
+            (tmp_path / fname).write_text("")
+        with open(tmp_path / "shadow_quotes.jsonl", "w") as fh:
+            for q in quotes:
+                fh.write(json.dumps(q) + "\n")
+        build_session_summary(tmp_path, cfg, session_ts="20260319_000012")
+        txt = (tmp_path / "session_summary.txt").read_text(encoding="utf-8")
+        subset_pos = txt.find("HIGH PASSIVE-EDGE SUBSET")
+        strategic_pos = txt.find("MAKER STRATEGIC INTERPRETATION")
+        assert subset_pos != -1, "HIGH PASSIVE-EDGE SUBSET section not found"
+        assert strategic_pos != -1, "MAKER STRATEGIC INTERPRETATION section not found"
+        assert subset_pos < strategic_pos, (
+            "HIGH PASSIVE-EDGE SUBSET must appear before MAKER STRATEGIC INTERPRETATION"
+        )
+
+    def test_txt_stronger_than_broad_maker_statement(self, tmp_path):
+        """When subset pnl > broad pnl, TXT must say STRONGER THAN BROAD MAKER THIS RUN."""
+        cfg = Settings(CONFIG_PATH)
+        # high-edge subset mean (0.4) > broad mean (0.275) with low-edge drag
+        quotes = self._high_edge_quotes() + self._low_edge_quotes()
+        for fname in ("signals.jsonl", "paper_trades.jsonl", "bankroll.jsonl"):
+            (tmp_path / fname).write_text("")
+        with open(tmp_path / "shadow_quotes.jsonl", "w") as fh:
+            for q in quotes:
+                fh.write(json.dumps(q) + "\n")
+        build_session_summary(tmp_path, cfg, session_ts="20260319_000013")
+        txt = (tmp_path / "session_summary.txt").read_text(encoding="utf-8")
+        assert "STRONGER THAN BROAD MAKER THIS RUN" in txt
+
+    def test_txt_subset_field_name_subset_resolved_fills(self, tmp_path):
+        """TXT must use 'Subset resolved fills' label (not bare 'Resolved fills')."""
+        cfg = Settings(CONFIG_PATH)
+        quotes = self._high_edge_quotes()
+        for fname in ("signals.jsonl", "paper_trades.jsonl", "bankroll.jsonl"):
+            (tmp_path / fname).write_text("")
+        with open(tmp_path / "shadow_quotes.jsonl", "w") as fh:
+            for q in quotes:
+                fh.write(json.dumps(q) + "\n")
+        build_session_summary(tmp_path, cfg, session_ts="20260319_000014")
+        txt = (tmp_path / "session_summary.txt").read_text(encoding="utf-8")
+        assert "Subset resolved fills" in txt
