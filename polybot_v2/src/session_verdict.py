@@ -413,6 +413,9 @@ def _build_maker_summary(quotes: list[dict]) -> dict:
         plist = g.pop("pnl_if_held_list", [])
         g["pnl_if_held_mean"] = round(statistics.mean(plist), 6) if plist else None
 
+    # High passive-edge subset analysis
+    high_edge_subset = _build_high_edge_subset_note(resolved_quotes)
+
     return {
         "unique_quote_count": unique_quote_count,
         "fill_count": fill_count,
@@ -436,6 +439,7 @@ def _build_maker_summary(quotes: list[dict]) -> dict:
         "by_regime": by_regime,
         "by_ste_bucket": by_ste,
         "by_passive_edge_bucket": by_passive_edge,
+        "high_edge_subset": high_edge_subset,
         # ── Explicit diagnostics vs evidence classification ──────────────────
         # diagnostics: operational health metrics. Tell you whether the probe is
         #   working (fills occurring, not all rejected), NOT whether it has edge.
@@ -507,6 +511,123 @@ def _group_breakdown(quotes: list[dict], key: str) -> dict[str, dict]:
         plist = g.pop("pnl_if_held_list", [])
         g["pnl_if_held_mean"] = round(statistics.mean(plist), 6) if plist else None
     return groups
+
+
+# ------------------------------------------------------------------ #
+# High passive-edge subset analysis
+# ------------------------------------------------------------------ #
+
+def _build_high_edge_subset_note(
+    resolved_quotes: list[dict],
+    edge_threshold: float = 0.10,
+) -> dict:
+    """
+    Analyse the high passive-edge subset (intended_passive_edge >= threshold).
+
+    Framing: promising subset, NOT yet proven edge.
+    Never auto-promotes to candidate. Requires multi-session consistency
+    and regime diversity before any strategy conclusion can be drawn.
+    """
+    subset = [
+        q for q in resolved_quotes
+        if q.get("intended_passive_edge") is not None
+        and float(q["intended_passive_edge"]) >= edge_threshold
+    ]
+    count = len(subset)
+
+    if count == 0:
+        return {
+            "edge_threshold": edge_threshold,
+            "subset_count": 0,
+            "resolved_filled_count": 0,
+            "pnl_if_held_mean": None,
+            "pnl_if_held_total": 0.0,
+            "pnl_if_held_median": None,
+            "boundary_win_count": 0,
+            "boundary_loss_count": 0,
+            "boundary_win_rate": None,
+            "by_side": {},
+            "subset_positive_pnl": None,
+            "framing": "promising_subset_not_yet_proven_edge",
+            "candidate_promotion": "NOT_AUTO_PROMOTED",
+            "note": (
+                f"No quotes with intended_passive_edge >= {edge_threshold:.2f} "
+                "in this session. Cannot assess high-edge subset performance."
+            ),
+        }
+
+    # Resolved fills = quotes with boundary_outcome_for_side set
+    resolved_filled = [
+        q for q in subset if q.get("boundary_outcome_for_side") is not None
+    ]
+    resolved_filled_count = len(resolved_filled)
+
+    pnl_list = [
+        float(q["maker_pnl_if_held"])
+        for q in subset
+        if q.get("maker_pnl_if_held") is not None
+    ]
+    pnl_total = sum(pnl_list) if pnl_list else 0.0
+    pnl_mean = statistics.mean(pnl_list) if pnl_list else None
+    pnl_median = statistics.median(pnl_list) if pnl_list else None
+
+    # Boundary wins/losses within subset
+    boundary_wins = [
+        q for q in resolved_filled
+        if float(q["boundary_outcome_for_side"]) >= 1.0
+    ]
+    boundary_losses = [
+        q for q in resolved_filled
+        if float(q["boundary_outcome_for_side"]) <= 0.0
+    ]
+    boundary_win_rate = (
+        len(boundary_wins) / len(resolved_filled) if resolved_filled else None
+    )
+
+    # By-side breakdown within subset
+    by_side: dict[str, dict] = {}
+    for q in subset:
+        side = q.get("side") or "unknown"
+        if side not in by_side:
+            by_side[side] = _empty_group()
+        _update_group(by_side[side], q)
+    for g in by_side.values():
+        plist_s = g.pop("pnl_if_held_list", [])
+        g["pnl_if_held_mean"] = round(statistics.mean(plist_s), 6) if plist_s else None
+
+    is_positive = pnl_mean is not None and pnl_mean > 0
+
+    if pnl_mean is not None:
+        pnl_note = (
+            f"pnl_if_held_mean={pnl_mean:+.4f} - "
+            "promising but NOT proven edge. "
+            "Do not promote to candidate based on subset alone. "
+            "Requires multi-session consistency and regime diversity "
+            "before any strategy conclusion."
+        )
+    else:
+        pnl_note = "No fill-conditioned pnl data yet for this subset."
+
+    return {
+        "edge_threshold": edge_threshold,
+        "subset_count": count,
+        "resolved_filled_count": resolved_filled_count,
+        "pnl_if_held_mean": round(pnl_mean, 6) if pnl_mean is not None else None,
+        "pnl_if_held_total": round(pnl_total, 6),
+        "pnl_if_held_median": round(pnl_median, 6) if pnl_median is not None else None,
+        "boundary_win_count": len(boundary_wins),
+        "boundary_loss_count": len(boundary_losses),
+        "boundary_win_rate": round(boundary_win_rate, 4) if boundary_win_rate is not None else None,
+        "by_side": by_side,
+        "subset_positive_pnl": is_positive,
+        "framing": "promising_subset_not_yet_proven_edge",
+        "candidate_promotion": "NOT_AUTO_PROMOTED",
+        "note": (
+            f"Subset with intended_passive_edge >= {edge_threshold:.2f}: "
+            f"{count} quotes, {resolved_filled_count} boundary-resolved fills. "
+            + pnl_note
+        ),
+    }
 
 
 # ------------------------------------------------------------------ #
@@ -968,6 +1089,65 @@ def _render_txt(
     lines.append(
         "           See REGIME BIAS ASSESSMENT below before drawing strategic conclusions."
     )
+
+    # High passive-edge subset
+    hes = maker.get("high_edge_subset", {})
+    if hes:
+        thr = hes.get("edge_threshold", 0.10)
+        lines.append(
+            f"\n-- HIGH PASSIVE-EDGE SUBSET (intended_passive_edge >= {thr:.2f}) --"
+        )
+        lines.append(
+            "  [CONSERVATIVE FRAMING: promising subset, NOT yet proven edge]"
+        )
+        lines.append(f"  Subset count          : {hes.get('subset_count', 0)}")
+        lines.append(f"  Resolved fills        : {hes.get('resolved_filled_count', 0)}")
+        he_pm = hes.get("pnl_if_held_mean")
+        lines.append(
+            f"  PnL-if-held mean      : {he_pm:+.6f}" if he_pm is not None
+            else "  PnL-if-held mean      : n/a"
+        )
+        he_pmed = hes.get("pnl_if_held_median")
+        lines.append(
+            f"  PnL-if-held median    : {he_pmed:+.6f}" if he_pmed is not None
+            else "  PnL-if-held median    : n/a"
+        )
+        lines.append(f"  PnL-if-held total     : {hes.get('pnl_if_held_total', 0.0):+.6f}")
+        he_bwr = hes.get("boundary_win_rate")
+        he_bwc = hes.get("boundary_win_count", 0)
+        he_blc = hes.get("boundary_loss_count", 0)
+        lines.append(
+            f"  Boundary win rate     : {he_bwr:.4f}  ({he_bwc} wins / {he_blc} losses)"
+            if he_bwr is not None
+            else f"  Boundary win rate     : n/a  ({he_bwc} wins / {he_blc} losses)"
+        )
+        he_sides = hes.get("by_side", {})
+        if he_sides:
+            lines.append("  By-side breakdown:")
+            for s_name in ("yes", "no"):
+                sd = he_sides.get(s_name, {})
+                if sd:
+                    s_pm = sd.get("pnl_if_held_mean")
+                    s_pm_str = f"{s_pm:+.4f}" if s_pm is not None else "n/a"
+                    lines.append(
+                        f"    {s_name.upper():3s}: count={sd.get('count',0)}"
+                        f"  fills={sd.get('fill_count',0)}"
+                        f"  bwins={sd.get('boundary_win_count',0)}"
+                        f"  pnl_mean={s_pm_str}"
+                    )
+        is_pos = hes.get("subset_positive_pnl")
+        if is_pos is True:
+            lines.append(
+                "  *** Subset pnl_mean is POSITIVE this session."
+            )
+            lines.append(
+                "      Multi-session confirmation and regime diversity required."
+            )
+        elif is_pos is False:
+            lines.append("  Subset pnl_mean is NEGATIVE this session.")
+        lines.append(
+            "  Candidate promotion   : NOT_AUTO_PROMOTED"
+        )
 
     # Measurement / basis risk note
     if measurement_note:

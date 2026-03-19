@@ -27,6 +27,7 @@ from session_verdict import (
     _build_taker_summary,
     _build_verdict,
     _build_regime_bias_note,
+    _build_high_edge_subset_note,
     build_session_summary,
 )
 
@@ -1074,3 +1075,203 @@ class TestEvidenceGateInVerdict:
         })
         v = _build_verdict(self._taker(), maker, cfg)
         assert v["maker_status"] == "conditionally_researchable"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# O) High passive-edge subset reporting
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestHighEdgeSubset:
+    """
+    Tests for the high passive-edge subset analysis added to maker summaries.
+    Conservative framing: promising subset, NOT yet proven edge.
+    Never auto-promotes to candidate.
+    """
+
+    def _high_edge_quotes(self) -> list[dict]:
+        """Three quotes at >= 0.10 passive edge with boundary data."""
+        return [
+            {"quote_id": "h1", "fill_status": "filled_favorable", "side": "yes",
+             "regime": "TRENDING", "seconds_to_expiry": 90.0,
+             "intended_passive_edge": 0.12,
+             "maker_pnl_if_held": 0.80, "boundary_outcome_for_side": 1.0},
+            {"quote_id": "h2", "fill_status": "filled_favorable", "side": "yes",
+             "regime": "TRENDING", "seconds_to_expiry": 70.0,
+             "intended_passive_edge": 0.15,
+             "maker_pnl_if_held": 0.60, "boundary_outcome_for_side": 1.0},
+            {"quote_id": "h3", "fill_status": "filled_adverse", "side": "no",
+             "regime": "CHOP", "seconds_to_expiry": 50.0,
+             "intended_passive_edge": 0.11,
+             "maker_pnl_if_held": -0.20, "boundary_outcome_for_side": 0.0},
+        ]
+
+    def _low_edge_quotes(self) -> list[dict]:
+        """Two quotes below the 0.10 threshold."""
+        return [
+            {"quote_id": "l1", "fill_status": "filled_adverse", "side": "yes",
+             "regime": "CHOP", "seconds_to_expiry": 40.0,
+             "intended_passive_edge": 0.04,
+             "maker_pnl_if_held": -0.10, "boundary_outcome_for_side": 0.0},
+            {"quote_id": "l2", "fill_status": "expired_unfilled", "side": "no",
+             "regime": "QUIET", "seconds_to_expiry": 60.0,
+             "intended_passive_edge": 0.03,
+             "maker_pnl_if_held": None, "boundary_outcome_for_side": None},
+        ]
+
+    def test_subset_count_only_high_edge(self):
+        """Only quotes with intended_passive_edge >= 0.10 counted in subset."""
+        notes = _build_high_edge_subset_note(
+            self._high_edge_quotes() + self._low_edge_quotes()
+        )
+        assert notes["subset_count"] == 3
+
+    def test_resolved_filled_count(self):
+        """Only quotes with boundary_outcome_for_side set counted as resolved fills."""
+        notes = _build_high_edge_subset_note(self._high_edge_quotes())
+        assert notes["resolved_filled_count"] == 3
+
+    def test_pnl_mean_computed(self):
+        """pnl_if_held_mean is mean of pnl values in subset."""
+        notes = _build_high_edge_subset_note(self._high_edge_quotes())
+        expected_mean = (0.80 + 0.60 - 0.20) / 3.0
+        assert notes["pnl_if_held_mean"] == pytest.approx(expected_mean, abs=1e-5)
+
+    def test_pnl_total(self):
+        notes = _build_high_edge_subset_note(self._high_edge_quotes())
+        assert notes["pnl_if_held_total"] == pytest.approx(0.80 + 0.60 - 0.20, abs=1e-5)
+
+    def test_boundary_win_loss_counts(self):
+        notes = _build_high_edge_subset_note(self._high_edge_quotes())
+        assert notes["boundary_win_count"] == 2
+        assert notes["boundary_loss_count"] == 1
+
+    def test_boundary_win_rate(self):
+        notes = _build_high_edge_subset_note(self._high_edge_quotes())
+        assert notes["boundary_win_rate"] == pytest.approx(2.0 / 3.0, abs=1e-3)
+
+    def test_by_side_breakdown_present(self):
+        notes = _build_high_edge_subset_note(self._high_edge_quotes())
+        assert "yes" in notes["by_side"]
+        assert "no" in notes["by_side"]
+        assert notes["by_side"]["yes"]["count"] == 2
+        assert notes["by_side"]["no"]["count"] == 1
+
+    def test_by_side_yes_pnl_mean(self):
+        notes = _build_high_edge_subset_note(self._high_edge_quotes())
+        expected_yes = (0.80 + 0.60) / 2.0
+        assert notes["by_side"]["yes"]["pnl_if_held_mean"] == pytest.approx(expected_yes, abs=1e-5)
+
+    def test_subset_positive_pnl_flag(self):
+        notes = _build_high_edge_subset_note(self._high_edge_quotes())
+        assert notes["subset_positive_pnl"] is True
+
+    def test_subset_negative_pnl_flag(self):
+        negative_quotes = [
+            {"quote_id": "n1", "fill_status": "filled_adverse", "side": "yes",
+             "regime": "CHOP", "seconds_to_expiry": 90.0,
+             "intended_passive_edge": 0.12,
+             "maker_pnl_if_held": -0.50, "boundary_outcome_for_side": 0.0},
+        ]
+        notes = _build_high_edge_subset_note(negative_quotes)
+        assert notes["subset_positive_pnl"] is False
+
+    def test_conservative_framing_fields(self):
+        """framing and candidate_promotion fields must carry conservative labels."""
+        notes = _build_high_edge_subset_note(self._high_edge_quotes())
+        assert notes["framing"] == "promising_subset_not_yet_proven_edge"
+        assert notes["candidate_promotion"] == "NOT_AUTO_PROMOTED"
+
+    def test_empty_subset_when_no_high_edge_quotes(self):
+        """No high-edge quotes -> subset_count=0, all None/zero."""
+        notes = _build_high_edge_subset_note(self._low_edge_quotes())
+        assert notes["subset_count"] == 0
+        assert notes["resolved_filled_count"] == 0
+        assert notes["pnl_if_held_mean"] is None
+        assert notes["candidate_promotion"] == "NOT_AUTO_PROMOTED"
+
+    def test_empty_input_handled(self):
+        notes = _build_high_edge_subset_note([])
+        assert notes["subset_count"] == 0
+
+    def test_maker_summary_includes_high_edge_subset(self):
+        """_build_maker_summary returns 'high_edge_subset' key."""
+        m = _build_maker_summary(self._high_edge_quotes() + self._low_edge_quotes())
+        assert "high_edge_subset" in m
+        assert m["high_edge_subset"]["subset_count"] == 3
+
+    def test_maker_summary_high_edge_subset_does_not_auto_promote(self):
+        """high_edge_subset.candidate_promotion must always be NOT_AUTO_PROMOTED."""
+        m = _build_maker_summary(self._high_edge_quotes())
+        assert m["high_edge_subset"]["candidate_promotion"] == "NOT_AUTO_PROMOTED"
+
+    def test_json_includes_high_edge_subset(self, tmp_path):
+        """build_session_summary writes high_edge_subset into session_summary.json."""
+        cfg = Settings(CONFIG_PATH)
+        quotes = self._high_edge_quotes() + self._low_edge_quotes()
+        for fname in ("signals.jsonl", "paper_trades.jsonl", "bankroll.jsonl"):
+            (tmp_path / fname).write_text("")
+        with open(tmp_path / "shadow_quotes.jsonl", "w") as fh:
+            for q in quotes:
+                fh.write(json.dumps(q) + "\n")
+        summary = build_session_summary(tmp_path, cfg, session_ts="20260319_000000")
+        assert "high_edge_subset" in summary["maker"]
+        assert summary["maker"]["high_edge_subset"]["subset_count"] == 3
+
+    def test_txt_contains_high_edge_subset_section(self, tmp_path):
+        """session_summary.txt must contain HIGH PASSIVE-EDGE SUBSET section."""
+        cfg = Settings(CONFIG_PATH)
+        quotes = self._high_edge_quotes() + self._low_edge_quotes()
+        for fname in ("signals.jsonl", "paper_trades.jsonl", "bankroll.jsonl"):
+            (tmp_path / fname).write_text("")
+        with open(tmp_path / "shadow_quotes.jsonl", "w") as fh:
+            for q in quotes:
+                fh.write(json.dumps(q) + "\n")
+        build_session_summary(tmp_path, cfg, session_ts="20260319_000001")
+        txt = (tmp_path / "session_summary.txt").read_text(encoding="utf-8")
+        assert "HIGH PASSIVE-EDGE SUBSET" in txt
+        assert "NOT_AUTO_PROMOTED" in txt
+
+    def test_txt_high_edge_section_ascii_safe(self, tmp_path):
+        """High-edge subset section must not introduce non-ASCII chars."""
+        cfg = Settings(CONFIG_PATH)
+        quotes = self._high_edge_quotes()
+        for fname in ("signals.jsonl", "paper_trades.jsonl", "bankroll.jsonl"):
+            (tmp_path / fname).write_text("")
+        with open(tmp_path / "shadow_quotes.jsonl", "w") as fh:
+            for q in quotes:
+                fh.write(json.dumps(q) + "\n")
+        build_session_summary(tmp_path, cfg, session_ts="20260319_000002")
+        txt = (tmp_path / "session_summary.txt").read_text(encoding="utf-8")
+        try:
+            txt.encode("ascii")
+        except UnicodeEncodeError as e:
+            pytest.fail(f"Non-ASCII char in txt after high-edge section added: {e}")
+
+    def test_txt_shows_positive_pnl_note(self, tmp_path):
+        """When subset pnl is positive, TXT must flag it with conservative note."""
+        cfg = Settings(CONFIG_PATH)
+        quotes = self._high_edge_quotes()  # net positive pnl
+        for fname in ("signals.jsonl", "paper_trades.jsonl", "bankroll.jsonl"):
+            (tmp_path / fname).write_text("")
+        with open(tmp_path / "shadow_quotes.jsonl", "w") as fh:
+            for q in quotes:
+                fh.write(json.dumps(q) + "\n")
+        build_session_summary(tmp_path, cfg, session_ts="20260319_000003")
+        txt = (tmp_path / "session_summary.txt").read_text(encoding="utf-8")
+        assert "POSITIVE" in txt
+        assert "Multi-session confirmation" in txt or "regime diversity" in txt
+
+    def test_txt_shows_by_side_breakdown(self, tmp_path):
+        """TXT must render by-side breakdown for the high-edge subset."""
+        cfg = Settings(CONFIG_PATH)
+        quotes = self._high_edge_quotes()
+        for fname in ("signals.jsonl", "paper_trades.jsonl", "bankroll.jsonl"):
+            (tmp_path / fname).write_text("")
+        with open(tmp_path / "shadow_quotes.jsonl", "w") as fh:
+            for q in quotes:
+                fh.write(json.dumps(q) + "\n")
+        build_session_summary(tmp_path, cfg, session_ts="20260319_000004")
+        txt = (tmp_path / "session_summary.txt").read_text(encoding="utf-8")
+        # Both YES and NO sides should appear in the by-side breakdown
+        assert "YES" in txt
+        assert "NO" in txt
