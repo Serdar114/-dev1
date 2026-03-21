@@ -1,0 +1,96 @@
+# ============================================================
+# Research Bot — Main Configuration
+# ============================================================
+# ALL kill conditions live in kill_conditions.yaml.
+# This file governs runtime behaviour, feed config, sizing,
+# fee model constants, and phase selection.
+
+# ----------------------------------------------------------
+# Phase Control
+# Supported values: 0a | 0b | 0c | 1
+#   0a  Infrastructure validation   (feed + discovery health only)
+#   0b  Signal validation           (signal engine, no fill simulation)
+#   0c  Paper trading validation    (full dual-lane paper execution)
+#   1   Live-candidate readiness    (paper only; tighter kill thresholds)
+# ----------------------------------------------------------
+phase: "0c"
+
+# ----------------------------------------------------------
+# Feed Configuration
+# RTDS = Polymarket Real-Time Data Service (websocket-based)
+# TODO: Confirm exact RTDS websocket host once Polymarket
+#       publishes stable channel docs.  Current best-known
+#       base is documented in feeds/base.py.
+# ----------------------------------------------------------
+feeds:
+  rtds_host: "wss://ws-subscriptions-clob.polymarket.com/ws/"
+  fast_feed_channel: "crypto_prices"          # Binance-like tick feed
+  chainlink_feed_channel: "crypto_prices_chainlink"  # Reference / settlement feed
+  stale_threshold_seconds: 10.0               # Mark feed stale if gap > this
+  max_gap_log_interval_seconds: 30.0          # Suppress repeated gap warnings
+
+# ----------------------------------------------------------
+# Market Discovery
+# ----------------------------------------------------------
+discovery:
+  # Gamma (Polymarket events API) base URL
+  # TODO: Replace with stable versioned endpoint when available.
+  gamma_base_url: "https://gamma-api.polymarket.com"
+  slug_template: "btc-updown-5m-{window_boundary}"
+  window_seconds: 300         # 5-minute windows
+  lookback_windows: 3         # How many prior windows to cache
+  discovery_timeout_seconds: 5.0
+
+# ----------------------------------------------------------
+# Signal Engine
+# ----------------------------------------------------------
+signal:
+  # Endcycle timing: seconds before window close to accept a signal
+  endcycle_entry_cutoff_seconds: 45
+  # Feed freshness: reject signal if either feed is older than this
+  feed_freshness_threshold_seconds: 8.0
+  # Basis mismatch: flag window if |fast - chainlink| exceeds this (bps)
+  basis_mismatch_flag_threshold_bps: 30.0
+  # Spread quality: minimum acceptable YES-side spread (bps)
+  min_spread_quality_bps: 5.0
+  # Extreme zone thresholds for quote-quality eligibility
+  extreme_zone_low: 0.10
+  extreme_zone_high: 0.90
+  # Momentum persistence: minimum candles confirming direction
+  momentum_persistence_candles: 2
+
+# ----------------------------------------------------------
+# Execution — Sizing
+# ----------------------------------------------------------
+sizing:
+  min_shares: 5               # HARD CONSTRAINT: minimum order size = 5 shares
+  fixed_shares_v1: 5          # v1 uses fixed 5-share sizing only
+  initial_bankroll: 1000.0    # Paper bankroll (USD)
+
+# ----------------------------------------------------------
+# Fee Model
+# See execution/fees.py for formula derivation and constants.
+# ----------------------------------------------------------
+fees:
+  maker_fee_rate: 0.0         # Maker fee = 0 (rebate model)
+  # Taker fee constant C in:  fee = C * 0.25 * (p*(1-p))^2
+  # C encapsulates CLOB taker rate + any exchange spread.
+  # Polymarket CLOB documented taker fee: 2% of winnings = 0.02.
+  # We use C = 0.02 as the baseline; override here to sensitivity-test.
+  taker_fee_C: 0.02
+
+# ----------------------------------------------------------
+# Quote Buckets (maker-paper classification)
+# ----------------------------------------------------------
+quote_buckets:
+  B1: [0.83, 0.86]
+  B2: [0.87, 0.90]
+  B3: [0.91, 0.92]
+
+# ----------------------------------------------------------
+# Logging
+# ----------------------------------------------------------
+logging:
+  level: "INFO"
+  log_dir: "logs"
+  summary_interval_windows: 50   # Print interim summary every N windows

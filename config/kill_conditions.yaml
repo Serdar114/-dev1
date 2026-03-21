@@ -1,0 +1,144 @@
+# ============================================================
+# Kill Conditions Configuration
+# ============================================================
+# All kill conditions are read exclusively by validator/kill_conditions.py.
+# No kill logic is embedded elsewhere in the codebase.
+#
+# Each condition has:
+#   enabled      : bool   — whether the check is active
+#   threshold    : float  — the limit value
+#   description  : str    — human-readable explanation
+#   action       : str    — "kill" | "tighten" | "warn"
+#
+# Conditions evaluated after every window (where data is available).
+# A single "kill" action triggers immediate session termination.
+# "tighten" logs a warning and halves position sizing.
+# "warn" logs only.
+# ============================================================
+
+kill_conditions:
+
+  # --- Signal Quality ---
+
+  raw_directional_accuracy:
+    enabled: true
+    threshold: 0.45          # Kill if raw direction accuracy falls below 45%
+    min_sample_size: 20      # Require at least N windows before evaluating
+    action: kill
+    description: >
+      Raw directional accuracy: fraction of candidate windows where predicted
+      direction matched actual close direction, regardless of fill.
+
+  filtered_directional_accuracy:
+    enabled: true
+    threshold: 0.50          # Kill if filtered accuracy below 50%
+    min_sample_size: 15
+    action: kill
+    description: >
+      Filtered directional accuracy: same as raw but restricted to windows
+      passing all signal quality filters (freshness, spread, extreme zone).
+
+  # --- Fill / Execution Quality ---
+
+  fill_conditioned_win_rate:
+    enabled: true
+    threshold: 0.52          # Kill if WR on actually-filled maker quotes < 52%
+    min_sample_size: 10
+    action: kill
+    description: >
+      Fill-conditioned win rate: win rate restricted to windows where a
+      maker quote was simulated as filled.
+
+  fill_rate:
+    enabled: true
+    threshold: 0.05          # Kill if maker fill rate < 5%
+    min_sample_size: 20
+    action: warn
+    description: >
+      Maker fill rate: fraction of candidate maker windows where quote
+      was simulated as filled. Very low rates indicate quote is too passive.
+
+  adverse_fill_underperformance:
+    enabled: true
+    threshold: -0.03         # Kill if adverse-fill P&L drag exceeds 3% of bankroll
+    min_sample_size: 10
+    action: kill
+    description: >
+      Adverse fill underperformance: cumulative P&L attributable to fills
+      that occurred when signal subsequently reversed, as fraction of bankroll.
+
+  avg_fill_price_ceiling:
+    enabled: true
+    threshold: 0.93          # Kill if average fill price (YES side) exceeds 0.93
+    min_sample_size: 10
+    action: tighten
+    description: >
+      Average fill price ceiling: if average executed price is above this
+      level, edge is likely too thin after fees even at maker rate.
+
+  # --- Feed Health ---
+
+  basis_mismatch_ceiling:
+    enabled: true
+    threshold: 50.0          # Kill if avg basis mismatch > 50 bps
+    min_sample_size: 10
+    action: tighten
+    description: >
+      Average basis mismatch (bps) between fast feed and Chainlink reference.
+      High persistent mismatch suggests feed unreliability.
+
+  chainlink_gap_frequency_ceiling:
+    enabled: true
+    threshold: 0.20          # Kill if Chainlink feed was stale >20% of active windows
+    min_sample_size: 10
+    action: kill
+    description: >
+      Fraction of active windows where the Chainlink feed gap exceeded
+      the stale_threshold_seconds setting.
+
+  fast_feed_gap_frequency_ceiling:
+    enabled: true
+    threshold: 0.15          # Kill if fast feed stale >15% of active windows
+    min_sample_size: 10
+    action: kill
+    description: >
+      Fraction of active windows where the fast (Binance-like) feed gap
+      exceeded the stale_threshold_seconds setting.
+
+  # --- Discovery ---
+
+  discovery_failure_rate_ceiling:
+    enabled: true
+    threshold: 0.10          # Kill if >10% of discovery attempts fail
+    min_sample_size: 10
+    action: kill
+    description: >
+      Fraction of window discovery attempts that returned no valid market
+      (slug not found, API timeout, invalid response).
+
+  open_price_capture_delay_ceiling:
+    enabled: true
+    threshold: 3.0           # Kill if avg delay > 3 seconds
+    min_sample_size: 10
+    action: tighten
+    description: >
+      Average seconds between window open and first price capture from feed.
+      High delay implies we are missing the open and distorting signal quality.
+
+  # --- Loss / Bankroll ---
+
+  consecutive_loss_limit:
+    enabled: true
+    threshold: 8             # Kill after 8 consecutive paper losses
+    action: kill
+    description: >
+      Maximum consecutive losing trades (paper). Triggered to prevent
+      runaway drawdown during signal breakdown periods.
+
+  paper_bankroll_floor:
+    enabled: true
+    threshold: 700.0         # Kill if paper bankroll drops below $700
+    action: kill
+    description: >
+      Minimum acceptable paper bankroll. A 30% drawdown from the $1000
+      starting balance triggers session termination.
