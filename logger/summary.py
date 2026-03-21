@@ -71,12 +71,15 @@ class WindowLog:
     signal_direction: str = "NONE"
     signal_eligible: bool = False
     gate_summary: str = ""
+    signal_rejection_reasons: str = ""   # Pipe-separated list of rejection reasons
+    current_yes_mid: Optional[float] = None  # Polymarket YES probability at signal time
 
     # Maker lane
     maker_quote_bucket: str = "N/A"
     maker_intended_price: Optional[float] = None
     maker_filled: bool = False
     maker_fill_price: Optional[float] = None
+    maker_fill_realism_grade: str = "N/A"   # OBSERVED_PATH | PROVISIONAL_NO_PATH | N/A
     maker_bankroll_fraction: Optional[float] = None
     maker_break_even_wr: Optional[float] = None
     maker_win_if_correct: Optional[float] = None
@@ -88,6 +91,9 @@ class WindowLog:
     taker_intended_price: Optional[float] = None
     taker_filled: bool = False
     taker_fill_price: Optional[float] = None
+    taker_decision_ts: Optional[float] = None
+    taker_execution_source: str = "UNAVAILABLE"
+    taker_assumed_slippage_bps: float = 0.0
     taker_fee_per_share: Optional[float] = None
     taker_total_fee: Optional[float] = None
     taker_bankroll_fraction: Optional[float] = None
@@ -96,6 +102,14 @@ class WindowLog:
     taker_loss_if_wrong: Optional[float] = None
     taker_net_pnl: Optional[float] = None
     taker_outcome_correct: Optional[bool] = None
+
+    # Settlement
+    settlement_source: str = "UNAVAILABLE"   # CHAINLINK_PROXY | FAST_PROXY | UNAVAILABLE
+
+    # Daily caps state snapshot
+    caps_candidates_today: int = 0
+    caps_entries_today: int = 0
+    caps_position_open: bool = False
 
     # Discovery
     discovery_ok: bool = False
@@ -117,6 +131,10 @@ class SummaryReporter:
         self._log_dir = log_cfg.get("log_dir", "logs")
         self._summary_interval = log_cfg.get("summary_interval_windows", 50)
         self._phase = phase
+        # Read initial bankroll from config — no hardcoded values.
+        self._initial_bankroll = float(
+            config.get("sizing", {}).get("initial_bankroll", 30.0)
+        )
 
         os.makedirs(self._log_dir, exist_ok=True)
         ts = int(time.time())
@@ -245,14 +263,14 @@ class SummaryReporter:
     # ------------------------------------------------------------------
 
     def _compute_bankroll(self, stats: SessionStats) -> float:
-        """Recompute paper bankroll from filled-trade P&L records."""
-        initial = 1000.0   # TODO: read from config in orchestrator
+        """Recompute paper bankroll from filled-trade P&L records.
+        Uses initial_bankroll from config (no hardcoded value)."""
         total_pnl = sum(
             wl.maker_net_pnl
             for wl in self._windows
             if wl.maker_net_pnl is not None
         )
-        return initial + total_pnl
+        return self._initial_bankroll + total_pnl
 
     def _write_summary_block(
         self,

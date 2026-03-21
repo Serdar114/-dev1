@@ -65,7 +65,15 @@ signal:
 sizing:
   min_shares: 5               # HARD CONSTRAINT: minimum order size = 5 shares
   fixed_shares_v1: 5          # v1 uses fixed 5-share sizing only
-  initial_bankroll: 1000.0    # Paper bankroll (USD)
+  initial_bankroll: 30.0      # Paper bankroll (USD) — micro-bankroll reality
+
+# ----------------------------------------------------------
+# Daily Caps  (enforced in code, not just logged)
+# ----------------------------------------------------------
+daily_caps:
+  max_candidates_per_day: 50  # Stop observing new candidates after this count
+  max_entries_per_day: 5      # Hard cap on filled paper entries per calendar day
+  one_position_at_a_time: true  # No overlapping positions allowed
 
 # ----------------------------------------------------------
 # Fee Model
@@ -78,6 +86,9 @@ fees:
   # Polymarket CLOB documented taker fee: 2% of winnings = 0.02.
   # We use C = 0.02 as the baseline; override here to sensitivity-test.
   taker_fee_C: 0.02
+  # Taker assumed slippage (bps) applied to decision price for realism logging.
+  # v1: 0 bps (documented; not applied to P&L — logged only as a field).
+  assumed_slippage_bps: 0
 
 # ----------------------------------------------------------
 # Quote Buckets (maker-paper classification)

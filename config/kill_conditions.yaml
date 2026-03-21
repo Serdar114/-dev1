@@ -137,8 +137,10 @@ kill_conditions:
 
   paper_bankroll_floor:
     enabled: true
-    threshold: 700.0         # Kill if paper bankroll drops below $700
+    threshold: 21.0          # Kill if paper bankroll drops below $21
     action: kill
     description: >
-      Minimum acceptable paper bankroll. A 30% drawdown from the $1000
-      starting balance triggers session termination.
+      Minimum acceptable paper bankroll. A 30% drawdown from the $30
+      starting balance triggers session termination. Threshold is 70%
+      of initial_bankroll (30.0 * 0.70 = 21.0). Update together with
+      sizing.initial_bankroll in settings.yaml.

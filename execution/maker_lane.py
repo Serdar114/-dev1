@@ -9,7 +9,7 @@ Sizing: FIXED 5 SHARES (v1 hard constraint).
 Quote Buckets
 -------------
 Every intended quote is classified into one of three buckets based on
-the intended execution price:
+the intended execution price (YES probability, 0-1):
 
     B1: 0.83 – 0.86
     B2: 0.87 – 0.90
@@ -17,24 +17,31 @@ the intended execution price:
 
 Quotes outside these ranges are not eligible for the maker lane.
 
-Fill simulation
----------------
-Paper fill is SIMULATED (no live order placement).  A quote is considered
-filled if the market price crosses the intended quote price during the
-window.  This is an OPTIMISTIC assumption — see README for execution
-realism risks.
+Fill simulation and realism grade
+----------------------------------
+Paper fill is SIMULATED (no live order placement).
+
+fill_realism_grade records the quality of the fill simulation:
+    "OBSERVED_PATH"       — intra_window_prices was populated with real data.
+    "PROVISIONAL_NO_PATH" — no intra-window price path available; fill is
+                            conservatively set to False.  Do NOT treat
+                            PROVISIONAL results as realistic fill estimates.
+
+When intra_window_prices is None, filled is always False to avoid
+optimistic inflation of fill rate metrics.
 
 Execution log fields (per window):
-    quote_bucket            : str  — "B1" | "B2" | "B3" | "INELIGIBLE"
+    quote_bucket            : str  — "B1" | "B2" | "B3" | "INELIGIBLE" | "N/A"
     intended_price          : float
     filled                  : bool
     fill_price              : float | None
+    fill_realism_grade      : str  — "OBSERVED_PATH" | "PROVISIONAL_NO_PATH" | "N/A"
     shares                  : int  (always 5 in v1)
     fee_per_share           : float (always 0 for maker)
     total_fee               : float (always 0 for maker)
     gross_pnl               : float | None
     net_pnl                 : float | None  (== gross_pnl since fee=0)
-    bankroll_fraction        : float — fraction of bankroll consumed by entry
+    bankroll_fraction       : float — fraction of bankroll consumed by entry
     break_even_wr_estimate  : float
     win_if_correct          : float — net gain if outcome matches prediction
     loss_if_wrong           : float — net loss if outcome is wrong
@@ -55,15 +62,21 @@ logger = logging.getLogger(__name__)
 FIXED_SHARES_V1 = 5
 
 # Quote bucket definitions: (label, low_inclusive, high_inclusive)
+# These are YES probability prices (0-1 range), not BTC/USD prices.
 QUOTE_BUCKETS = [
     ("B1", 0.83, 0.86),
     ("B2", 0.87, 0.90),
     ("B3", 0.91, 0.92),
 ]
 
+# Fill realism grade constants
+FILL_GRADE_OBSERVED = "OBSERVED_PATH"
+FILL_GRADE_PROVISIONAL = "PROVISIONAL_NO_PATH"
+FILL_GRADE_NA = "N/A"
+
 
 def classify_quote_bucket(price: float) -> str:
-    """Return the quote bucket label for `price`, or "INELIGIBLE"."""
+    """Return the quote bucket label for `price` (YES probability 0-1), or "INELIGIBLE"."""
     for label, lo, hi in QUOTE_BUCKETS:
         if lo <= price <= hi:
             return label
@@ -83,6 +96,7 @@ class MakerResult:
     shares: int = FIXED_SHARES_V1
     filled: bool = False
     fill_price: Optional[float] = None
+    fill_realism_grade: str = FILL_GRADE_NA   # see module docstring
     fee_per_share: float = 0.0
     total_fee: float = 0.0
     gross_pnl: Optional[float] = None
@@ -101,14 +115,13 @@ class MakerLane:
     Maker paper execution lane.
 
     Call sequence per window:
-        1. evaluate(window, signal, market_prices)  → MakerResult (pre-fill)
-        2. settle(result, actual_outcome)           → MakerResult (post-fill)
+        1. evaluate(...)  → MakerResult (pre-fill)
+        2. settle(result, actual_outcome)  → MakerResult (post-fill)
     """
 
     def __init__(self, config: dict) -> None:
         self._sizing_cfg = config.get("sizing", {})
         self._quote_buckets_cfg = config.get("quote_buckets", {})
-        # shares is always FIXED_SHARES_V1 in v1 — config read is for audit only.
         self._shares = FIXED_SHARES_V1
 
     def evaluate(
@@ -118,8 +131,7 @@ class MakerLane:
         signal_direction: str,
         intended_price: Optional[float],
         bankroll: float,
-        low_price_in_window: Optional[float] = None,
-        high_price_in_window: Optional[float] = None,
+        intra_window_prices: Optional[list] = None,
     ) -> MakerResult:
         """
         Simulate a maker quote for one window.
@@ -129,11 +141,20 @@ class MakerLane:
         window_open_ts      : Unix timestamp of window open.
         slug                : Market slug.
         signal_direction    : "YES" | "NO" | "NONE"
-        intended_price      : The price at which we would post the limit order
-                              (YES side). None if signal is "NONE".
+        intended_price      : The YES probability price at which to post the limit
+                              order. None if signal is "NONE". Must be in (0, 1).
         bankroll            : Current paper bankroll (USD).
-        low_price_in_window : Lowest YES price seen in the window (for fill sim).
-        high_price_in_window: Highest YES price seen in the window (for fill sim).
+        intra_window_prices : List of YES probability prices observed during the
+                              window (e.g. from CLOB snapshots or book feed).
+                              Pass None if unavailable — fill will be PROVISIONAL_NO_PATH
+                              and filled will be False.
+
+        Fill realism:
+            If intra_window_prices is provided, fill is True iff any price in the
+            list dips at or below intended_price (limit order crossing logic).
+            If intra_window_prices is None, fill is always False and the grade is
+            PROVISIONAL_NO_PATH.  This is the CONSERVATIVE choice — we do NOT
+            assume fills when we have no evidence of a price crossing.
 
         Returns
         -------
@@ -158,13 +179,13 @@ class MakerLane:
         if bucket == "INELIGIBLE":
             result.rejection_reason = f"price_{intended_price:.4f}_outside_buckets"
             logger.debug(
-                "[maker] Ineligible price=%.4f for window=%d slug=%s",
+                "[maker] Ineligible price=%.4f window=%d slug=%s",
                 intended_price, window_open_ts, slug
             )
             return result
 
         # Compute cost metrics.
-        cost = intended_price * self._shares          # Cash outlay per fill
+        cost = intended_price * self._shares
         result.bankroll_fraction = cost / bankroll if bankroll > 0 else 0.0
         result.fee_per_share = maker_fee(self._shares) / self._shares  # = 0.0
         result.total_fee = 0.0
@@ -172,21 +193,30 @@ class MakerLane:
         result.win_if_correct = (1.0 - intended_price) * self._shares
         result.loss_if_wrong = intended_price * self._shares
 
-        # Simulate fill: price must dip to / below intended (YES buy).
-        # We use the window's low price as a proxy for whether the limit
-        # would have been hit.
-        if low_price_in_window is not None and low_price_in_window <= intended_price:
-            result.filled = True
-            result.fill_price = intended_price   # Assume fill at limit price.
-            result.shares = self._shares
-        else:
+        # Fill simulation.
+        if intra_window_prices is None:
+            # No intra-window price path available.
+            # CONSERVATIVE: do not assume fill; mark as provisional.
             result.filled = False
             result.fill_price = None
+            result.fill_realism_grade = FILL_GRADE_PROVISIONAL
+        else:
+            # Observed path available: fill if any price dipped to / below limit.
+            min_price = min(intra_window_prices)
+            if min_price <= intended_price:
+                result.filled = True
+                result.fill_price = intended_price   # Assume fill at limit price.
+                result.shares = self._shares
+            else:
+                result.filled = False
+                result.fill_price = None
+            result.fill_realism_grade = FILL_GRADE_OBSERVED
 
         logger.info(
             "[maker] window=%d slug=%s bucket=%s price=%.4f filled=%s "
-            "bankroll_frac=%.4f be_wr=%.4f win=%.4f loss=%.4f",
+            "grade=%s bankroll_frac=%.4f be_wr=%.4f win=%.4f loss=%.4f",
             window_open_ts, slug, bucket, intended_price, result.filled,
+            result.fill_realism_grade,
             result.bankroll_fraction or 0.0,
             result.break_even_wr_estimate or 0.0,
             result.win_if_correct or 0.0,
@@ -202,9 +232,6 @@ class MakerLane:
         ----------
         result         : Previously returned MakerResult.
         actual_outcome : "YES" (price went up) | "NO" (price went down).
-
-        Updates gross_pnl, net_pnl, outcome_correct in place and returns
-        the updated result.
         """
         if not result.filled or result.fill_price is None:
             result.outcome_correct = None
@@ -213,17 +240,16 @@ class MakerLane:
         result.outcome_correct = (result.signal_direction == actual_outcome)
 
         if result.outcome_correct:
-            # Win: receive $1 per share, paid fill_price per share.
             result.gross_pnl = (1.0 - result.fill_price) * result.shares
         else:
-            # Loss: lose the fill_price per share.
             result.gross_pnl = -result.fill_price * result.shares
 
         result.net_pnl = result.gross_pnl  # maker fee = 0
 
         logger.info(
-            "[maker] settle window=%d outcome=%s correct=%s gross_pnl=%.4f",
+            "[maker] settle window=%d outcome=%s correct=%s gross_pnl=%.4f grade=%s",
             result.window_open_ts, actual_outcome,
-            result.outcome_correct, result.gross_pnl or 0.0
+            result.outcome_correct, result.gross_pnl or 0.0,
+            result.fill_realism_grade,
         )
         return result

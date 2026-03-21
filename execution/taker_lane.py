@@ -7,12 +7,20 @@ using the same signal, providing an apples-to-apples fee-impact analysis.
 
 Sizing: FIXED 5 SHARES (v1 hard constraint).
 
-Fill simulation
----------------
-A taker fill is assumed to execute at the window OPEN price.  This is an
-optimistic assumption for the open-price benchmark.  Actual taker fills
-during the window may be at worse prices.  See README for execution realism
-risks.
+Execution timing
+----------------
+The taker fill is simulated at the DECISION price, not the window-open price.
+Decision price is the fast feed YES probability at the moment the signal was
+evaluated (i.e., after the signal engine ran, before waiting for close).
+
+execution_source documents where the decision price came from:
+    "FAST_FEED_AT_SIGNAL"   — fast feed snapshot taken at signal evaluation time
+    "CLOB_ASK_AT_SIGNAL"    — best CLOB ask at signal evaluation time (preferred)
+    "UNAVAILABLE"           — price was not available; fill not simulated
+
+assumed_slippage_bps is logged but NOT applied to P&L in v1.
+It is a documented placeholder for realistic slippage modelling in v2.
+Configure in settings.yaml → fees.assumed_slippage_bps.
 
 Fee computation
 ---------------
@@ -22,14 +30,17 @@ Taker fee is computed using the formula from execution/fees.py:
 This is deducted from gross P&L to produce net P&L.
 
 Execution log fields (per window):
-    filled                  : bool  (always True for taker lane if signal exists)
-    fill_price              : float (window open price)
+    filled                  : bool
+    fill_price              : float (decision price)
+    decision_ts             : float (unix epoch seconds at fill decision)
+    execution_source        : str
+    assumed_slippage_bps    : float
     shares                  : int   (always 5 in v1)
     fee_per_share           : float
     total_fee               : float
     gross_pnl               : float | None
     net_pnl                 : float | None
-    bankroll_fraction        : float
+    bankroll_fraction       : float
     break_even_wr_estimate  : float
     win_if_correct          : float
     loss_if_wrong           : float
@@ -40,6 +51,7 @@ Execution log fields (per window):
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -48,6 +60,11 @@ from .fees import compute_taker_fee, break_even_win_rate, TakerFeeResult
 logger = logging.getLogger(__name__)
 
 FIXED_SHARES_V1 = 5
+
+# Execution source constants
+SRC_FAST_FEED_AT_SIGNAL = "FAST_FEED_AT_SIGNAL"
+SRC_CLOB_ASK_AT_SIGNAL = "CLOB_ASK_AT_SIGNAL"
+SRC_UNAVAILABLE = "UNAVAILABLE"
 
 
 @dataclass
@@ -60,6 +77,9 @@ class TakerResult:
     shares: int = FIXED_SHARES_V1
     filled: bool = False
     fill_price: Optional[float] = None
+    decision_ts: Optional[float] = None        # Unix epoch seconds of fill decision
+    execution_source: str = SRC_UNAVAILABLE    # Documents where price came from
+    assumed_slippage_bps: float = 0.0          # Documented; not applied to P&L in v1
     fee_per_share: float = 0.0
     total_fee: float = 0.0
     gross_pnl: Optional[float] = None
@@ -79,12 +99,16 @@ class TakerLane:
     Taker paper execution lane (benchmark / control).
 
     Same signal as the maker lane, different execution model:
-    - Always fills at open price (market order assumption).
+    - Fills at decision price (fast feed YES probability at signal time).
     - Deducts taker fee per the auditable formula in execution/fees.py.
+    - Logs decision_ts and execution_source for audit.
     """
 
     def __init__(self, config: dict) -> None:
         self._fee_C = config.get("fees", {}).get("taker_fee_C", 0.02)
+        self._assumed_slippage_bps = float(
+            config.get("fees", {}).get("assumed_slippage_bps", 0)
+        )
         self._shares = FIXED_SHARES_V1
 
     def evaluate(
@@ -92,46 +116,64 @@ class TakerLane:
         window_open_ts: int,
         slug: str,
         signal_direction: str,
-        open_price: Optional[float],
+        decision_price: Optional[float],
         bankroll: float,
+        decision_ts: Optional[float] = None,
+        execution_source: str = SRC_FAST_FEED_AT_SIGNAL,
     ) -> TakerResult:
         """
-        Simulate a taker fill at the window open price.
+        Simulate a taker fill at the decision price.
 
         Parameters
         ----------
-        window_open_ts  : Unix timestamp of window open.
-        slug            : Market slug.
-        signal_direction: "YES" | "NO" | "NONE"
-        open_price      : Window open price (YES side). None → no fill.
-        bankroll        : Current paper bankroll (USD).
+        window_open_ts   : Unix timestamp of window open.
+        slug             : Market slug.
+        signal_direction : "YES" | "NO" | "NONE"
+        decision_price   : YES probability price at signal evaluation time.
+                           This is the fast feed snapshot (or CLOB ask if available)
+                           at the moment we decided to take liquidity.
+                           NOT the window-open price — these can differ if signal
+                           evaluation is delayed.
+        bankroll         : Current paper bankroll (USD).
+        decision_ts      : Unix epoch seconds of the fill decision.
+                           None → auto-filled with time.time() at call time.
+        execution_source : Documents where decision_price came from.
+                           Use SRC_FAST_FEED_AT_SIGNAL, SRC_CLOB_ASK_AT_SIGNAL,
+                           or SRC_UNAVAILABLE.
         """
+        captured_ts = decision_ts if decision_ts is not None else time.time()
+
         result = TakerResult(
             window_open_ts=window_open_ts,
             slug=slug,
             signal_direction=signal_direction,
-            intended_price=open_price,
+            intended_price=decision_price,
+            decision_ts=captured_ts,
+            execution_source=execution_source,
+            assumed_slippage_bps=self._assumed_slippage_bps,
         )
 
-        if signal_direction == "NONE" or open_price is None:
-            result.rejection_reason = "no_signal"
+        if signal_direction == "NONE" or decision_price is None:
+            result.rejection_reason = "no_signal_or_price_unavailable"
+            result.execution_source = SRC_UNAVAILABLE
             return result
 
-        fee_result = compute_taker_fee(open_price, self._shares, self._fee_C)
+        fee_result = compute_taker_fee(decision_price, self._shares, self._fee_C)
         result.fee_result = fee_result
         result.fee_per_share = fee_result.fee_per_share
         result.total_fee = fee_result.total_fee
         result.filled = True
-        result.fill_price = open_price
-        result.bankroll_fraction = (open_price * self._shares) / bankroll if bankroll > 0 else 0.0
-        result.break_even_wr_estimate = break_even_win_rate(open_price, fee_result.fee_per_share)
-        result.win_if_correct = (1.0 - open_price) * self._shares - fee_result.total_fee
-        result.loss_if_wrong = open_price * self._shares + fee_result.total_fee
+        result.fill_price = decision_price
+        result.bankroll_fraction = (decision_price * self._shares) / bankroll if bankroll > 0 else 0.0
+        result.break_even_wr_estimate = break_even_win_rate(decision_price, fee_result.fee_per_share)
+        result.win_if_correct = (1.0 - decision_price) * self._shares - fee_result.total_fee
+        result.loss_if_wrong = decision_price * self._shares + fee_result.total_fee
 
         logger.info(
-            "[taker] window=%d slug=%s price=%.4f fee=%.6f/share total_fee=%.6f "
-            "bankroll_frac=%.4f be_wr=%.4f",
-            window_open_ts, slug, open_price,
+            "[taker] window=%d slug=%s price=%.4f src=%s decision_ts=%.3f "
+            "slippage=%dbps fee=%.6f/share total_fee=%.6f bankroll_frac=%.4f be_wr=%.4f",
+            window_open_ts, slug, decision_price, execution_source, captured_ts,
+            int(self._assumed_slippage_bps),
             fee_result.fee_per_share, fee_result.total_fee,
             result.bankroll_fraction or 0.0,
             result.break_even_wr_estimate or 0.0,
@@ -155,8 +197,10 @@ class TakerLane:
         result.net_pnl = (result.gross_pnl or 0.0) - result.total_fee
 
         logger.info(
-            "[taker] settle window=%d outcome=%s correct=%s gross=%.4f net=%.4f fee=%.6f",
+            "[taker] settle window=%d outcome=%s correct=%s "
+            "gross=%.4f net=%.4f fee=%.6f src=%s",
             result.window_open_ts, actual_outcome, result.outcome_correct,
             result.gross_pnl or 0.0, result.net_pnl or 0.0, result.total_fee,
+            result.execution_source,
         )
         return result
