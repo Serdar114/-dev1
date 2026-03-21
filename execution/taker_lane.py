@@ -158,6 +158,18 @@ class TakerLane:
             result.execution_source = SRC_UNAVAILABLE
             return result
 
+        # Price-space guard: decision_price must be a YES probability in (0, 1).
+        # BTC/USD prices (e.g. 94000.0) must NEVER reach here.
+        # Passing BTC/USD would corrupt the fee formula: p*(1-p) ≈ 94000*(-93999).
+        if not (0.0 < decision_price < 1.0):
+            raise ValueError(
+                f"TakerLane.evaluate: decision_price={decision_price!r} is outside (0, 1). "
+                "decision_price must be a Polymarket YES probability (e.g. 0.87). "
+                "BTC/USD prices must NEVER be passed here. "
+                "Use YesPriceSnapshot from feeds/yes_price_adapter.py to obtain the "
+                "YES probability before calling this method."
+            )
+
         fee_result = compute_taker_fee(decision_price, self._shares, self._fee_C)
         result.fee_result = fee_result
         result.fee_per_share = fee_result.fee_per_share

@@ -6,7 +6,7 @@ Unavailable data (CLOB book, candles) is reported explicitly, not silently
 collapsed to NONE.
 """
 import pytest
-from signal.engine import SignalEngine, FeedWindow, SignalDirection
+from sigeng.engine import SignalEngine, FeedWindow, SignalDirection
 
 
 def _make_fw(**kwargs):

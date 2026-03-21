@@ -70,8 +70,9 @@ QUOTE_BUCKETS = [
 ]
 
 # Fill realism grade constants
-FILL_GRADE_OBSERVED = "OBSERVED_PATH"
-FILL_GRADE_PROVISIONAL = "PROVISIONAL_NO_PATH"
+FILL_GRADE_OBSERVED = "OBSERVED_PATH"              # Real WebSocket price path
+FILL_GRADE_PROVISIONAL_PROXY = "PROVISIONAL_OBSERVED_PROXY"  # REST-polled proxy path
+FILL_GRADE_PROVISIONAL = "PROVISIONAL_NO_PATH"     # No prices at all
 FILL_GRADE_NA = "N/A"
 
 
@@ -132,6 +133,7 @@ class MakerLane:
         intended_price: Optional[float],
         bankroll: float,
         intra_window_prices: Optional[list] = None,
+        fill_realism_source: Optional[str] = None,
     ) -> MakerResult:
         """
         Simulate a maker quote for one window.
@@ -148,6 +150,13 @@ class MakerLane:
                               window (e.g. from CLOB snapshots or book feed).
                               Pass None if unavailable — fill will be PROVISIONAL_NO_PATH
                               and filled will be False.
+        fill_realism_source : Override the fill realism grade string.
+                              If None, auto-selected based on intra_window_prices:
+                                  None  → PROVISIONAL_NO_PATH
+                                  list  → OBSERVED_PATH (or PROVISIONAL_OBSERVED_PROXY
+                                          if fill_realism_source="PROVISIONAL_OBSERVED_PROXY")
+                              Pass FILL_GRADE_PROVISIONAL_PROXY when prices come from
+                              the REST-polled CLOBYesPriceAdapter (not WebSocket).
 
         Fill realism:
             If intra_window_prices is provided, fill is True iff any price in the
@@ -210,7 +219,12 @@ class MakerLane:
             else:
                 result.filled = False
                 result.fill_price = None
-            result.fill_realism_grade = FILL_GRADE_OBSERVED
+            # Grade: caller can override to PROVISIONAL_OBSERVED_PROXY when prices
+            # came from REST polling rather than a live WebSocket book stream.
+            result.fill_realism_grade = (
+                fill_realism_source if fill_realism_source is not None
+                else FILL_GRADE_OBSERVED
+            )
 
         logger.info(
             "[maker] window=%d slug=%s bucket=%s price=%.4f filled=%s "

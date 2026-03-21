@@ -5,7 +5,7 @@ Covers fix #2: extreme_zone gate must use current_yes_mid (Polymarket YES
 probability, 0-1 range) NOT BTC/USD spot price.
 """
 import pytest
-from signal.engine import SignalEngine, FeedWindow, SignalDirection
+from sigeng.engine import SignalEngine, FeedWindow, SignalDirection
 
 
 def _make_fw(current_yes_mid, yes_book_available=True, candles_available=True, **kwargs):

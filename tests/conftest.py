@@ -55,7 +55,7 @@ def all_gates_open_feed_window():
     A FeedWindow where all data is available and all gates should pass.
     Uses explicit current_yes_mid in probability space (0-1).
     """
-    from signal.engine import FeedWindow
+    from sigeng.engine import FeedWindow
     return FeedWindow(
         window_open_ts=1_700_000_000,
         slug="btc-updown-5m-1700000000",

@@ -50,14 +50,16 @@ from typing import Optional
 import yaml
 
 from discovery.market import MarketDiscovery, WindowMarket, current_window_boundary, next_window_boundary
-from execution.maker_lane import MakerLane
-from execution.taker_lane import TakerLane, SRC_FAST_FEED_AT_SIGNAL
+from execution.maker_lane import MakerLane, FILL_GRADE_PROVISIONAL_PROXY
+from execution.taker_lane import TakerLane, SRC_CLOB_ASK_AT_SIGNAL, SRC_UNAVAILABLE
 from feeds.chainlink_feed import ChainlinkFeedAdapter
 from feeds.fast_feed import FastFeedAdapter
+from feeds.intra_window_collector import IntraWindowYesPriceCollector, FILL_GRADE_PROVISIONAL_PROXY as INTRA_FILL_GRADE
+from feeds.yes_price_adapter import CLOBYesPriceAdapter
 from logger.summary import SummaryReporter, WindowLog
 from risk.sizing import PositionSizer
 from risk.caps import DailyCaps
-from signal.engine import FeedWindow, SignalEngine, SignalDirection
+from sigeng.engine import FeedWindow, SignalEngine, SignalDirection
 from validator.kill_conditions import KillAction, KillConditionValidator, SessionStats
 
 logger = logging.getLogger(__name__)
@@ -127,6 +129,11 @@ class ResearchBot:
         self._caps = DailyCaps(config.get("daily_caps", {}))
         self._reporter = SummaryReporter(config, self._phase)
         self._validator = KillConditionValidator(config["kill_conditions_cfg"])
+
+        # YES probability source (provisional REST polling until WebSocket live)
+        clob_url = config.get("discovery", {}).get("clob_base_url", "https://clob.polymarket.com")
+        self._yes_adapter = CLOBYesPriceAdapter(clob_base_url=clob_url)
+        self._intra_collector = IntraWindowYesPriceCollector(self._yes_adapter)
 
     async def run(self) -> None:
         """Main loop: start feeds, then iterate over 5m windows until killed."""
@@ -306,27 +313,66 @@ class ResearchBot:
         """
         Simulate maker and taker paper fills, then settle at window close.
         """
-        # Capture decision-time data (fast feed at signal evaluation moment).
+        # Capture decision-time timestamp.
         decision_ts = time.time()
-        decision_price = wl.fast_price   # fast feed price at signal time
-        # NOTE: wl.fast_price is BTC/USD from RTDS feeds, NOT a YES probability.
-        # The maker intended_price comes from sig.intended_price (YES probability mid).
-        # If sig.intended_price is None (yes_mid unavailable), maker cannot place quote.
+
+        # --- YES probability source (PROVISIONAL: REST polling) ---
+        # We need a YES probability in (0, 1) for both lanes.
+        # sig.intended_price comes from CLOB yes_mid embedded in FeedWindow.
+        # If unavailable in the signal engine, try a direct CLOB poll now.
+        yes_probability: Optional[float] = sig.intended_price
+        yes_src = SRC_CLOB_ASK_AT_SIGNAL
+
+        if yes_probability is None and market is not None:
+            # Attempt provisional REST poll to get a YES probability.
+            # Token ID is not available here without a CLOB lookup; log and skip.
+            # TODO: store token_id in WindowMarket from discovery response.
+            logger.warning(
+                "[bot] YES probability unavailable for window=%d (yes_mid=None). "
+                "Cannot source from CLOB without token_id. "
+                "Taker fill blocked. Maker fill blocked.",
+                window_open_ts
+            )
+            yes_src = SRC_UNAVAILABLE
 
         # --- Daily entry cap check ---
         can_enter, entry_reason = self._caps.can_enter()
+
+        # --- Concurrent: intra-window YES price collection + settlement wait ---
+        # Both run concurrently during the window.
+        # intra_window_prices populates the maker fill simulation.
+        now = time.time()
+        sleep_time = window_close_ts - now + 1
+        collect_duration = max(sleep_time - 5.0, 0.0)  # stop polling 5s before close
+
+        if yes_probability is not None and market is not None and collect_duration > 0:
+            # TODO: use market.yes_token_id once discovery provides it.
+            # Until then, intra-window collection requires token_id; skip.
+            intra_prices = None
+            intra_grade = None
+            # Placeholder: when token_id is available:
+            # intra_prices, _ = await asyncio.gather(
+            #     self._intra_collector.collect(market.yes_token_id, collect_duration),
+            #     asyncio.sleep(sleep_time),
+            # )
+            # intra_grade = FILL_GRADE_PROVISIONAL_PROXY
+            if sleep_time > 0:
+                await asyncio.sleep(sleep_time)
+        else:
+            intra_prices = None
+            intra_grade = None
+            if sleep_time > 0:
+                await asyncio.sleep(sleep_time)
 
         # --- Maker lane ---
         maker_result = self._maker_lane.evaluate(
             window_open_ts=window_open_ts,
             slug=wl.slug,
             signal_direction=sig.direction.value,
-            intended_price=sig.intended_price,   # YES probability from signal engine
+            intended_price=yes_probability,   # YES probability from CLOB
             bankroll=self._sizer.bankroll,
-            # intra_window_prices: no observed path yet.
-            # Fill grade = PROVISIONAL_NO_PATH; filled = False (conservative).
-            # TODO: connect CLOB snapshot loop to supply real intra-window prices.
-            intra_window_prices=None,
+            intra_window_prices=intra_prices,
+            fill_realism_source=intra_grade,
         )
         wl.maker_quote_bucket = maker_result.quote_bucket
         wl.maker_intended_price = maker_result.intended_price
@@ -337,14 +383,16 @@ class ResearchBot:
         wl.maker_loss_if_wrong = maker_result.loss_if_wrong
 
         # --- Taker lane ---
+        # decision_price MUST be YES probability in (0,1). NEVER pass BTC/USD here.
+        # If YES probability is unavailable, block the taker fill by passing None.
         taker_result = self._taker_lane.evaluate(
             window_open_ts=window_open_ts,
             slug=wl.slug,
             signal_direction=sig.direction.value,
-            decision_price=decision_price,
+            decision_price=yes_probability,   # YES probability (0,1) or None → no fill
             bankroll=self._sizer.bankroll,
             decision_ts=decision_ts,
-            execution_source=SRC_FAST_FEED_AT_SIGNAL,
+            execution_source=yes_src if yes_probability is not None else SRC_UNAVAILABLE,
         )
         wl.taker_intended_price = taker_result.intended_price
         wl.taker_decision_ts = taker_result.decision_ts
@@ -368,13 +416,6 @@ class ResearchBot:
             wl.taker_loss_if_wrong = taker_result.loss_if_wrong
             if taker_result.filled:
                 self._caps.record_entry()
-
-        # --- Wait for window close to settle ---
-        now = time.time()
-        sleep_time = window_close_ts - now + 1
-        if sleep_time > 0:
-            logger.debug("[bot] Waiting %.1fs for window close (settle)", sleep_time)
-            await asyncio.sleep(sleep_time)
 
         # --- Settlement: use Chainlink as proxy truth ---
         close_cl = self._chainlink_feed.latest

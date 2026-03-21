@@ -16,6 +16,14 @@
 phase: "0c"
 
 # ----------------------------------------------------------
+# Bot Mode
+# STRICT     : Missing data = hard gate failure (production readiness eval)
+# PROVISIONAL: Missing data = soft-pass with PROVISIONAL_SOFT_PASS label
+#              Use for early paper validation when CLOB/candle feeds unavailable
+# ----------------------------------------------------------
+bot_mode: "PROVISIONAL"
+
+# ----------------------------------------------------------
 # Feed Configuration
 # RTDS = Polymarket Real-Time Data Service (websocket-based)
 # TODO: Confirm exact RTDS websocket host once Polymarket
@@ -36,6 +44,9 @@ discovery:
   # Gamma (Polymarket events API) base URL
   # TODO: Replace with stable versioned endpoint when available.
   gamma_base_url: "https://gamma-api.polymarket.com"
+  # CLOB REST API base URL for YES probability polling (provisional)
+  # TODO: Upgrade to WebSocket subscription once CLOB book feed is confirmed.
+  clob_base_url: "https://clob.polymarket.com"
   slug_template: "btc-updown-5m-{window_boundary}"
   window_seconds: 300         # 5-minute windows
   lookback_windows: 3         # How many prior windows to cache
