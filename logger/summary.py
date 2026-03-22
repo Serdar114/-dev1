@@ -118,6 +118,14 @@ class WindowLog:
     # Open price capture delay
     open_price_capture_delay_seconds: Optional[float] = None
 
+    # YES price input tracking (for signal + execution audit)
+    yes_price_source: Optional[str] = None          # "clob_midpoint" | "clob_ask" | None
+    yes_price_is_provisional: Optional[bool] = None # True if REST-polled, False if WebSocket
+    signal_input_missing: Optional[str] = None      # e.g. "yes_mid_unavailable"
+    maker_path_source: Optional[str] = None         # fill realism grade for this window
+    maker_path_points_collected: int = 0            # number of intra-window prices collected
+    runtime_mode_effective: Optional[str] = None    # "STRICT" | "PROVISIONAL"
+
 
 class SummaryReporter:
     """

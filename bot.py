@@ -54,7 +54,8 @@ from execution.maker_lane import MakerLane, FILL_GRADE_PROVISIONAL_PROXY
 from execution.taker_lane import TakerLane, SRC_CLOB_ASK_AT_SIGNAL, SRC_UNAVAILABLE
 from feeds.chainlink_feed import ChainlinkFeedAdapter
 from feeds.fast_feed import FastFeedAdapter
-from feeds.intra_window_collector import IntraWindowYesPriceCollector, FILL_GRADE_PROVISIONAL_PROXY as INTRA_FILL_GRADE
+from feeds.intra_window_collector import IntraWindowYesPriceCollector
+from feeds.price_types import YesPriceSnapshot
 from feeds.yes_price_adapter import CLOBYesPriceAdapter
 from logger.summary import SummaryReporter, WindowLog
 from risk.sizing import PositionSizer
@@ -108,6 +109,8 @@ class ResearchBot:
     def __init__(self, config: dict) -> None:
         self._config = config
         self._phase = config.get("phase", "0c")
+        # STRICT: missing data = hard gate fail. PROVISIONAL: soft-pass with label.
+        self._bot_mode = config.get("bot_mode", "STRICT")
 
         feed_cfg = config["feeds"]
         self._fast_feed = FastFeedAdapter(
@@ -201,16 +204,17 @@ class ResearchBot:
             await asyncio.sleep(wait)
 
     async def _run_window(self) -> None:
-        """Execute one full window: feeds → caps → discovery → signal → execute → settle."""
+        """Execute one full window: feeds → caps → discovery → yes_mid → signal → execute → settle."""
         window_open_ts = current_window_boundary()
         window_close_ts = window_open_ts + 300
 
-        logger.info("[bot] === Window open ts=%d ===", window_open_ts)
+        logger.info("[bot] === Window open ts=%d mode=%s ===", window_open_ts, self._bot_mode)
 
         # ---- Daily cap reset ----
         self._caps.reset_if_new_day()
 
         wl = WindowLog(window_open_ts=window_open_ts, slug="", phase=self._phase)
+        wl.runtime_mode_effective = self._bot_mode
 
         # ---- Step 1: Capture feed snapshots ----
         open_capture_start = time.time()
@@ -244,6 +248,11 @@ class ResearchBot:
             self._reporter.record_window(wl)
             return
 
+        # ---- Step 4a: YES probability pre-fetch (pre-signal) ----
+        # Fetch before signal evaluation so extreme_zone gate can use it.
+        # Uses market.yes_token_id from discovery — never hardcoded.
+        yes_snap = await self._fetch_yes_snap(market, wl)
+
         # ---- Step 5: Signal engine ----
         seconds_remaining = window_close_ts - time.time()
         fw = FeedWindow(
@@ -253,20 +262,20 @@ class ResearchBot:
             latest_fast_price=wl.fast_price,
             open_chainlink_price=wl.chainlink_price,
             latest_chainlink_price=wl.chainlink_price,
-            # current_yes_mid: Polymarket YES probability price (0-1).
-            # TODO: populate from CLOB order book snapshot.
-            # Must NOT be set to BTC/USD spot price (e.g. 94000.0).
-            current_yes_mid=None,           # unavailable until CLOB book connected
-            yes_bid=None,                   # unavailable until CLOB book connected
-            yes_ask=None,                   # unavailable until CLOB book connected
+            # current_yes_mid: Polymarket YES probability (0-1) from CLOB REST poll.
+            # None if market unavailable or CLOB request failed.
+            # MUST NOT be set to BTC/USD spot price (BTCSpotSnapshot guard enforces this).
+            current_yes_mid=yes_snap.probability if yes_snap is not None else None,
+            yes_bid=None,           # REST midpoint does not provide bid; book not yet live
+            yes_ask=None,           # REST midpoint does not provide ask; book not yet live
             fast_gap_seconds=wl.fast_feed_gap_seconds,
             chainlink_gap_seconds=wl.chainlink_gap_seconds,
             fast_feed_stale=wl.fast_feed_stale,
             chainlink_feed_stale=wl.chainlink_feed_stale,
             seconds_to_window_close=seconds_remaining,
-            candles_same_direction=0,       # unavailable until 1m candle tracker connected
-            yes_book_available=False,       # explicit: CLOB book not yet connected
-            candles_available=False,        # explicit: candle tracker not yet connected
+            candles_same_direction=0,       # TODO: connect 1m candle tracker
+            yes_book_available=False,       # REST midpoint does not constitute a live book
+            candles_available=False,        # candle tracker not yet connected
         )
 
         sig = self._signal_engine.evaluate(fw)
@@ -297,81 +306,133 @@ class ResearchBot:
 
         # ---- Step 6: Paper execution (phases 0c and 1) ----
         if market is not None and sig.direction != SignalDirection.NONE:
-            await self._execute_paper_trades(wl, sig, market, window_open_ts, window_close_ts)
+            await self._execute_paper_trades(
+                wl, sig, market, yes_snap, window_open_ts, window_close_ts
+            )
 
         self._reporter.record_window(wl)
         self._check_kill(wl)
+
+    async def _fetch_yes_snap(
+        self,
+        market: Optional[WindowMarket],
+        wl: WindowLog,
+    ) -> Optional[YesPriceSnapshot]:
+        """
+        Fetch YES probability from CLOB REST API using market.yes_token_id.
+
+        Sets wl.yes_price_source, wl.yes_price_is_provisional, and
+        wl.signal_input_missing as side-effects for audit logging.
+
+        Returns
+        -------
+        YesPriceSnapshot with is_provisional=True, or None if unavailable.
+        None is a valid result — callers must treat it as YES mid unavailable.
+        """
+        if market is None:
+            wl.signal_input_missing = "yes_mid_unavailable:market_not_discovered"
+            logger.warning("[bot] YES mid unavailable: market not discovered (window=%d)", wl.window_open_ts)
+            return None
+
+        snap = await self._yes_adapter.get_yes_mid(
+            token_id=market.yes_token_id,
+            timestamp=time.time(),
+        )
+
+        if snap is not None:
+            wl.yes_price_source = snap.source
+            wl.yes_price_is_provisional = snap.is_provisional
+            logger.debug(
+                "[bot] YES mid fetched: token=%s prob=%.4f provisional=%s window=%d",
+                market.yes_token_id, snap.probability, snap.is_provisional, wl.window_open_ts,
+            )
+        else:
+            wl.signal_input_missing = "yes_mid_unavailable:clob_request_failed"
+            logger.warning(
+                "[bot] YES mid unavailable for window=%d token=%s (CLOB request failed)",
+                wl.window_open_ts, market.yes_token_id,
+            )
+
+        return snap
 
     async def _execute_paper_trades(
         self,
         wl: WindowLog,
         sig,
         market: WindowMarket,
+        yes_snap: Optional[YesPriceSnapshot],
         window_open_ts: int,
         window_close_ts: int,
     ) -> None:
         """
         Simulate maker and taker paper fills, then settle at window close.
+
+        YES probability flow
+        --------------------
+        yes_snap is the pre-signal CLOB midpoint snapshot fetched in _run_window.
+        It is the ONLY valid source for decision_price in the taker lane.
+        BTC/USD prices (wl.fast_price / wl.chainlink_price) MUST NOT reach
+        the taker lane (TakerLane.evaluate() has a hard ValueError guard).
+
+        Intra-window collection
+        -----------------------
+        IntraWindowYesPriceCollector polls market.yes_token_id every ~60s using
+        asyncio.gather alongside the settlement sleep.  Collected prices feed
+        the maker fill simulation with grade PROVISIONAL_OBSERVED_PROXY.
         """
-        # Capture decision-time timestamp.
         decision_ts = time.time()
 
-        # --- YES probability source (PROVISIONAL: REST polling) ---
-        # We need a YES probability in (0, 1) for both lanes.
-        # sig.intended_price comes from CLOB yes_mid embedded in FeedWindow.
-        # If unavailable in the signal engine, try a direct CLOB poll now.
-        yes_probability: Optional[float] = sig.intended_price
-        yes_src = SRC_CLOB_ASK_AT_SIGNAL
+        # YES probability for both lanes — from pre-signal CLOB fetch.
+        yes_probability: Optional[float] = yes_snap.probability if yes_snap is not None else None
+        yes_src = SRC_CLOB_ASK_AT_SIGNAL if yes_probability is not None else SRC_UNAVAILABLE
 
-        if yes_probability is None and market is not None:
-            # Attempt provisional REST poll to get a YES probability.
-            # Token ID is not available here without a CLOB lookup; log and skip.
-            # TODO: store token_id in WindowMarket from discovery response.
+        if yes_probability is None:
             logger.warning(
-                "[bot] YES probability unavailable for window=%d (yes_mid=None). "
-                "Cannot source from CLOB without token_id. "
-                "Taker fill blocked. Maker fill blocked.",
-                window_open_ts
+                "[bot] YES probability unavailable for window=%d token=%s — "
+                "taker fill blocked, maker fill blocked",
+                window_open_ts, market.yes_token_id,
             )
-            yes_src = SRC_UNAVAILABLE
 
         # --- Daily entry cap check ---
         can_enter, entry_reason = self._caps.can_enter()
 
         # --- Concurrent: intra-window YES price collection + settlement wait ---
-        # Both run concurrently during the window.
-        # intra_window_prices populates the maker fill simulation.
+        # IntraWindowYesPriceCollector uses market.yes_token_id directly.
+        # Both tasks run concurrently via asyncio.gather.
         now = time.time()
-        sleep_time = window_close_ts - now + 1
+        sleep_time = max(window_close_ts - now + 1, 0.0)
         collect_duration = max(sleep_time - 5.0, 0.0)  # stop polling 5s before close
 
-        if yes_probability is not None and market is not None and collect_duration > 0:
-            # TODO: use market.yes_token_id once discovery provides it.
-            # Until then, intra-window collection requires token_id; skip.
-            intra_prices = None
-            intra_grade = None
-            # Placeholder: when token_id is available:
-            # intra_prices, _ = await asyncio.gather(
-            #     self._intra_collector.collect(market.yes_token_id, collect_duration),
-            #     asyncio.sleep(sleep_time),
-            # )
-            # intra_grade = FILL_GRADE_PROVISIONAL_PROXY
-            if sleep_time > 0:
-                await asyncio.sleep(sleep_time)
+        if collect_duration > 0:
+            intra_prices, _ = await asyncio.gather(
+                self._intra_collector.collect(market.yes_token_id, collect_duration),
+                asyncio.sleep(sleep_time),
+            )
+            intra_grade = FILL_GRADE_PROVISIONAL_PROXY if intra_prices else None
         else:
-            intra_prices = None
+            intra_prices = []
             intra_grade = None
             if sleep_time > 0:
                 await asyncio.sleep(sleep_time)
+
+        wl.maker_path_source = intra_grade or "PROVISIONAL_NO_PATH"
+        wl.maker_path_points_collected = len(intra_prices) if intra_prices else 0
+
+        if not intra_prices:
+            logger.debug(
+                "[bot] maker_path_unavailable: no intra-window prices collected "
+                "for window=%d token=%s. Fill grade=PROVISIONAL_NO_PATH.",
+                window_open_ts, market.yes_token_id,
+            )
 
         # --- Maker lane ---
         maker_result = self._maker_lane.evaluate(
             window_open_ts=window_open_ts,
             slug=wl.slug,
             signal_direction=sig.direction.value,
-            intended_price=yes_probability,   # YES probability from CLOB
+            intended_price=yes_probability,   # YES probability (0,1) from CLOB
             bankroll=self._sizer.bankroll,
-            intra_window_prices=intra_prices,
+            intra_window_prices=intra_prices if intra_prices else None,
             fill_realism_source=intra_grade,
         )
         wl.maker_quote_bucket = maker_result.quote_bucket
@@ -383,17 +444,22 @@ class ResearchBot:
         wl.maker_loss_if_wrong = maker_result.loss_if_wrong
 
         # --- Taker lane ---
-        # decision_price MUST be YES probability in (0,1). NEVER pass BTC/USD here.
-        # If YES probability is unavailable, block the taker fill by passing None.
+        # decision_price MUST be a YES probability in (0,1).
+        # BTC/USD prices must NEVER reach here — TakerLane has a hard ValueError guard.
+        # If YES probability is unavailable (yes_snap was None), pass None → no fill.
+        # execution_blocked:yes_probability_unavailable is logged via rejection_reason.
+        taker_decision_price = yes_probability  # None → fill blocked by TakerLane
         taker_result = self._taker_lane.evaluate(
             window_open_ts=window_open_ts,
             slug=wl.slug,
             signal_direction=sig.direction.value,
-            decision_price=yes_probability,   # YES probability (0,1) or None → no fill
+            decision_price=taker_decision_price,
             bankroll=self._sizer.bankroll,
             decision_ts=decision_ts,
-            execution_source=yes_src if yes_probability is not None else SRC_UNAVAILABLE,
+            execution_source=yes_src,
         )
+        if taker_decision_price is None:
+            taker_result.rejection_reason = "execution_blocked:yes_probability_unavailable"
         wl.taker_intended_price = taker_result.intended_price
         wl.taker_decision_ts = taker_result.decision_ts
         wl.taker_execution_source = taker_result.execution_source
