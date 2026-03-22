@@ -22,7 +22,7 @@ def _make_fw(current_yes_mid, yes_book_available=True, candles_available=True, *
         chainlink_gap_seconds=3.0,
         fast_feed_stale=False,
         chainlink_feed_stale=False,
-        seconds_to_window_close=120.0,
+        seconds_to_window_close=30.0,   # within decision window [10, 45]
         candles_same_direction=3,
         yes_book_available=yes_book_available,
         candles_available=candles_available,

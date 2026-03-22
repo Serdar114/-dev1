@@ -126,6 +126,15 @@ class WindowLog:
     maker_path_points_collected: int = 0            # number of intra-window prices collected
     runtime_mode_effective: Optional[str] = None    # "STRICT" | "PROVISIONAL"
 
+    # Decision-time snapshot (Phase B: T - decision_window_start seconds before close)
+    # Distinct from fast_price / chainlink_price which are captured at window open (T+0).
+    decision_fast_price: Optional[float] = None         # BTC/USD at decision time
+    decision_chainlink_price: Optional[float] = None    # BTC/USD at decision time (Chainlink)
+    decision_yes_mid: Optional[float] = None            # YES probability at decision time
+    decision_ts: Optional[float] = None                 # Unix epoch of decision evaluation
+    decision_seconds_to_close: Optional[float] = None   # Seconds remaining when signal was evaluated
+    entry_cap_policy: str = "either_lane_fill"          # Documents which fills consume entry budget
+
 
 class SummaryReporter:
     """

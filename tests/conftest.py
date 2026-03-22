@@ -23,7 +23,9 @@ def base_config():
             "assumed_slippage_bps": 0,
         },
         "signal": {
-            "endcycle_entry_cutoff_seconds": 45,
+            "decision_window_start_seconds_to_close": 45,
+            "decision_window_end_seconds_to_close": 10,
+            "endcycle_entry_cutoff_seconds": 45,   # legacy alias
             "feed_freshness_threshold_seconds": 8.0,
             "basis_mismatch_flag_threshold_bps": 30.0,
             "min_spread_quality_bps": 5.0,
@@ -70,7 +72,7 @@ def all_gates_open_feed_window():
         chainlink_gap_seconds=3.0,
         fast_feed_stale=False,
         chainlink_feed_stale=False,
-        seconds_to_window_close=120.0,
+        seconds_to_window_close=30.0,   # within decision window [10, 45]
         candles_same_direction=3,
         yes_book_available=True,
         candles_available=True,

@@ -90,27 +90,33 @@ class FeedWindow:
     slug: str
 
     # BTC/USD RTDS prices (for direction + basis mismatch only)
-    open_fast_price: Optional[float]
-    latest_fast_price: Optional[float]
-    open_chainlink_price: Optional[float]
-    latest_chainlink_price: Optional[float]
+    open_fast_price: Optional[float]           # captured at window open (T+0)
+    latest_fast_price: Optional[float]         # latest available (used for basis)
+    open_chainlink_price: Optional[float]      # captured at window open (T+0)
+    latest_chainlink_price: Optional[float]    # latest available (used for basis)
+
+    # Decision-time BTC/USD prices (captured at T - decision_window_start_seconds_to_close)
+    # These are the inputs to direction computation.
+    # None if the bot is evaluating at window open (legacy / test mode).
+    decision_fast_price: Optional[float] = None       # BTC/USD at decision time
+    decision_chainlink_price: Optional[float] = None  # BTC/USD at decision time (Chainlink)
 
     # Polymarket YES probability prices (for extreme zone + spread quality)
-    current_yes_mid: Optional[float]    # YES probability (0, 1) or None
-    yes_bid: Optional[float]            # CLOB YES bid probability
-    yes_ask: Optional[float]            # CLOB YES ask probability
+    current_yes_mid: Optional[float] = None    # YES probability (0, 1) or None
+    yes_bid: Optional[float] = None            # CLOB YES bid probability
+    yes_ask: Optional[float] = None            # CLOB YES ask probability
 
-    # Feed gaps
-    fast_gap_seconds: Optional[float]
-    chainlink_gap_seconds: Optional[float]
-    fast_feed_stale: bool
-    chainlink_feed_stale: bool
+    # Feed gaps (use decision-time values in the bot; open-time in tests)
+    fast_gap_seconds: Optional[float] = None
+    chainlink_gap_seconds: Optional[float] = None
+    fast_feed_stale: bool = False
+    chainlink_feed_stale: bool = False
 
-    # Window timing
-    seconds_to_window_close: float
+    # Window timing — set to seconds-to-close AT DECISION TIME in the bot
+    seconds_to_window_close: float = 30.0
 
     # Candle data
-    candles_same_direction: int
+    candles_same_direction: int = 0
 
     # Explicit availability flags (caller sets these honestly)
     yes_book_available: bool = False
@@ -169,13 +175,25 @@ class SignalEngine:
 
     def __init__(self, config: dict) -> None:
         sig = config.get("signal", {})
-        self._endcycle_cutoff = sig.get("endcycle_entry_cutoff_seconds", 45)
         self._freshness_thresh = sig.get("feed_freshness_threshold_seconds", 8.0)
         self._basis_flag_thresh = sig.get("basis_mismatch_flag_threshold_bps", 30.0)
         self._min_spread_bps = sig.get("min_spread_quality_bps", 5.0)
         self._extreme_low = sig.get("extreme_zone_low", 0.10)
         self._extreme_high = sig.get("extreme_zone_high", 0.90)
         self._momentum_candles = sig.get("momentum_persistence_candles", 2)
+
+        # Decision window bounds (seconds before close).
+        # Signal is ONLY valid if evaluated within [dw_end, dw_start] seconds of close.
+        # dw_start: outer bound — rejects if evaluated too early (e.g. at window open).
+        # dw_end:   inner bound — rejects if evaluated too late (risk of not filling).
+        # Both bounds are HARD gates: never soft-passed in PROVISIONAL mode.
+        # Falls back to endcycle_entry_cutoff_seconds for start if new key absent.
+        self._dw_start = sig.get(
+            "decision_window_start_seconds_to_close",
+            sig.get("endcycle_entry_cutoff_seconds", 45),
+        )
+        self._dw_end = sig.get("decision_window_end_seconds_to_close", 10)
+
         # PROVISIONAL mode: soft-pass gates that fail due to missing data.
         # STRICT mode (default): missing data = hard failure.
         self._provisional = config.get("bot_mode", "STRICT") == "PROVISIONAL"
@@ -251,15 +269,25 @@ class SignalEngine:
 
         # ----------------------------------------------------------------
         # Feature 3 — Endcycle Timing (HARD gate)
+        # Decision must fall within the configured decision window:
+        #   dw_end <= seconds_to_window_close <= dw_start
+        # Rejects if evaluated too early (still early-window, not endcycle)
+        # Rejects if evaluated too late (not enough time to fill).
         # ----------------------------------------------------------------
-        sig.gates["endcycle_timing"] = (
-            fw.seconds_to_window_close >= self._endcycle_cutoff
-        )
-        if not sig.gates["endcycle_timing"]:
-            sig.rejection_reasons.append(
-                f"endcycle_timing:{fw.seconds_to_window_close:.1f}s_remaining"
-                f"_below_{self._endcycle_cutoff}s_cutoff"
-            )
+        s = fw.seconds_to_window_close
+        in_window = self._dw_end <= s <= self._dw_start
+        sig.gates["endcycle_timing"] = in_window
+        if not in_window:
+            if s > self._dw_start:
+                sig.rejection_reasons.append(
+                    f"endcycle_timing:{s:.1f}s_remaining"
+                    f"_above_window_start_{self._dw_start}s:too_early"
+                )
+            else:
+                sig.rejection_reasons.append(
+                    f"endcycle_timing:{s:.1f}s_remaining"
+                    f"_below_window_end_{self._dw_end}s:too_late"
+                )
 
         # ----------------------------------------------------------------
         # Feature 4 — Extreme Zone (HARD gate: uses YES probability only)
@@ -408,10 +436,20 @@ class SignalEngine:
 
     def _compute_direction(self, fw: FeedWindow) -> SignalDirection:
         """
-        Compute raw directional prediction from BTC/USD open vs. current.
-        Uses fast feed latest vs. Chainlink open.
+        Compute raw directional prediction: decision-time BTC/USD vs. window-open BTC/USD.
+
+        Uses decision_fast_price (BTC/USD at signal evaluation, ~T-45s before close)
+        vs. open_chainlink_price (BTC/USD at window open, T+0).
+        This measures within-window movement, not open-time basis.
+
+        Falls back to latest_fast_price if decision_fast_price is not set
+        (backward compatibility: tests that build FeedWindow without decision prices).
         """
-        fast = fw.latest_fast_price
+        fast = (
+            fw.decision_fast_price
+            if fw.decision_fast_price is not None
+            else fw.latest_fast_price
+        )
         open_cl = fw.open_chainlink_price
         if fast is None or open_cl is None:
             return SignalDirection.NONE

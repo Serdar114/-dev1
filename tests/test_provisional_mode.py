@@ -21,14 +21,21 @@ from sigeng.engine import SignalEngine, FeedWindow, SignalDirection
 
 
 def _make_fw(**kwargs):
-    """FeedWindow with all gates passable by default; override with kwargs."""
+    """FeedWindow with all gates passable by default; override with kwargs.
+
+    seconds_to_window_close defaults to 30.0 — within the decision window [10, 45].
+    Tests of the endcycle gate explicitly override this.
+    """
     defaults = dict(
         window_open_ts=1_700_000_000,
         slug="btc-updown-5m-1700000000",
         open_fast_price=50_000.0,
-        latest_fast_price=50_200.0,      # fast > chainlink → YES direction
+        latest_fast_price=50_200.0,
         open_chainlink_price=50_005.0,
         latest_chainlink_price=50_100.0,
+        # decision_fast_price > open_chainlink_price → YES direction
+        decision_fast_price=50_200.0,
+        decision_chainlink_price=50_100.0,
         current_yes_mid=0.87,            # YES probability — in-zone
         yes_bid=None,                    # book unavailable by default
         yes_ask=None,
@@ -36,7 +43,7 @@ def _make_fw(**kwargs):
         chainlink_gap_seconds=3.0,
         fast_feed_stale=False,
         chainlink_feed_stale=False,
-        seconds_to_window_close=120.0,
+        seconds_to_window_close=30.0,    # within decision window [10, 45]
         candles_same_direction=0,        # no candles by default
         yes_book_available=False,        # no CLOB book by default
         candles_available=False,         # no candles by default
@@ -49,7 +56,9 @@ def _provisional_config():
     return {
         "bot_mode": "PROVISIONAL",
         "signal": {
-            "endcycle_entry_cutoff_seconds": 45,
+            "decision_window_start_seconds_to_close": 45,
+            "decision_window_end_seconds_to_close": 10,
+            "endcycle_entry_cutoff_seconds": 45,   # legacy alias
             "feed_freshness_threshold_seconds": 8.0,
             "basis_mismatch_flag_threshold_bps": 30.0,
             "min_spread_quality_bps": 5.0,
@@ -155,12 +164,23 @@ class TestHardGatesNeverSoftPassed:
         assert sig.gates["feed_freshness"] is False
         assert sig.quote_eligible is False
 
-    def test_endcycle_timing_hard_fails_in_provisional(self):
+    def test_endcycle_timing_hard_fails_when_too_late(self):
+        """Evaluated below dw_end (5s < 10s) — too late to submit."""
         engine = SignalEngine(_provisional_config())
-        fw = _make_fw(seconds_to_window_close=10.0)  # below 45s cutoff
+        fw = _make_fw(seconds_to_window_close=5.0)   # below dw_end=10
         sig = engine.evaluate(fw)
         assert sig.gates["endcycle_timing"] is False
         assert sig.quote_eligible is False
+        assert any("too_late" in r for r in sig.rejection_reasons)
+
+    def test_endcycle_timing_hard_fails_when_too_early(self):
+        """Evaluated far above dw_start (290s > 45s) — window just opened, not endcycle."""
+        engine = SignalEngine(_provisional_config())
+        fw = _make_fw(seconds_to_window_close=290.0)  # above dw_start=45
+        sig = engine.evaluate(fw)
+        assert sig.gates["endcycle_timing"] is False
+        assert sig.quote_eligible is False
+        assert any("too_early" in r for r in sig.rejection_reasons)
 
     def test_extreme_zone_hard_fails_in_provisional(self):
         engine = SignalEngine(_provisional_config())

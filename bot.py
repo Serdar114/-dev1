@@ -138,6 +138,14 @@ class ResearchBot:
         self._yes_adapter = CLOBYesPriceAdapter(clob_base_url=clob_url)
         self._intra_collector = IntraWindowYesPriceCollector(self._yes_adapter)
 
+        # Decision window parameters (mirrors SignalEngine for bot-level timing).
+        sig_cfg = config.get("signal", {})
+        self._dw_start = sig_cfg.get(
+            "decision_window_start_seconds_to_close",
+            sig_cfg.get("endcycle_entry_cutoff_seconds", 45),
+        )
+        self._dw_end = sig_cfg.get("decision_window_end_seconds_to_close", 10)
+
     async def run(self) -> None:
         """Main loop: start feeds, then iterate over 5m windows until killed."""
         logger.info("[bot] Starting research bot — Phase %s", self._phase)
@@ -204,11 +212,37 @@ class ResearchBot:
             await asyncio.sleep(wait)
 
     async def _run_window(self) -> None:
-        """Execute one full window: feeds → caps → discovery → yes_mid → signal → execute → settle."""
+        """
+        Execute one full 5-minute window.
+
+        Two-phase flow
+        --------------
+        PHASE A — Window open (T+0):
+            1. Capture open-time feed snapshots (BTC/USD reference prices).
+            2. Run market discovery concurrently.
+            3. Log mandatory feed pair.
+            4. Check daily candidate cap.
+            → Wait until decision window opens (T - dw_start seconds before close).
+
+        PHASE B — Decision time (T - dw_start):
+            5. Capture fresh decision-time feed snapshots.
+            6. Fetch YES probability (CLOB REST, at decision time).
+            7. Build FeedWindow with both open and decision data.
+            8. Evaluate signal engine.
+            9. Paper execute (phases 0c+) and settle.
+
+        The endcycle_timing gate validates that evaluation actually happened
+        inside the decision window [dw_end, dw_start]. This is a HARD gate.
+        Direction uses decision_fast_price vs open_chainlink_price to measure
+        within-window BTC movement, not open-time basis.
+        """
         window_open_ts = current_window_boundary()
         window_close_ts = window_open_ts + 300
 
-        logger.info("[bot] === Window open ts=%d mode=%s ===", window_open_ts, self._bot_mode)
+        logger.info(
+            "[bot] === Window open ts=%d mode=%s dw=[T-%d, T-%d] ===",
+            window_open_ts, self._bot_mode, self._dw_start, self._dw_end,
+        )
 
         # ---- Daily cap reset ----
         self._caps.reset_if_new_day()
@@ -216,9 +250,13 @@ class ResearchBot:
         wl = WindowLog(window_open_ts=window_open_ts, slug="", phase=self._phase)
         wl.runtime_mode_effective = self._bot_mode
 
-        # ---- Step 1: Capture feed snapshots ----
+        # ================================================================
+        # PHASE A: Window open (T+0) — open-price snapshot + discovery
+        # ================================================================
+
+        # ---- Step 1: Capture open-time feed snapshots ----
         open_capture_start = time.time()
-        self._capture_feeds(wl)
+        self._capture_feeds(wl)   # sets wl.fast_price, wl.chainlink_price (open-time)
         wl.open_price_capture_delay_seconds = time.time() - open_capture_start
 
         # ---- Step 2: Market discovery ----
@@ -248,36 +286,77 @@ class ResearchBot:
             self._reporter.record_window(wl)
             return
 
-        # ---- Step 4a: YES probability pre-fetch (pre-signal) ----
-        # Fetch before signal evaluation so extreme_zone gate can use it.
-        # Uses market.yes_token_id from discovery — never hardcoded.
-        yes_snap = await self._fetch_yes_snap(market, wl)
+        # ================================================================
+        # WAIT: Sleep until decision window opens
+        # ================================================================
+        decision_wake_ts = window_close_ts - self._dw_start
+        wait_secs = decision_wake_ts - time.time()
+        if wait_secs > 0.5:
+            logger.debug(
+                "[bot] Waiting %.1fs for decision window (T-%ds before close)",
+                wait_secs, self._dw_start,
+            )
+            await asyncio.sleep(wait_secs)
 
-        # ---- Step 5: Signal engine ----
-        seconds_remaining = window_close_ts - time.time()
+        # ================================================================
+        # PHASE B: Decision time (T - dw_start) — fresh snapshot + signal
+        # ================================================================
+
+        # ---- Step 5: Capture decision-time feed snapshots ----
+        decision_ts = time.time()
+        decision_seconds_to_close = window_close_ts - decision_ts
+        wl.decision_ts = decision_ts
+        wl.decision_seconds_to_close = decision_seconds_to_close
+
+        # Fresh BTC/USD prices at decision time
+        decision_fast_snap = self._fast_feed.latest
+        decision_cl_snap = self._chainlink_feed.latest
+        wl.decision_fast_price = decision_fast_snap.price if decision_fast_snap else None
+        wl.decision_chainlink_price = decision_cl_snap.price if decision_cl_snap else None
+
+        # Decision-time feed freshness (used in FeedWindow, NOT the open-time values)
+        decision_fast_gap = self._fast_feed.gap_seconds_now()
+        decision_cl_gap = self._chainlink_feed.gap_seconds_now()
+        decision_fast_stale = decision_fast_snap.is_stale if decision_fast_snap else True
+        decision_cl_stale = decision_cl_snap.is_stale if decision_cl_snap else True
+
+        # ---- Step 6: Fetch YES probability at decision time ----
+        # MUST be fetched at decision time, not window open.
+        # Uses market.yes_token_id from discovery (never hardcoded).
+        decision_yes_snap = await self._fetch_yes_snap(market, wl)
+        wl.decision_yes_mid = decision_yes_snap.probability if decision_yes_snap else None
+
+        # ---- Step 7: Build FeedWindow with open and decision data ----
         fw = FeedWindow(
             window_open_ts=window_open_ts,
             slug=wl.slug,
+            # Open-time BTC/USD (reference anchor; used in open_price_integrity gate)
             open_fast_price=wl.fast_price,
-            latest_fast_price=wl.fast_price,
             open_chainlink_price=wl.chainlink_price,
-            latest_chainlink_price=wl.chainlink_price,
-            # current_yes_mid: Polymarket YES probability (0-1) from CLOB REST poll.
-            # None if market unavailable or CLOB request failed.
-            # MUST NOT be set to BTC/USD spot price (BTCSpotSnapshot guard enforces this).
-            current_yes_mid=yes_snap.probability if yes_snap is not None else None,
-            yes_bid=None,           # REST midpoint does not provide bid; book not yet live
-            yes_ask=None,           # REST midpoint does not provide ask; book not yet live
-            fast_gap_seconds=wl.fast_feed_gap_seconds,
-            chainlink_gap_seconds=wl.chainlink_gap_seconds,
-            fast_feed_stale=wl.fast_feed_stale,
-            chainlink_feed_stale=wl.chainlink_feed_stale,
-            seconds_to_window_close=seconds_remaining,
+            # Latest BTC/USD (decision-time; used in basis mismatch calculation)
+            latest_fast_price=wl.decision_fast_price,
+            latest_chainlink_price=wl.decision_chainlink_price,
+            # Explicit decision-time prices (used for direction: was price movement bullish?)
+            decision_fast_price=wl.decision_fast_price,
+            decision_chainlink_price=wl.decision_chainlink_price,
+            # YES probability at decision time (CLOB REST, provisional)
+            # MUST NOT be BTC/USD price — guard is in YesPriceSnapshot + TakerLane
+            current_yes_mid=wl.decision_yes_mid,
+            yes_bid=None,           # REST midpoint has no bid; book not yet live
+            yes_ask=None,           # REST midpoint has no ask; book not yet live
+            # Feed freshness at DECISION time (not open time)
+            fast_gap_seconds=decision_fast_gap,
+            chainlink_gap_seconds=decision_cl_gap,
+            fast_feed_stale=decision_fast_stale,
+            chainlink_feed_stale=decision_cl_stale,
+            # seconds_to_window_close at decision time — endcycle gate validates this
+            seconds_to_window_close=decision_seconds_to_close,
             candles_same_direction=0,       # TODO: connect 1m candle tracker
             yes_book_available=False,       # REST midpoint does not constitute a live book
             candles_available=False,        # candle tracker not yet connected
         )
 
+        # ---- Step 8: Signal engine ----
         sig = self._signal_engine.evaluate(fw)
 
         wl.basis_bps = sig.basis_bps
@@ -304,10 +383,10 @@ class ResearchBot:
             self._check_kill(wl)
             return
 
-        # ---- Step 6: Paper execution (phases 0c and 1) ----
+        # ---- Step 9: Paper execution (phases 0c and 1) ----
         if market is not None and sig.direction != SignalDirection.NONE:
             await self._execute_paper_trades(
-                wl, sig, market, yes_snap, window_open_ts, window_close_ts
+                wl, sig, market, decision_yes_snap, window_open_ts, window_close_ts
             )
 
         self._reporter.record_window(wl)
@@ -465,10 +544,14 @@ class ResearchBot:
         wl.taker_execution_source = taker_result.execution_source
         wl.taker_assumed_slippage_bps = taker_result.assumed_slippage_bps
 
-        # Apply entry cap before recording fills
+        # --- Entry cap application (both lanes together) ---
+        # Policy (either_lane_fill): a window where either lane produces a fill
+        # consumes exactly ONE entry budget slot.  Both lanes are blocked/unblocked
+        # together so the cap is honest regardless of which lane fills.
         if not can_enter:
-            logger.info("[bot] Entry cap blocked maker/taker fill: %s", entry_reason)
-            wl.taker_filled = False
+            logger.info("[bot] Entry cap blocked both lanes: %s", entry_reason)
+            maker_result.filled = False
+            maker_result.rejection_reason = f"cap:{entry_reason}"
             taker_result.filled = False
             taker_result.rejection_reason = f"cap:{entry_reason}"
         else:
@@ -480,8 +563,14 @@ class ResearchBot:
             wl.taker_break_even_wr = taker_result.break_even_wr_estimate
             wl.taker_win_if_correct = taker_result.win_if_correct
             wl.taker_loss_if_wrong = taker_result.loss_if_wrong
-            if taker_result.filled:
+            # Record entry if EITHER lane filled (one budget slot per window)
+            if maker_result.filled or taker_result.filled:
                 self._caps.record_entry()
+                logger.info(
+                    "[bot] Entry recorded (either_lane_fill policy): "
+                    "maker_filled=%s taker_filled=%s window=%d",
+                    maker_result.filled, taker_result.filled, window_open_ts,
+                )
 
         # --- Settlement: use Chainlink as proxy truth ---
         close_cl = self._chainlink_feed.latest

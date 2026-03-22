@@ -25,7 +25,7 @@ def _make_fw(**kwargs):
         chainlink_gap_seconds=3.0,
         fast_feed_stale=False,
         chainlink_feed_stale=False,
-        seconds_to_window_close=120.0,
+        seconds_to_window_close=30.0,   # within decision window [10, 45]
         candles_same_direction=3,
         yes_book_available=True,
         candles_available=True,
@@ -77,8 +77,9 @@ class TestStructuredRejectionReasons:
         assert any("chainlink_feed_stale" in r for r in sig.rejection_reasons)
 
     def test_endcycle_too_late_rejection_reason(self, base_config):
+        """5s remaining < dw_end (10s) → endcycle_timing fails as too_late."""
         engine = SignalEngine(base_config)
-        fw = _make_fw(seconds_to_window_close=10.0)  # below 45s cutoff
+        fw = _make_fw(seconds_to_window_close=5.0)   # below dw_end=10 → too_late
         sig = engine.evaluate(fw)
         assert any("endcycle_timing" in r for r in sig.rejection_reasons)
 

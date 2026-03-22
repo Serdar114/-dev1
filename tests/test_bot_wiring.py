@@ -206,7 +206,7 @@ class TestFeedWindowYesMidWiring:
             chainlink_gap_seconds=1.5,
             fast_feed_stale=False,
             chainlink_feed_stale=False,
-            seconds_to_window_close=120.0,
+            seconds_to_window_close=30.0,   # within decision window [10, 45]
             candles_same_direction=0,
             yes_book_available=False,
             candles_available=False,
@@ -233,7 +233,7 @@ class TestFeedWindowYesMidWiring:
             chainlink_gap_seconds=1.5,
             fast_feed_stale=False,
             chainlink_feed_stale=False,
-            seconds_to_window_close=120.0,
+            seconds_to_window_close=30.0,   # within decision window [10, 45]
             candles_same_direction=0,
             yes_book_available=False,
             candles_available=False,
@@ -255,6 +255,8 @@ class TestSignalEngineCandidateProduction:
         return {
             "bot_mode": "PROVISIONAL",
             "signal": {
+                "decision_window_start_seconds_to_close": 45,
+                "decision_window_end_seconds_to_close": 10,
                 "endcycle_entry_cutoff_seconds": 45,
                 "feed_freshness_threshold_seconds": 8.0,
                 "basis_mismatch_flag_threshold_bps": 30.0,
@@ -285,7 +287,7 @@ class TestSignalEngineCandidateProduction:
             chainlink_gap_seconds=1.5,
             fast_feed_stale=False,
             chainlink_feed_stale=False,
-            seconds_to_window_close=120.0,
+            seconds_to_window_close=30.0,   # within decision window [10, 45]
             candles_same_direction=0,
             yes_book_available=False,        # no live book — soft-passed
             candles_available=False,         # no candles — soft-passed
@@ -318,7 +320,7 @@ class TestSignalEngineCandidateProduction:
             chainlink_gap_seconds=1.5,
             fast_feed_stale=False,
             chainlink_feed_stale=False,
-            seconds_to_window_close=120.0,
+            seconds_to_window_close=30.0,   # within decision window [10, 45]
             candles_same_direction=0,
             yes_book_available=False,
             candles_available=False,

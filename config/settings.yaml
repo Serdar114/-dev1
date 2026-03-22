@@ -56,7 +56,15 @@ discovery:
 # Signal Engine
 # ----------------------------------------------------------
 signal:
-  # Endcycle timing: seconds before window close to accept a signal
+  # Decision window: signal is only valid if evaluated within this range.
+  # The bot WAITS from window open until decision_window_start_seconds_to_close
+  # before the window closes, then takes fresh snapshots and evaluates the signal.
+  #   start: outer bound — too early if more than this many seconds remain
+  #   end:   inner bound — too late if fewer than this many seconds remain
+  # Both bounds are HARD gates (never soft-passed in PROVISIONAL mode).
+  decision_window_start_seconds_to_close: 45   # wake up at T-45 before close
+  decision_window_end_seconds_to_close: 10     # must evaluate by T-10 before close
+  # Legacy alias (kept for backward compatibility with older configs):
   endcycle_entry_cutoff_seconds: 45
   # Feed freshness: reject signal if either feed is older than this
   feed_freshness_threshold_seconds: 8.0
