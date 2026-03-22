@@ -22,20 +22,32 @@ Fill simulation and realism grade
 Paper fill is SIMULATED (no live order placement).
 
 fill_realism_grade records the quality of the fill simulation:
-    "OBSERVED_PATH"       — intra_window_prices was populated with real data.
-    "PROVISIONAL_NO_PATH" — no intra-window price path available; fill is
-                            conservatively set to False.  Do NOT treat
-                            PROVISIONAL results as realistic fill estimates.
+    "OBSERVED_PATH"            — real WebSocket book path (not yet live).
+    "PROVISIONAL_MULTI_POINT"  — 2+ REST-polled prices; fill IS evaluable.
+    "PROVISIONAL_SINGLE_POINT" — exactly 1 price collected; fill blocked.
+                                 Single-point paths are not sufficient evidence
+                                 of a fill — the first post-decision price can
+                                 equal the limit by coincidence (same-tick risk).
+    "PROVISIONAL_NO_PATH"      — no prices at all; fill blocked.
 
-When intra_window_prices is None, filled is always False to avoid
-optimistic inflation of fill rate metrics.
+fill_evaluable (bool):
+    True  only when grade is PROVISIONAL_MULTI_POINT or OBSERVED_PATH.
+    False for single-point and no-path grades.
+
+    Session summaries distinguish maker_raw_fill_count (any filled=True)
+    from maker_evaluable_fill_count (filled=True AND fill_evaluable=True).
+    Do NOT use raw fills to draw maker viability conclusions.
+
+When intra_window_prices is None or has < 2 entries, filled is always
+False to avoid optimistic inflation of fill rate metrics.
 
 Execution log fields (per window):
     quote_bucket            : str  — "B1" | "B2" | "B3" | "INELIGIBLE" | "N/A"
     intended_price          : float
     filled                  : bool
     fill_price              : float | None
-    fill_realism_grade      : str  — "OBSERVED_PATH" | "PROVISIONAL_NO_PATH" | "N/A"
+    fill_realism_grade      : str  — see grades above
+    fill_evaluable          : bool — True only for multi-point / observed paths
     shares                  : int  (always 5 in v1)
     fee_per_share           : float (always 0 for maker)
     total_fee               : float (always 0 for maker)
@@ -70,10 +82,15 @@ QUOTE_BUCKETS = [
 ]
 
 # Fill realism grade constants
-FILL_GRADE_OBSERVED = "OBSERVED_PATH"              # Real WebSocket price path
-FILL_GRADE_PROVISIONAL_PROXY = "PROVISIONAL_OBSERVED_PROXY"  # REST-polled proxy path
-FILL_GRADE_PROVISIONAL = "PROVISIONAL_NO_PATH"     # No prices at all
+FILL_GRADE_OBSERVED = "OBSERVED_PATH"              # Real WebSocket price path (future)
+FILL_GRADE_PROVISIONAL_MULTI = "PROVISIONAL_MULTI_POINT"    # 2+ REST-polled prices — evaluable
+FILL_GRADE_PROVISIONAL_SINGLE = "PROVISIONAL_SINGLE_POINT"  # 1 price — NOT evaluable
+FILL_GRADE_PROVISIONAL = "PROVISIONAL_NO_PATH"     # No prices at all — NOT evaluable
 FILL_GRADE_NA = "N/A"
+
+# Legacy alias kept so existing callers that pass fill_realism_source=FILL_GRADE_PROVISIONAL_PROXY
+# do not break; the value is ignored in the new count-based grade logic.
+FILL_GRADE_PROVISIONAL_PROXY = "PROVISIONAL_OBSERVED_PROXY"
 
 
 def classify_quote_bucket(price: float) -> str:
@@ -98,6 +115,7 @@ class MakerResult:
     filled: bool = False
     fill_price: Optional[float] = None
     fill_realism_grade: str = FILL_GRADE_NA   # see module docstring
+    fill_evaluable: bool = False              # True only for multi-point / observed paths
     fee_per_share: float = 0.0
     total_fee: float = 0.0
     gross_pnl: Optional[float] = None
@@ -202,15 +220,43 @@ class MakerLane:
         result.win_if_correct = (1.0 - intended_price) * self._shares
         result.loss_if_wrong = intended_price * self._shares
 
-        # Fill simulation.
-        if intra_window_prices is None:
-            # No intra-window price path available.
-            # CONSERVATIVE: do not assume fill; mark as provisional.
+        # Fill simulation — grade and evaluability determined by path density.
+        #
+        # Conservative rules:
+        #   path=None or len<1 → PROVISIONAL_NO_PATH    fill=False evaluable=False
+        #   len==1             → PROVISIONAL_SINGLE_POINT fill=False evaluable=False
+        #                        (single-point is not sufficient evidence; the first
+        #                         post-decision price can equal limit by coincidence)
+        #   len>=2             → PROVISIONAL_MULTI_POINT  fill=maybe evaluable=True
+        #                        (OR OBSERVED_PATH if caller explicitly signals WebSocket)
+        #
+        if not intra_window_prices:
+            # No path at all.
             result.filled = False
             result.fill_price = None
             result.fill_realism_grade = FILL_GRADE_PROVISIONAL
+            result.fill_evaluable = False
+        elif len(intra_window_prices) < 2:
+            # Single-point path — not evaluable.
+            # A single price immediately after decision time can coincide with the
+            # limit price without implying real tradeable liquidity at that level.
+            result.filled = False
+            result.fill_price = None
+            result.fill_realism_grade = FILL_GRADE_PROVISIONAL_SINGLE
+            result.fill_evaluable = False
+            logger.debug(
+                "[maker] single-point path: fill blocked window=%d slug=%s price=%.4f",
+                window_open_ts, slug, intended_price,
+            )
         else:
-            # Observed path available: fill if any price dipped to / below limit.
+            # Multi-point path — evaluable.
+            # Grade: OBSERVED_PATH only if caller explicitly signals real WebSocket data.
+            if fill_realism_source == FILL_GRADE_OBSERVED:
+                result.fill_realism_grade = FILL_GRADE_OBSERVED
+            else:
+                result.fill_realism_grade = FILL_GRADE_PROVISIONAL_MULTI
+            result.fill_evaluable = True
+
             min_price = min(intra_window_prices)
             if min_price <= intended_price:
                 result.filled = True
@@ -219,12 +265,6 @@ class MakerLane:
             else:
                 result.filled = False
                 result.fill_price = None
-            # Grade: caller can override to PROVISIONAL_OBSERVED_PROXY when prices
-            # came from REST polling rather than a live WebSocket book stream.
-            result.fill_realism_grade = (
-                fill_realism_source if fill_realism_source is not None
-                else FILL_GRADE_OBSERVED
-            )
 
         logger.info(
             "[maker] window=%d slug=%s bucket=%s price=%.4f filled=%s "

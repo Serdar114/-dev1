@@ -75,7 +75,8 @@ class SessionStats:
     candidate_windows: int = 0
     maker_candidate_count: int = 0
     taker_candidate_count: int = 0
-    maker_fills: int = 0
+    maker_fills: int = 0            # raw: any filled=True (includes single-point grade)
+    maker_evaluable_fills: int = 0  # conservative: filled=True AND fill_evaluable=True
     taker_fills: int = 0
 
     # Accuracy / win rate
@@ -132,6 +133,12 @@ class SessionStats:
         if self.maker_candidate_count == 0:
             return None
         return self.maker_fills / self.maker_candidate_count
+
+    def maker_evaluable_fill_rate(self) -> Optional[float]:
+        """Fill rate counting only evaluable (multi-point) fills. Use for viability."""
+        if self.maker_candidate_count == 0:
+            return None
+        return self.maker_evaluable_fills / self.maker_candidate_count
 
     def avg_fill_price(self) -> Optional[float]:
         if self.avg_fill_price_count == 0:

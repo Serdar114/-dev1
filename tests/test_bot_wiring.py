@@ -408,8 +408,6 @@ class TestIntraWindowCollectorWiring:
         intra_mock = MagicMock()
         intra_mock.collect = fake_collect
 
-        from execution.maker_lane import MakerLane, FILL_GRADE_PROVISIONAL_PROXY
-
         market = _make_market(yes_token_id="the_real_token_xyz")
         yes_snap = _make_yes_snap(probability=0.87)
 
@@ -426,12 +424,13 @@ class TestIntraWindowCollectorWiring:
         assert collected_token == ["the_real_token_xyz"]
         assert prices == [0.87, 0.86]
 
-    def test_maker_lane_uses_intra_prices_with_provisional_proxy_grade(self):
+    def test_maker_lane_uses_intra_prices_with_multi_point_grade(self):
         """
-        When intra_prices are returned by the collector, maker lane receives them
-        with fill_realism_source=PROVISIONAL_OBSERVED_PROXY.
+        When 2+ intra_prices are returned by the collector, maker lane grades them
+        as PROVISIONAL_MULTI_POINT (evaluable).  The old PROVISIONAL_OBSERVED_PROXY
+        alias is a no-op in the new count-based grade logic.
         """
-        from execution.maker_lane import MakerLane, FILL_GRADE_PROVISIONAL_PROXY
+        from execution.maker_lane import MakerLane, FILL_GRADE_PROVISIONAL_MULTI
 
         config = {
             "sizing": {"min_shares": 5, "fixed_shares_v1": 5, "initial_bankroll": 30.0},
@@ -439,8 +438,8 @@ class TestIntraWindowCollectorWiring:
         }
         lane = MakerLane(config)
 
-        # Prices from intra-window collector — contain a value below limit
-        intra_prices = [0.88, 0.87, 0.85]   # 0.85 dips below limit 0.87
+        # 3 price points from intra-window collector — 0.85 dips below limit 0.87
+        intra_prices = [0.88, 0.87, 0.85]
 
         result = lane.evaluate(
             window_open_ts=1_700_000_000,
@@ -449,11 +448,11 @@ class TestIntraWindowCollectorWiring:
             intended_price=0.87,
             bankroll=30.0,
             intra_window_prices=intra_prices,
-            fill_realism_source=FILL_GRADE_PROVISIONAL_PROXY,
         )
 
         assert result.filled is True
-        assert result.fill_realism_grade == "PROVISIONAL_OBSERVED_PROXY"
+        assert result.fill_realism_grade == FILL_GRADE_PROVISIONAL_MULTI
+        assert result.fill_evaluable is True
 
     def test_maker_lane_conservative_no_fill_when_no_intra_prices(self):
         """When intra_prices is None or empty, fill must be False (conservative)."""

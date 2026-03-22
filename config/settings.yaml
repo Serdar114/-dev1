@@ -110,6 +110,23 @@ fees:
   assumed_slippage_bps: 0
 
 # ----------------------------------------------------------
+# Maker lane configuration
+# ----------------------------------------------------------
+maker:
+  # Poll interval for intra-window YES price collection (seconds).
+  #
+  # This value must be materially less than the collection window duration.
+  # Collection runs from decision time (T - dw_start) to T - 5s before close.
+  # With dw_start=45, that is ~40 s of collection time.
+  #
+  # At 15 s interval: ~2–3 polls → PROVISIONAL_MULTI_POINT (evaluable).
+  # At 60 s interval: 0–1 polls  → PROVISIONAL_SINGLE_POINT (not evaluable).
+  #
+  # A fill is only counted in evaluable_fill metrics when path_points >= 2.
+  # Single-point fills are logged but excluded from maker viability conclusions.
+  provisional_yes_poll_interval_seconds: 15
+
+# ----------------------------------------------------------
 # Quote Buckets (maker-paper classification)
 # ----------------------------------------------------------
 quote_buckets:

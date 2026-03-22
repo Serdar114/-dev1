@@ -50,11 +50,11 @@ from typing import Optional
 import yaml
 
 from discovery.market import MarketDiscovery, WindowMarket, current_window_boundary, next_window_boundary
-from execution.maker_lane import MakerLane, FILL_GRADE_PROVISIONAL_PROXY
+from execution.maker_lane import MakerLane, FILL_GRADE_OBSERVED
 from execution.taker_lane import TakerLane, SRC_CLOB_ASK_AT_SIGNAL, SRC_UNAVAILABLE
 from feeds.chainlink_feed import ChainlinkFeedAdapter
 from feeds.fast_feed import FastFeedAdapter
-from feeds.intra_window_collector import IntraWindowYesPriceCollector
+from feeds.intra_window_collector import IntraWindowYesPriceCollector, CollectionResult
 from feeds.price_types import YesPriceSnapshot
 from feeds.yes_price_adapter import CLOBYesPriceAdapter
 from logger.summary import SummaryReporter, WindowLog
@@ -136,7 +136,18 @@ class ResearchBot:
         # YES probability source (provisional REST polling until WebSocket live)
         clob_url = config.get("discovery", {}).get("clob_base_url", "https://clob.polymarket.com")
         self._yes_adapter = CLOBYesPriceAdapter(clob_base_url=clob_url)
-        self._intra_collector = IntraWindowYesPriceCollector(self._yes_adapter)
+
+        # Poll interval: config-driven so it can be tuned relative to decision window.
+        # Default 15 s gives ~2–3 points in the ~40 s post-decision collection window,
+        # which satisfies the PROVISIONAL_MULTI_POINT (evaluable) threshold.
+        # A 60 s interval would yield 0–1 points → non-evaluable in every window.
+        maker_cfg = config.get("maker", {})
+        self._maker_poll_interval = float(
+            maker_cfg.get("provisional_yes_poll_interval_seconds", 15.0)
+        )
+        self._intra_collector = IntraWindowYesPriceCollector(
+            self._yes_adapter, poll_interval_s=self._maker_poll_interval
+        )
 
         # Decision window parameters (mirrors SignalEngine for bot-level timing).
         sig_cfg = config.get("signal", {})
@@ -483,28 +494,47 @@ class ResearchBot:
         collect_duration = max(sleep_time - 5.0, 0.0)  # stop polling 5s before close
 
         if collect_duration > 0:
-            intra_prices, _ = await asyncio.gather(
+            collect_result, _ = await asyncio.gather(
                 self._intra_collector.collect(market.yes_token_id, collect_duration),
                 asyncio.sleep(sleep_time),
             )
-            intra_grade = FILL_GRADE_PROVISIONAL_PROXY if intra_prices else None
         else:
-            intra_prices = []
-            intra_grade = None
+            collect_result = CollectionResult(poll_interval_s=self._maker_poll_interval)
             if sleep_time > 0:
                 await asyncio.sleep(sleep_time)
 
-        wl.maker_path_source = intra_grade or "PROVISIONAL_NO_PATH"
-        wl.maker_path_points_collected = len(intra_prices) if intra_prices else 0
+        intra_prices = collect_result.prices
 
-        if not intra_prices:
+        # Log path statistics for audit / realism tracking.
+        wl.maker_poll_interval_seconds = collect_result.poll_interval_s
+        wl.maker_path_points_collected = collect_result.point_count
+        wl.maker_first_path_ts = collect_result.first_ts
+        wl.maker_last_path_ts = collect_result.last_ts
+
+        if collect_result.point_count == 0:
+            wl.maker_path_source = "PROVISIONAL_NO_PATH"
             logger.debug(
-                "[bot] maker_path_unavailable: no intra-window prices collected "
-                "for window=%d token=%s. Fill grade=PROVISIONAL_NO_PATH.",
+                "[bot] maker_path: 0 points for window=%d token=%s — fill blocked",
                 window_open_ts, market.yes_token_id,
+            )
+        elif collect_result.point_count == 1:
+            wl.maker_path_source = "PROVISIONAL_SINGLE_POINT"
+            logger.debug(
+                "[bot] maker_path: 1 point for window=%d token=%s — "
+                "fill blocked (single-point not evaluable)",
+                window_open_ts, market.yes_token_id,
+            )
+        else:
+            wl.maker_path_source = "PROVISIONAL_MULTI_POINT"
+            logger.debug(
+                "[bot] maker_path: %d points for window=%d token=%s — evaluable",
+                collect_result.point_count, window_open_ts, market.yes_token_id,
             )
 
         # --- Maker lane ---
+        # fill_realism_source is intentionally omitted: grade is auto-determined
+        # from path density (None/single-point/multi-point).  Pass FILL_GRADE_OBSERVED
+        # only when a real WebSocket book feed is connected (future upgrade).
         maker_result = self._maker_lane.evaluate(
             window_open_ts=window_open_ts,
             slug=wl.slug,
@@ -512,11 +542,12 @@ class ResearchBot:
             intended_price=yes_probability,   # YES probability (0,1) from CLOB
             bankroll=self._sizer.bankroll,
             intra_window_prices=intra_prices if intra_prices else None,
-            fill_realism_source=intra_grade,
         )
         wl.maker_quote_bucket = maker_result.quote_bucket
         wl.maker_intended_price = maker_result.intended_price
         wl.maker_fill_realism_grade = maker_result.fill_realism_grade
+        wl.maker_fill_evaluable = maker_result.fill_evaluable
+        wl.maker_fill_realism_mode = maker_result.fill_realism_grade
         wl.maker_bankroll_fraction = maker_result.bankroll_fraction
         wl.maker_break_even_wr = maker_result.break_even_wr_estimate
         wl.maker_win_if_correct = maker_result.win_if_correct

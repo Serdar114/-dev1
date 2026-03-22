@@ -126,6 +126,13 @@ class WindowLog:
     maker_path_points_collected: int = 0            # number of intra-window prices collected
     runtime_mode_effective: Optional[str] = None    # "STRICT" | "PROVISIONAL"
 
+    # Maker path statistics (for realism audit)
+    maker_poll_interval_seconds: Optional[float] = None   # configured poll interval
+    maker_first_path_ts: Optional[float] = None           # Unix ts of first price poll
+    maker_last_path_ts: Optional[float] = None            # Unix ts of last price poll
+    maker_fill_evaluable: bool = False                    # True iff path_points >= 2
+    maker_fill_realism_mode: str = "N/A"                  # grade label from MakerResult
+
     # Decision-time snapshot (Phase B: T - decision_window_start seconds before close)
     # Distinct from fast_price / chainlink_price which are captured at window open (T+0).
     decision_fast_price: Optional[float] = None         # BTC/USD at decision time
@@ -242,6 +249,9 @@ class SummaryReporter:
                 if wl.maker_fill_price is not None:
                     stats.avg_fill_price_sum += wl.maker_fill_price
                     stats.avg_fill_price_count += 1
+                # Evaluable fills: only count when path was multi-point or observed
+                if wl.maker_fill_evaluable:
+                    stats.maker_evaluable_fills += 1
 
             if wl.maker_outcome_correct is not None and wl.maker_filled:
                 stats.fill_conditioned_total += 1
@@ -300,6 +310,7 @@ class SummaryReporter:
 
         # Compute derived values
         maker_fill_rate = stats.maker_fill_rate()
+        maker_evaluable_fill_rate = stats.maker_evaluable_fill_rate()
         taker_exec_rate = (
             stats.taker_fills / stats.taker_candidate_count
             if stats.taker_candidate_count > 0 else None
@@ -350,9 +361,11 @@ class SummaryReporter:
             f"  Candidate windows        : {stats.candidate_windows}",
             f"  Maker candidate count    : {stats.maker_candidate_count}",
             f"  Taker candidate count    : {stats.taker_candidate_count}",
-            f"  Maker fills              : {stats.maker_fills}",
+            f"  Maker fills (raw)        : {stats.maker_fills}",
+            f"  Maker fills (evaluable)  : {stats.maker_evaluable_fills}  ← use this for viability",
             f"  Taker fills              : {stats.taker_fills}",
-            f"  Maker fill rate          : {_pct(maker_fill_rate)}",
+            f"  Maker fill rate (raw)    : {_pct(maker_fill_rate)}",
+            f"  Maker fill rate (eval)   : {_pct(maker_evaluable_fill_rate)}",
             f"  Taker execution rate     : {_pct(taker_exec_rate)}",
             f"  Maker avg quote bucket   : {avg_bucket_str}",
             f"{'--'*31}",

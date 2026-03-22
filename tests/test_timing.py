@@ -23,7 +23,7 @@ import pytest
 
 from sigeng.engine import SignalEngine, FeedWindow, SignalDirection
 from logger.summary import WindowLog
-from execution.maker_lane import MakerLane, FILL_GRADE_PROVISIONAL_PROXY
+from execution.maker_lane import MakerLane, FILL_GRADE_PROVISIONAL_MULTI
 from execution.taker_lane import TakerLane
 
 
@@ -337,7 +337,7 @@ class TestEntryCapAccounting:
             signal_direction="YES",
             intended_price=0.87,
             bankroll=30.0,
-            intra_window_prices=[0.85],  # would fill if not capped
+            intra_window_prices=[0.86, 0.85],  # 2 points, would fill if not capped
         )
         taker_result = taker.evaluate(
             window_open_ts=1_700_000_000,
