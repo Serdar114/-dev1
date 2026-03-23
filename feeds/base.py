@@ -125,6 +125,10 @@ class BaseFeedAdapter:
     # Polymarket RTDS requires frequent pings to keep the connection alive.
     # Recommended interval: ~5 seconds.
     HEARTBEAT_INTERVAL = 5                   # seconds
+    # Diagnostics
+    _RAW_LOG_LIMIT = 5        # log first N raw messages per connection
+    _NO_MSG_WARN_SECS = 30    # warn if no messages arrive within this window
+    _COUNTER_LOG_INTERVAL = 60  # log message counters every N seconds
 
     def __init__(
         self,
@@ -143,6 +147,18 @@ class BaseFeedAdapter:
         self._lock = asyncio.Lock()
         self._running = False
         self._ws = None
+
+        # --- Diagnostics counters (cumulative across reconnects) ---
+        self._total_received: int = 0
+        self._total_parsed_ok: int = 0
+        self._total_parse_failed: int = 0
+        self._total_discarded: int = 0
+        # Per-connection raw-log counter (reset on each connect)
+        self._raw_log_count: int = 0
+        # Set to True once first valid price is logged
+        self._first_valid_logged: bool = False
+        # Last time counters were logged (wall clock)
+        self._last_counter_log: float = 0.0
 
     # ------------------------------------------------------------------
     # Public API
@@ -219,6 +235,10 @@ class BaseFeedAdapter:
             logger.error("[%s] websockets package not installed", self._feed_label())
             raise
 
+        # Reset per-connection raw-log counter so first 5 messages of each
+        # reconnect are always captured.
+        self._raw_log_count = 0
+
         async with websockets.connect(self._rtds_host) as ws:
             self._ws = ws
             self._status = FeedStatus.CONNECTED
@@ -232,23 +252,79 @@ class BaseFeedAdapter:
                 "[%s] Sent RTDS subscribe: %s", self._feed_label(), sub_payload
             )
 
+            # Track messages received on this specific connection (for no-msg warning).
+            msgs_this_conn: list[int] = [0]
+
             heartbeat_task = asyncio.ensure_future(self._heartbeat(ws))
+            no_msg_task = asyncio.ensure_future(
+                self._no_message_warning(msgs_this_conn)
+            )
             try:
                 async for raw_msg in ws:
                     if not self._running:
                         break
+
+                    msgs_this_conn[0] += 1
+                    self._total_received += 1
+
+                    # Log first _RAW_LOG_LIMIT raw messages verbatim for
+                    # wire-level diagnostics.
+                    if self._raw_log_count < self._RAW_LOG_LIMIT:
+                        self._raw_log_count += 1
+                        raw_preview = (
+                            raw_msg[:500]
+                            if isinstance(raw_msg, str)
+                            else str(raw_msg)[:500]
+                        )
+                        logger.info(
+                            "[%s] RAW msg #%d: %s",
+                            self._feed_label(), self._raw_log_count, raw_preview
+                        )
+
                     try:
                         payload = json.loads(raw_msg)
                         snap = self._parse_message(payload)
                         if snap is not None:
+                            self._total_parsed_ok += 1
+                            if not self._first_valid_logged:
+                                self._first_valid_logged = True
+                                logger.info(
+                                    "[%s] First valid price: %.6f at ts=%.3f",
+                                    self._feed_label(), snap.price, snap.timestamp
+                                )
                             async with self._lock:
                                 self._latest = snap
                                 self._prev_timestamp = snap.timestamp
                             self._log_tick(snap)
+                        else:
+                            self._total_discarded += 1
                     except Exception as parse_exc:
-                        logger.debug("[%s] Parse error: %s", self._feed_label(), parse_exc)
+                        self._total_parse_failed += 1
+                        raw_preview = (
+                            raw_msg[:200]
+                            if isinstance(raw_msg, str)
+                            else str(raw_msg)[:200]
+                        )
+                        logger.warning(
+                            "[%s] Parse failed for msg: %s — error: %s: %s",
+                            self._feed_label(), raw_preview,
+                            type(parse_exc).__name__, parse_exc
+                        )
+
+                    # Log counters every _COUNTER_LOG_INTERVAL seconds.
+                    now = time.time()
+                    if now - self._last_counter_log >= self._COUNTER_LOG_INTERVAL:
+                        self._last_counter_log = now
+                        logger.info(
+                            "[%s] counters: received=%d parsed_ok=%d "
+                            "parse_failed=%d discarded=%d",
+                            self._feed_label(),
+                            self._total_received, self._total_parsed_ok,
+                            self._total_parse_failed, self._total_discarded,
+                        )
             finally:
                 heartbeat_task.cancel()
+                no_msg_task.cancel()
                 self._ws = None
 
     async def _heartbeat(self, ws) -> None:
@@ -265,6 +341,19 @@ class BaseFeedAdapter:
                 await ws.ping()
             except Exception:
                 break
+
+    async def _no_message_warning(self, msgs_this_conn: list) -> None:
+        """
+        Warn if no messages arrive within _NO_MSG_WARN_SECS after subscribe.
+        Uses a mutable list[int] as a shared counter to avoid closure issues.
+        """
+        await asyncio.sleep(self._NO_MSG_WARN_SECS)
+        if msgs_this_conn[0] == 0:
+            logger.warning(
+                "[%s] WARNING: No messages received %ds after subscribe — "
+                "check RTDS host (%s) and subscription payload",
+                self._feed_label(), self._NO_MSG_WARN_SECS, self._rtds_host
+            )
 
     def _subscribe_payload(self) -> dict:
         """

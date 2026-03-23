@@ -27,6 +27,7 @@ Usage
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Optional
@@ -83,7 +84,10 @@ class CLOBYesPriceAdapter:
         url = f"{self._base_url}{_MIDPOINT_PATH}?token_id={token_id}"
 
         try:
-            async with aiohttp.ClientSession() as session:
+            connector = aiohttp.TCPConnector(
+                resolver=aiohttp.resolver.ThreadedResolver()
+            )
+            async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=self._timeout)) as resp:
                     if resp.status != 200:
                         logger.warning(
@@ -92,9 +96,25 @@ class CLOBYesPriceAdapter:
                         )
                         return None
                     data = await resp.json()
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[clob_yes] Timeout (%.1fs) for token_id=%s url=%s",
+                self._timeout, token_id, url
+            )
+            return None
+        except aiohttp.ClientConnectorError as exc:
+            cause = str(exc)
+            is_dns = "dns" in cause.lower() or "name or service not known" in cause.lower() or "could not contact" in cause.lower()
+            logger.warning(
+                "[clob_yes] %s for token_id=%s url=%s — %s: %s",
+                "DNS resolution failed" if is_dns else "Connection error",
+                token_id, url, type(exc).__name__, exc
+            )
+            return None
         except Exception as exc:
             logger.warning(
-                "[clob_yes] Request failed for token_id=%s: %s", token_id, exc
+                "[clob_yes] Unexpected error for token_id=%s url=%s — %s: %s",
+                token_id, url, type(exc).__name__, exc
             )
             return None
 

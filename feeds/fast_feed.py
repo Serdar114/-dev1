@@ -120,24 +120,49 @@ class FastFeedAdapter(BaseFeedAdapter):
 
         timestamp is in milliseconds; converted to seconds for FeedSnapshot.
         """
-        if payload.get("topic") != _CHANNEL:
+        topic = payload.get("topic")
+        if topic != _CHANNEL:
+            logger.debug("[fast] Message discarded: topic=%r (expected %r)", topic, _CHANNEL)
             return None
 
         data = payload.get("payload", {})
         if not data:
+            # Help diagnose if the envelope uses a different key (e.g. "data")
+            alt_keys = [k for k in payload if k not in ("topic", "type", "timestamp")]
+            logger.debug(
+                "[fast] Message discarded: empty/missing 'payload'. "
+                "Other envelope keys: %s", alt_keys
+            )
             return None
+
+        # Unexpected-key visibility: log if payload fields differ from expected schema.
+        expected_keys = {"symbol", "value", "timestamp"}
+        actual_keys = set(data.keys())
+        unexpected = actual_keys - expected_keys
+        missing_required = {"value", "timestamp"} - actual_keys
+        if unexpected or missing_required:
+            logger.debug(
+                "[fast] Unexpected payload keys: present=%s unexpected=%s missing=%s",
+                sorted(actual_keys), sorted(unexpected), sorted(missing_required)
+            )
 
         # Symbol filter — only process ticks for the configured symbol.
         rtds_sym = _to_rtds_symbol(self._symbol)
         incoming_sym = data.get("symbol", "")
         if incoming_sym and incoming_sym != rtds_sym:
+            logger.debug(
+                "[fast] Message discarded: symbol=%r (want %r)", incoming_sym, rtds_sym
+            )
             return None
 
         try:
             price = float(data["value"])
             ts = float(data["timestamp"]) / 1000.0  # ms → seconds
         except (KeyError, TypeError, ValueError) as exc:
-            logger.debug("[fast] Cannot parse tick: %s | payload=%s", exc, payload)
+            logger.warning(
+                "[fast] Cannot parse tick fields: %s: %s | data=%s",
+                type(exc).__name__, exc, data
+            )
             return None
 
         return self._build_snapshot(price=price, ts=ts, raw=payload)

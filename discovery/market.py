@@ -186,7 +186,10 @@ class MarketDiscovery:
         params = {"slug": slug}
 
         try:
-            async with aiohttp.ClientSession() as session:
+            connector = aiohttp.TCPConnector(
+                resolver=aiohttp.resolver.ThreadedResolver()
+            )
+            async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.get(
                     url,
                     params=params,
@@ -194,16 +197,32 @@ class MarketDiscovery:
                 ) as resp:
                     if resp.status != 200:
                         logger.warning(
-                            "[discovery] Gamma returned HTTP %d for slug=%s",
-                            resp.status, slug
+                            "[discovery] Gamma returned HTTP %d for slug=%s url=%s",
+                            resp.status, slug, url
                         )
                         return None
                     data = await resp.json()
         except asyncio.TimeoutError:
-            logger.warning("[discovery] Timeout fetching slug=%s", slug)
+            logger.warning(
+                "[discovery] Timeout (%.1fs) fetching slug=%s url=%s",
+                self._timeout, slug, url
+            )
+            return None
+        except aiohttp.ClientConnectorError as exc:
+            # Covers DNS failure and TCP connection refusal.
+            cause = str(exc)
+            is_dns = "dns" in cause.lower() or "name or service not known" in cause.lower() or "could not contact" in cause.lower()
+            logger.error(
+                "[discovery] %s connecting to %s — %s: %s",
+                "DNS resolution failed" if is_dns else "Connection error",
+                url, type(exc).__name__, exc
+            )
             return None
         except Exception as exc:
-            logger.error("[discovery] Error fetching slug=%s: %s", slug, exc)
+            logger.error(
+                "[discovery] Unexpected error fetching slug=%s url=%s — %s: %s",
+                slug, url, type(exc).__name__, exc
+            )
             return None
 
         return self._parse_market(data, slug, window_boundary_ts)
