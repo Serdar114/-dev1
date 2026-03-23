@@ -26,12 +26,14 @@ bot_mode: "PROVISIONAL"
 # ----------------------------------------------------------
 # Feed Configuration
 # RTDS = Polymarket Real-Time Data Service (websocket-based)
-# TODO: Confirm exact RTDS websocket host once Polymarket
-#       publishes stable channel docs.  Current best-known
-#       base is documented in feeds/base.py.
+# Endpoint: wss://ws-live-data.polymarket.com
+# NOTE: RTDS uses a DIFFERENT host than the CLOB market/user WebSockets.
+#   RTDS (crypto prices):  wss://ws-live-data.polymarket.com
+#   CLOB market events:    wss://ws-subscriptions-clob.polymarket.com/ws/market
+#   CLOB user events:      wss://ws-subscriptions-clob.polymarket.com/ws/user
 # ----------------------------------------------------------
 feeds:
-  rtds_host: "wss://ws-subscriptions-clob.polymarket.com/ws/"
+  rtds_host: "wss://ws-live-data.polymarket.com"
   fast_feed_channel: "crypto_prices"          # Binance-like tick feed
   chainlink_feed_channel: "crypto_prices_chainlink"  # Reference / settlement feed
   stale_threshold_seconds: 10.0               # Mark feed stale if gap > this

@@ -2,30 +2,65 @@
 feeds/base.py — Shared types and base class for RTDS feed adapters.
 
 Polymarket RTDS (Real-Time Data Service) delivers price data over a
-WebSocket connection. The best-known base endpoint is:
-  wss://ws-subscriptions-clob.polymarket.com/ws/
+dedicated WebSocket endpoint that is SEPARATE from the CLOB market/user
+WebSocket endpoints:
 
-TODO: Verify channel name format once Polymarket publishes stable RTDS
-      channel documentation. Current channel names (`crypto_prices`,
-      `crypto_prices_chainlink`) are taken from the spec addendum and
-      match the naming conventions observed in Polymarket's CLOB docs.
+  RTDS endpoint:      wss://ws-live-data.polymarket.com
+  CLOB market events: wss://ws-subscriptions-clob.polymarket.com/ws/market
+  CLOB user events:   wss://ws-subscriptions-clob.polymarket.com/ws/user
 
-TODO: Confirm subscription message schema (subscribe / unsubscribe
-      payloads) against live RTDS documentation. The adapter below uses
-      a placeholder JSON subscribe format that mirrors websocket-based
-      exchange conventions; update when confirmed.
+Do NOT connect RTDS topics (crypto_prices, crypto_prices_chainlink) to the
+CLOB ws-subscriptions host — that returns HTTP 404.
 
-Connection strategy:
-  - Each adapter maintains a single async WebSocket connection.
-  - On disconnect, the adapter will attempt reconnect with exponential
-    back-off (max 5 retries).
-  - Heartbeat / ping frames are sent every 20 s to keep the connection
-    alive.
+--- Subscription protocol ---
+
+After connecting to wss://ws-live-data.polymarket.com, send:
+
+    {
+      "action": "subscribe",
+      "subscriptions": [
+        {
+          "topic": "<topic>",
+          "type": "update",
+          "filters": "<optional JSON-encoded filter string>"
+        }
+      ]
+    }
+
+Supported topics: "crypto_prices", "crypto_prices_chainlink"
+
+Filter example (fast feed, BTCUSDT):
+    "filters": '{"symbol":"BTCUSDT"}'
+
+--- Incoming message format ---
+
+    {
+      "topic": "crypto_prices",
+      "type":  "update",
+      "timestamp": <unix ms>,
+      "payload": {
+        "symbol":    "BTCUSDT",
+        "value":     <float price>,
+        "timestamp": <unix ms>
+      }
+    }
+
+--- Heartbeat ---
+
+Polymarket RTDS requires WebSocket PING frames every ~5 seconds to keep
+the connection alive.  This adapter sends ws.ping() every HEARTBEAT_INTERVAL
+(5 s).  Do not reuse CLOB market/user heartbeat assumptions (those use
+application-level "{"type":"heartbeat"}" messages on a different socket).
+
+--- Reconnect ---
+
+Exponential back-off: [2, 4, 8, 16, 32] seconds, up to 5 attempts.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -52,7 +87,7 @@ class FeedSnapshot:
     Attributes
     ----------
     feed_name       Identifier string (e.g. 'fast' or 'chainlink').
-    symbol          Asset symbol (e.g. 'BTC-USD').
+    symbol          Asset symbol as used by this bot (e.g. 'BTC-USD').
     price           Mid-price or last trade price reported by the feed.
     timestamp       Unix epoch seconds of the tick as received from the feed.
     received_at     Local unix epoch seconds when the tick was processed.
@@ -74,13 +109,22 @@ class BaseFeedAdapter:
     """
     Async base class for Polymarket RTDS feed adapters.
 
+    Connects to wss://ws-live-data.polymarket.com (RTDS), subscribes to
+    the topic returned by _channel_name(), and streams FeedSnapshot objects.
+
     Subclasses must implement:
-        _channel_name()  → str
-        _parse_message() → Optional[FeedSnapshot]
+        _channel_name()       → str      RTDS topic name
+        _rtds_symbol()        → str      Symbol in RTDS notation (e.g. "BTCUSDT")
+        _parse_message()      → Optional[FeedSnapshot]
+
+    Subclasses may override:
+        _subscribe_payload()  → dict     Full subscribe action sent after connect
     """
 
     RECONNECT_DELAYS = [2, 4, 8, 16, 32]   # seconds, exponential back-off
-    HEARTBEAT_INTERVAL = 20                  # seconds
+    # Polymarket RTDS requires frequent pings to keep the connection alive.
+    # Recommended interval: ~5 seconds.
+    HEARTBEAT_INTERVAL = 5                   # seconds
 
     def __init__(
         self,
@@ -143,7 +187,7 @@ class BaseFeedAdapter:
             try:
                 self._status = FeedStatus.CONNECTING
                 logger.info(
-                    "[%s] Connecting to RTDS %s channel=%s",
+                    "[%s] Connecting to RTDS %s topic=%s",
                     self._feed_label(), self._rtds_host, self._channel_name()
                 )
                 await self._connect_and_consume()
@@ -160,10 +204,15 @@ class BaseFeedAdapter:
 
     async def _connect_and_consume(self) -> None:
         """
-        TODO: Replace placeholder websocket logic with real RTDS connection
-              once subscription message format is confirmed from Polymarket docs.
+        Connect to wss://ws-live-data.polymarket.com and consume RTDS messages.
+
+        Protocol:
+          1. Open WebSocket to self._rtds_host (must be RTDS host, not CLOB host).
+          2. Send RTDS subscribe action (see _subscribe_payload()).
+          3. Receive messages; each has {"topic":..., "type":..., "payload":{...}}.
+          4. Send WebSocket PING frames every HEARTBEAT_INTERVAL seconds to keep
+             the connection alive (Polymarket RTDS requires ~5 s pings).
         """
-        # Import guard — websockets is an optional dep during unit tests.
         try:
             import websockets  # type: ignore
         except ImportError:
@@ -173,18 +222,15 @@ class BaseFeedAdapter:
         async with websockets.connect(self._rtds_host) as ws:
             self._ws = ws
             self._status = FeedStatus.CONNECTED
-            logger.info("[%s] Connected", self._feed_label())
+            logger.info("[%s] Connected to RTDS %s", self._feed_label(), self._rtds_host)
 
-            # Subscribe to channel
-            # TODO: Confirm exact subscribe payload from Polymarket RTDS docs.
-            subscribe_msg = {
-                "action": "subscribe",
-                "channel": self._channel_name(),
-                "assets": [self._symbol],
-            }
-            import json
-            await ws.send(json.dumps(subscribe_msg))
-            logger.debug("[%s] Sent subscribe: %s", self._feed_label(), subscribe_msg)
+            # Send RTDS subscription — uses "subscriptions" list wrapper, not
+            # the CLOB {"action":"subscribe","channel":...} format.
+            sub_payload = self._subscribe_payload()
+            await ws.send(json.dumps(sub_payload))
+            logger.info(
+                "[%s] Sent RTDS subscribe: %s", self._feed_label(), sub_payload
+            )
 
             heartbeat_task = asyncio.ensure_future(self._heartbeat(ws))
             try:
@@ -206,13 +252,44 @@ class BaseFeedAdapter:
                 self._ws = None
 
     async def _heartbeat(self, ws) -> None:
-        import json
+        """
+        Send WebSocket PING frames every HEARTBEAT_INTERVAL seconds.
+
+        Polymarket RTDS keepalive is done via native WebSocket ping/pong,
+        NOT via application-level heartbeat messages (those are only for
+        the CLOB market/user sockets).  A ping every 5 seconds is sufficient.
+        """
         while True:
             await asyncio.sleep(self.HEARTBEAT_INTERVAL)
             try:
                 await ws.ping()
             except Exception:
                 break
+
+    def _subscribe_payload(self) -> dict:
+        """
+        Build the RTDS subscribe action to send immediately after connection.
+
+        Default: subscribe to _channel_name() with type "update".
+        Subclasses override to add symbol filters.
+
+        RTDS format (different from CLOB channel subscription):
+          {
+            "action": "subscribe",
+            "subscriptions": [
+              {"topic": "<topic>", "type": "update"}
+            ]
+          }
+        """
+        return {
+            "action": "subscribe",
+            "subscriptions": [
+                {
+                    "topic": self._channel_name(),
+                    "type": "update",
+                }
+            ],
+        }
 
     def _build_snapshot(self, price: float, ts: float, raw: dict) -> FeedSnapshot:
         now = time.time()
@@ -246,10 +323,26 @@ class BaseFeedAdapter:
     # ------------------------------------------------------------------
 
     def _channel_name(self) -> str:
+        """RTDS topic name (e.g. 'crypto_prices')."""
         raise NotImplementedError
 
     def _feed_label(self) -> str:
         raise NotImplementedError
 
     def _parse_message(self, payload: dict) -> Optional[FeedSnapshot]:
+        """
+        Parse an incoming RTDS message envelope.
+
+        Incoming structure:
+          {
+            "topic":     "<topic>",
+            "type":      "update",
+            "timestamp": <unix ms>,
+            "payload": {
+              "symbol":    "<RTDS symbol>",
+              "value":     <float price>,
+              "timestamp": <unix ms>
+            }
+          }
+        """
         raise NotImplementedError

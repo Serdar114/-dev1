@@ -1,30 +1,41 @@
 """
 feeds/chainlink_feed.py — Chainlink-like settlement / reference feed adapter.
 
-RTDS channel: crypto_prices_chainlink
-Purpose     : Slower, authoritative price reference used for:
-              - Settlement verification
-              - Basis mismatch computation
-              - Open-price integrity checks
+RTDS topic : crypto_prices_chainlink
+RTDS host  : wss://ws-live-data.polymarket.com   (NOT the CLOB host)
+Purpose    : Slower, authoritative price reference used for:
+             - Settlement verification
+             - Basis mismatch computation
+             - Open-price integrity checks
 
-Channel semantics (from spec addendum):
+Channel semantics:
   - Analogous to a Chainlink oracle price feed.
   - Updates less frequently than the fast feed (typically every few
     seconds to tens of seconds, mirroring on-chain oracle cadence).
-  - Used as the reference price against which the fast feed is compared.
 
-TODO: Confirm `crypto_prices_chainlink` message schema from Polymarket
-      RTDS docs. Expected schema (mirrors fast feed with different channel):
-        {
-          "channel": "crypto_prices_chainlink",
-          "data": {
-            "asset": "<symbol>",
-            "price": <float>,
-            "timestamp": <unix_seconds_float>,
-            "round_id": <optional int>   # Chainlink round identifier
-          }
-        }
-      Update _parse_message if schema differs.
+Subscription sent after connect:
+  {
+    "action": "subscribe",
+    "subscriptions": [
+      {
+        "topic": "crypto_prices_chainlink",
+        "type":  "update"
+      }
+    ]
+  }
+
+Incoming message structure:
+  {
+    "topic":     "crypto_prices_chainlink",
+    "type":      "update",
+    "timestamp": <unix ms>,
+    "payload": {
+      "symbol":    "BTCUSDT",
+      "value":     <float price>,
+      "timestamp": <unix ms>,
+      "round_id":  <optional str/int>   # Chainlink round identifier
+    }
+  }
 
 Gap monitoring note:
   chainlink_gap_seconds is intentionally more forgiving than fast_feed_gap
@@ -39,6 +50,7 @@ import logging
 from typing import Optional
 
 from .base import BaseFeedAdapter, FeedSnapshot
+from .fast_feed import _to_rtds_symbol  # reuse shared symbol mapping
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +66,6 @@ class ChainlinkFeedAdapter(BaseFeedAdapter):
       - Signal engine (open-price integrity gate)
       - Basis mismatch computation
       - Kill condition: chainlink_gap_frequency_ceiling
-
-    chainlink_gap_seconds is derived from FeedSnapshot.gap_seconds.
     """
 
     def _channel_name(self) -> str:
@@ -64,27 +74,61 @@ class ChainlinkFeedAdapter(BaseFeedAdapter):
     def _feed_label(self) -> str:
         return "chainlink"
 
+    def _subscribe_payload(self) -> dict:
+        """
+        RTDS subscribe action for crypto_prices_chainlink.
+
+        No symbol filter is included by default; the Chainlink topic
+        delivers fewer assets and the adapter filters by symbol in
+        _parse_message.  Add a filter here if the feed proves noisy.
+        """
+        return {
+            "action": "subscribe",
+            "subscriptions": [
+                {
+                    "topic": _CHANNEL,
+                    "type": "update",
+                }
+            ],
+        }
+
     def _parse_message(self, payload: dict) -> Optional[FeedSnapshot]:
         """
         Parse an incoming RTDS message from `crypto_prices_chainlink`.
 
-        TODO: Update field paths once confirmed against live RTDS docs.
-              round_id is logged for audit purposes if present; not used
-              in current signal logic.
+        Incoming envelope:
+          {
+            "topic":     "crypto_prices_chainlink",
+            "type":      "update",
+            "timestamp": <unix ms>,
+            "payload": {
+              "symbol":    "BTCUSDT",
+              "value":     <float price>,
+              "timestamp": <unix ms>,
+              "round_id":  <optional>
+            }
+          }
+
+        timestamp is in milliseconds; converted to seconds for FeedSnapshot.
+        round_id is logged for audit purposes if present; not used in
+        current signal logic.
         """
-        if payload.get("channel") != _CHANNEL:
+        if payload.get("topic") != _CHANNEL:
             return None
 
-        data = payload.get("data", {})
+        data = payload.get("payload", {})
         if not data:
             return None
 
-        if data.get("asset") and data["asset"] != self._symbol:
+        # Symbol filter — only process ticks for the configured symbol.
+        rtds_sym = _to_rtds_symbol(self._symbol)
+        incoming_sym = data.get("symbol", "")
+        if incoming_sym and incoming_sym != rtds_sym:
             return None
 
         try:
-            price = float(data["price"])
-            ts = float(data["timestamp"])
+            price = float(data["value"])
+            ts = float(data["timestamp"]) / 1000.0  # ms → seconds
         except (KeyError, TypeError, ValueError) as exc:
             logger.debug("[chainlink] Cannot parse tick: %s | payload=%s", exc, payload)
             return None
