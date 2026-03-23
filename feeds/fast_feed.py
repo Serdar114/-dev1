@@ -104,65 +104,46 @@ class FastFeedAdapter(BaseFeedAdapter):
 
     def _parse_message(self, payload: dict) -> Optional[FeedSnapshot]:
         """
-        Parse an incoming RTDS message from `crypto_prices`.
+        Parse the ACTUAL crypto_prices RTDS format observed from the live feed:
 
-        Incoming envelope:
           {
-            "topic":     "crypto_prices",
-            "type":      "update",
-            "timestamp": <unix ms>,
             "payload": {
-              "symbol":    "BTCUSDT",
-              "value":     <float price>,
-              "timestamp": <unix ms>
+              "data": [
+                {"timestamp": <unix ms>, "value": <float>},
+                ...
+              ]
             }
           }
 
-        timestamp is in milliseconds; converted to seconds for FeedSnapshot.
+        Notes:
+        - No "topic", "type", or "symbol" at the envelope level.
+        - Subscription filter (BTCUSDT) handles symbol selection server-side.
+        - data[] is a batch; take the LAST element as the most recent price.
+        - Timestamps are milliseconds; converted to seconds for FeedSnapshot.
+
+        Returns None (discarded) for empty batch.
+        Raises ValueError/KeyError for unexpected shapes → base counts as parse_failed.
         """
-        topic = payload.get("topic")
-        if topic != _CHANNEL:
-            logger.debug("[fast] Message discarded: topic=%r (expected %r)", topic, _CHANNEL)
-            return None
-
-        data = payload.get("payload", {})
-        if not data:
-            # Help diagnose if the envelope uses a different key (e.g. "data")
-            alt_keys = [k for k in payload if k not in ("topic", "type", "timestamp")]
-            logger.debug(
-                "[fast] Message discarded: empty/missing 'payload'. "
-                "Other envelope keys: %s", alt_keys
-            )
-            return None
-
-        # Unexpected-key visibility: log if payload fields differ from expected schema.
-        expected_keys = {"symbol", "value", "timestamp"}
-        actual_keys = set(data.keys())
-        unexpected = actual_keys - expected_keys
-        missing_required = {"value", "timestamp"} - actual_keys
-        if unexpected or missing_required:
-            logger.debug(
-                "[fast] Unexpected payload keys: present=%s unexpected=%s missing=%s",
-                sorted(actual_keys), sorted(unexpected), sorted(missing_required)
+        payload_obj = payload.get("payload")
+        if not isinstance(payload_obj, dict):
+            raise ValueError(
+                f"Expected 'payload' dict at top level, "
+                f"got {type(payload_obj).__name__}. Keys: {list(payload.keys())}"
             )
 
-        # Symbol filter — only process ticks for the configured symbol.
-        rtds_sym = _to_rtds_symbol(self._symbol)
-        incoming_sym = data.get("symbol", "")
-        if incoming_sym and incoming_sym != rtds_sym:
-            logger.debug(
-                "[fast] Message discarded: symbol=%r (want %r)", incoming_sym, rtds_sym
+        data_list = payload_obj.get("data")
+        if not isinstance(data_list, list):
+            raise ValueError(
+                f"Expected 'payload.data' list, "
+                f"got {type(data_list).__name__}. payload keys: {list(payload_obj.keys())}"
             )
-            return None
 
-        try:
-            price = float(data["value"])
-            ts = float(data["timestamp"]) / 1000.0  # ms → seconds
-        except (KeyError, TypeError, ValueError) as exc:
-            logger.warning(
-                "[fast] Cannot parse tick fields: %s: %s | data=%s",
-                type(exc).__name__, exc, data
-            )
-            return None
+        if len(data_list) == 0:
+            logger.debug("[fast] Skipped empty data batch")
+            return None  # discarded, not parse_failed
 
+        # Take the last element — most recent in the batch.
+        latest = data_list[-1]
+        price = float(latest["value"])
+        ts = float(latest["timestamp"]) / 1000.0  # ms → seconds
         return self._build_snapshot(price=price, ts=ts, raw=payload)

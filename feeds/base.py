@@ -153,8 +153,11 @@ class BaseFeedAdapter:
         self._total_parsed_ok: int = 0
         self._total_parse_failed: int = 0
         self._total_discarded: int = 0
+        self._total_empty_ack: int = 0
         # Per-connection raw-log counter (reset on each connect)
         self._raw_log_count: int = 0
+        # Per-connection empty-ack log flag (reset on each connect — log once per conn)
+        self._empty_ack_logged: bool = False
         # Set to True once first valid price is logged
         self._first_valid_logged: bool = False
         # Last time counters were logged (wall clock)
@@ -235,9 +238,9 @@ class BaseFeedAdapter:
             logger.error("[%s] websockets package not installed", self._feed_label())
             raise
 
-        # Reset per-connection raw-log counter so first 5 messages of each
-        # reconnect are always captured.
+        # Reset per-connection counters so diagnostics cover each reconnect.
         self._raw_log_count = 0
+        self._empty_ack_logged = False
 
         async with websockets.connect(self._rtds_host) as ws:
             self._ws = ws
@@ -263,6 +266,15 @@ class BaseFeedAdapter:
                 async for raw_msg in ws:
                     if not self._running:
                         break
+
+                    # Empty string = subscription ack — skip cleanly, not an error.
+                    raw_stripped = raw_msg.strip() if isinstance(raw_msg, str) else raw_msg
+                    if not raw_stripped:
+                        self._total_empty_ack += 1
+                        if not self._empty_ack_logged:
+                            self._empty_ack_logged = True
+                            logger.debug("[%s] Skipped empty ack", self._feed_label())
+                        continue
 
                     msgs_this_conn[0] += 1
                     self._total_received += 1
@@ -317,10 +329,11 @@ class BaseFeedAdapter:
                         self._last_counter_log = now
                         logger.info(
                             "[%s] counters: received=%d parsed_ok=%d "
-                            "parse_failed=%d discarded=%d",
+                            "parse_failed=%d discarded=%d empty_ack=%d",
                             self._feed_label(),
                             self._total_received, self._total_parsed_ok,
                             self._total_parse_failed, self._total_discarded,
+                            self._total_empty_ack,
                         )
             finally:
                 heartbeat_task.cancel()

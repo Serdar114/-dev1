@@ -94,77 +94,49 @@ class ChainlinkFeedAdapter(BaseFeedAdapter):
 
     def _parse_message(self, payload: dict) -> Optional[FeedSnapshot]:
         """
-        Parse an incoming RTDS message from `crypto_prices_chainlink`.
+        Parse the ACTUAL crypto_prices_chainlink RTDS format observed from the
+        live feed:
 
-        Incoming envelope:
           {
-            "topic":     "crypto_prices_chainlink",
-            "type":      "update",
-            "timestamp": <unix ms>,
+            "connection_id": "...",
             "payload": {
-              "symbol":    "BTCUSDT",
-              "value":     <float price>,
-              "timestamp": <unix ms>,
-              "round_id":  <optional>
-            }
+              "symbol":              "btc/usd",   ← lowercase with slash
+              "timestamp":           <unix ms>,
+              "value":               <float>,
+              "full_accuracy_value": "..."        ← optional, ignored
+            },
+            "timestamp": <unix ms>,
+            "topic":     "crypto_prices_chainlink",
+            "type":      "update"
           }
 
-        timestamp is in milliseconds; converted to seconds for FeedSnapshot.
-        round_id is logged for audit purposes if present; not used in
-        current signal logic.
+        Symbol filter: accept "btc/usd" only; discard all other symbols
+        (eth/usd, sol/usd, etc.) silently — they are expected, NOT failures.
+
+        Returns None (discarded) for non-BTC symbols.
+        Raises ValueError/KeyError for unexpected shapes → base counts as parse_failed.
         """
-        topic = payload.get("topic")
-        if topic != _CHANNEL:
-            logger.debug(
-                "[chainlink] Message discarded: topic=%r (expected %r)", topic, _CHANNEL
-            )
-            return None
-
-        data = payload.get("payload", {})
-        if not data:
-            alt_keys = [k for k in payload if k not in ("topic", "type", "timestamp")]
-            logger.debug(
-                "[chainlink] Message discarded: empty/missing 'payload'. "
-                "Other envelope keys: %s", alt_keys
-            )
-            return None
-
-        # Unexpected-key visibility.
-        expected_keys = {"symbol", "value", "timestamp", "round_id"}
-        actual_keys = set(data.keys())
-        unexpected = actual_keys - expected_keys
-        missing_required = {"value", "timestamp"} - actual_keys
-        if unexpected or missing_required:
-            logger.debug(
-                "[chainlink] Unexpected payload keys: present=%s unexpected=%s missing=%s",
-                sorted(actual_keys), sorted(unexpected), sorted(missing_required)
+        payload_obj = payload.get("payload")
+        if not isinstance(payload_obj, dict):
+            raise ValueError(
+                f"Expected 'payload' dict, got {type(payload_obj).__name__}. "
+                f"Keys: {list(payload.keys())}"
             )
 
-        # Symbol filter — only process ticks for the configured symbol.
-        rtds_sym = _to_rtds_symbol(self._symbol)
-        incoming_sym = data.get("symbol", "")
-        if incoming_sym and incoming_sym != rtds_sym:
-            logger.debug(
-                "[chainlink] Message discarded: symbol=%r (want %r)",
-                incoming_sym, rtds_sym
-            )
+        symbol = payload_obj.get("symbol", "")
+        if symbol.lower() != "btc/usd":
+            # Expected: eth/usd, sol/usd, doge/usd, bnb/usd, etc. — discard quietly.
+            logger.debug("[chainlink] Discarded: symbol=%r (want 'btc/usd')", symbol)
             return None
 
-        try:
-            price = float(data["value"])
-            ts = float(data["timestamp"]) / 1000.0  # ms → seconds
-        except (KeyError, TypeError, ValueError) as exc:
-            logger.warning(
-                "[chainlink] Cannot parse tick fields: %s: %s | data=%s",
-                type(exc).__name__, exc, data
-            )
-            return None
+        price = float(payload_obj["value"])
+        ts = float(payload_obj["timestamp"]) / 1000.0  # ms → seconds
 
         snap = self._build_snapshot(price=price, ts=ts, raw=payload)
 
-        # Log round_id if present (Chainlink-specific audit field).
-        round_id = data.get("round_id")
-        if round_id is not None:
-            logger.debug("[chainlink] round_id=%s price=%.6f", round_id, price)
+        # Log full_accuracy_value if present (Chainlink audit field).
+        fav = payload_obj.get("full_accuracy_value")
+        if fav is not None:
+            logger.debug("[chainlink] btc/usd full_accuracy_value=%s price=%.6f", fav, price)
 
         return snap
