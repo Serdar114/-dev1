@@ -110,6 +110,30 @@ fees:
   assumed_slippage_bps: 0
 
 # ----------------------------------------------------------
+# Trade Eligibility Zones
+#
+# These separate the "research logging zone" (signal engine extreme_zone gate)
+# from the narrower bands within which each lane will actually simulate a fill.
+#
+# Research zone (extreme_zone gate in signal engine):
+#   extreme_zone_low  = 0.10  — below this → extreme long bias, no signal
+#   extreme_zone_high = 0.90  — above this → extreme short bias, no signal
+#
+# Trade zones are tighter:
+#   maker: 0.83–0.92  (matches the union of quote buckets B1/B2/B3)
+#   taker: 0.80–0.92  (slightly wider — taker can still execute at 0.80)
+#
+# A window where YES mid is inside the research zone but outside the trade zone
+# will be logged as a candidate but will not produce a fill in that lane.
+# Rejection reason: e.g. "taker_zone:0.79_outside_[0.80,0.92]"
+# ----------------------------------------------------------
+trade_zones:
+  maker_trade_zone_low: 0.83
+  maker_trade_zone_high: 0.92
+  taker_trade_zone_low: 0.80
+  taker_trade_zone_high: 0.92
+
+# ----------------------------------------------------------
 # Maker lane configuration
 # ----------------------------------------------------------
 maker:

@@ -18,17 +18,31 @@ MAKER LANE
 
 TAKER LANE
 ----------
-  fee = C * 0.25 * (p * (1 - p))^2
+  fee = C * p * 0.25 * (p * (1 - p))^2
 
   Symbol definitions:
     p   = execution price of the YES share (0 < p < 1)
     C   = fee constant (see below)
 
   Why this formula?
-    The term 0.25 * (p*(1-p))^2 captures how taker cost varies with price:
-      - At p = 0.5 the term peaks at 0.25 * (0.25)^2 = 0.015625.
-      - At p near 0 or 1 the term → 0 (thin markets have low absolute value).
-    Multiplying by C converts this into a dollar fee per share.
+    The leading p term scales the fee with the price of the position —
+    higher-priced YES shares attract a larger absolute fee, reflecting
+    that more capital is at risk.
+    The trailing 0.25 * (p*(1-p))^2 captures the price-variance shape:
+      - At p = 0.5 the variance term peaks at 0.25 * (0.25)^2 = 0.015625.
+      - At p near 0 or 1 the term → 0 (thin markets, small absolute value).
+    Combining: fee is highest for mid-to-high-probability positions.
+
+  Numeric examples (C=0.02, 5 shares):
+    p = 0.50: fee_per_share = 0.02 * 0.50 * 0.25 * (0.50*0.50)^2
+                            = 0.02 * 0.50 * 0.25 * 0.0625
+                            = 0.000156250
+              total_fee (5 shares) = 0.000781
+    p = 0.85: fee_per_share = 0.02 * 0.85 * 0.25 * (0.85*0.15)^2
+                            = 0.02 * 0.85 * 0.25 * (0.1275)^2
+                            = 0.02 * 0.85 * 0.25 * 0.016256
+                            = 0.000069
+              total_fee (5 shares) = 0.000345
 
   Derivation of C:
     Polymarket CLOB documented taker fee:
@@ -38,17 +52,17 @@ TAKER LANE
       Taker fee per share          = 0.02 * (1 - p)                  ...(A)
 
     The formula above at C=0.02:
-      fee = 0.02 * 0.25 * (p*(1-p))^2
+      fee = 0.02 * p * 0.25 * (p*(1-p))^2
 
-    Note: formula (A) and the quadratic form are NOT identical.
-    We use the quadratic form as specified in the spec addendum.
-    The quadratic form penalises mid-range prices more than (A) does,
-    making it a CONSERVATIVE (higher) estimate when p ≈ 0.5.
+    Note: formula (A) and the cubic form are NOT identical.
+    We use the cubic form as specified in the spec addendum.
+    The leading p term makes it more conservative at high-probability
+    positions than the simple linear form (A).
 
     C = 0.02 is the default, drawn from the Polymarket CLOB documentation.
     Override via config `fees.taker_fee_C` to run sensitivity analysis.
 
-  CAUTION: The quadratic formula is not directly derived from Polymarket's
+  CAUTION: This formula is not directly derived from Polymarket's
   published fee schedule.  It is a model imposed by the spec addendum.
   Results are only comparable within this framework.  Do not interpret the
   fee output as an exact exchange charge.
@@ -90,7 +104,7 @@ class TakerFeeResult:
     price           Execution price p (YES side, 0 < p < 1).
     shares          Number of shares.
     C               Fee constant used in the computation.
-    fee_per_share   Fee in USD per share:  C * 0.25 * (p*(1-p))^2
+    fee_per_share   Fee in USD per share:  C * p * 0.25 * (p*(1-p))^2
     total_fee       fee_per_share * shares
     formula_str     Human-readable formula string for logs / audits.
     """
@@ -117,7 +131,11 @@ def compute_taker_fee(price: float, shares: int, C: float = DEFAULT_TAKER_C) -> 
     Compute the taker fee for a YES-side fill.
 
     Formula (from spec addendum):
-        fee_per_share = C * 0.25 * (p * (1 - p))^2
+        fee_per_share = C * p * 0.25 * (p * (1 - p))^2
+
+    The leading p term scales the fee with the price of the position.
+    At p=0.50, C=0.02: fee_per_share = 0.02 * 0.50 * 0.25 * 0.0625 = 0.000156
+    At p=0.85, C=0.02: fee_per_share = 0.02 * 0.85 * 0.25 * 0.01626 = 0.000069
 
     Parameters
     ----------
@@ -135,12 +153,12 @@ def compute_taker_fee(price: float, shares: int, C: float = DEFAULT_TAKER_C) -> 
         raise ValueError(f"shares must be >= 1, got {shares}")
 
     inner = price * (1.0 - price)
-    fee_per_share = C * 0.25 * (inner ** 2)
+    fee_per_share = C * price * 0.25 * (inner ** 2)
     total_fee = fee_per_share * shares
 
     formula_str = (
-        f"fee = {C} * 0.25 * ({price:.4f} * (1 - {price:.4f}))^2 "
-        f"= {fee_per_share:.6f} per share × {shares} shares = {total_fee:.6f} USD"
+        f"fee = {C} * {price:.4f} * 0.25 * ({price:.4f} * (1 - {price:.4f}))^2 "
+        f"= {fee_per_share:.8f} per share × {shares} shares = {total_fee:.8f} USD"
     )
 
     return TakerFeeResult(

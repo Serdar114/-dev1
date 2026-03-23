@@ -25,7 +25,7 @@ Configure in settings.yaml → fees.assumed_slippage_bps.
 Fee computation
 ---------------
 Taker fee is computed using the formula from execution/fees.py:
-    fee = C * 0.25 * (p * (1 - p))^2
+    fee = C * p * 0.25 * (p * (1 - p))^2
 
 This is deducted from gross P&L to produce net P&L.
 
@@ -90,6 +90,7 @@ class TakerResult:
     loss_if_wrong: Optional[float] = None
     outcome_correct: Optional[bool] = None
     fee_result: Optional[TakerFeeResult] = None
+    zone_eligible: bool = True   # False if decision_price is outside taker_trade_zone
     rejection_reason: Optional[str] = None
     extra: dict = field(default_factory=dict)
 
@@ -110,6 +111,12 @@ class TakerLane:
             config.get("fees", {}).get("assumed_slippage_bps", 0)
         )
         self._shares = FIXED_SHARES_V1
+        # Trade zone: taker fills only within [zone_low, zone_high].
+        # Prices inside the research zone (extreme_zone gate) but outside this
+        # band are logged as "inside research zone but outside taker trade zone".
+        zone_cfg = config.get("trade_zones", {})
+        self._zone_low = float(zone_cfg.get("taker_trade_zone_low", 0.80))
+        self._zone_high = float(zone_cfg.get("taker_trade_zone_high", 0.92))
 
     def evaluate(
         self,
@@ -169,6 +176,21 @@ class TakerLane:
                 "Use YesPriceSnapshot from feeds/yes_price_adapter.py to obtain the "
                 "YES probability before calling this method."
             )
+
+        # Trade zone gate: reject fills outside configured taker trade zone.
+        # This is narrower than the research zone (extreme_zone signal gate).
+        # A window can be a signal candidate while still being outside trade zone.
+        if not (self._zone_low <= decision_price <= self._zone_high):
+            result.zone_eligible = False
+            result.rejection_reason = (
+                f"taker_zone:{decision_price:.4f}_outside_"
+                f"[{self._zone_low:.2f},{self._zone_high:.2f}]"
+            )
+            logger.debug(
+                "[taker] zone rejection window=%d price=%.4f zone=[%.2f, %.2f]",
+                window_open_ts, decision_price, self._zone_low, self._zone_high,
+            )
+            return result
 
         fee_result = compute_taker_fee(decision_price, self._shares, self._fee_C)
         result.fee_result = fee_result

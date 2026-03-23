@@ -132,6 +132,12 @@ class WindowLog:
     maker_last_path_ts: Optional[float] = None            # Unix ts of last price poll
     maker_fill_evaluable: bool = False                    # True iff path_points >= 2
     maker_fill_realism_mode: str = "N/A"                  # grade label from MakerResult
+    maker_fill_confirmed_by_later_point: bool = False     # True iff later path point confirmed fill
+    maker_fill_confirmation_index: Optional[int] = None   # index in path that confirmed (1-based)
+
+    # Trade zone eligibility (research zone is wider; trade zones are narrower)
+    maker_trade_zone_eligible: bool = True   # False if intended_price outside maker trade zone
+    taker_trade_zone_eligible: bool = True   # False if decision_price outside taker trade zone
 
     # Decision-time snapshot (Phase B: T - decision_window_start seconds before close)
     # Distinct from fast_price / chainlink_price which are captured at window open (T+0).

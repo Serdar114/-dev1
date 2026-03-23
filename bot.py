@@ -548,6 +548,9 @@ class ResearchBot:
         wl.maker_fill_realism_grade = maker_result.fill_realism_grade
         wl.maker_fill_evaluable = maker_result.fill_evaluable
         wl.maker_fill_realism_mode = maker_result.fill_realism_grade
+        wl.maker_fill_confirmed_by_later_point = maker_result.fill_confirmed_by_later_point
+        wl.maker_fill_confirmation_index = maker_result.fill_confirmation_index
+        wl.maker_trade_zone_eligible = (maker_result.quote_bucket != "INELIGIBLE")
         wl.maker_bankroll_fraction = maker_result.bankroll_fraction
         wl.maker_break_even_wr = maker_result.break_even_wr_estimate
         wl.maker_win_if_correct = maker_result.win_if_correct
@@ -574,6 +577,7 @@ class ResearchBot:
         wl.taker_decision_ts = taker_result.decision_ts
         wl.taker_execution_source = taker_result.execution_source
         wl.taker_assumed_slippage_bps = taker_result.assumed_slippage_bps
+        wl.taker_trade_zone_eligible = taker_result.zone_eligible
 
         # --- Entry cap application (both lanes together) ---
         # Policy (either_lane_fill): a window where either lane produces a fill

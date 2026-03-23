@@ -116,6 +116,8 @@ class MakerResult:
     fill_price: Optional[float] = None
     fill_realism_grade: str = FILL_GRADE_NA   # see module docstring
     fill_evaluable: bool = False              # True only for multi-point / observed paths
+    fill_confirmed_by_later_point: bool = False   # True iff fill evidence came from index >= 1
+    fill_confirmation_index: Optional[int] = None  # index in path that confirmed fill (1-based)
     fee_per_share: float = 0.0
     total_fee: float = 0.0
     gross_pnl: Optional[float] = None
@@ -142,6 +144,11 @@ class MakerLane:
         self._sizing_cfg = config.get("sizing", {})
         self._quote_buckets_cfg = config.get("quote_buckets", {})
         self._shares = FIXED_SHARES_V1
+        # Trade zone (informational — enforced implicitly by quote bucket INELIGIBLE).
+        # Stored here so logs can reference the configured band.
+        zone_cfg = config.get("trade_zones", {})
+        self._zone_low = float(zone_cfg.get("maker_trade_zone_low", 0.83))
+        self._zone_high = float(zone_cfg.get("maker_trade_zone_high", 0.92))
 
     def evaluate(
         self,
@@ -249,7 +256,7 @@ class MakerLane:
                 window_open_ts, slug, intended_price,
             )
         else:
-            # Multi-point path — evaluable.
+            # Multi-point path (len >= 2) — evaluable.
             # Grade: OBSERVED_PATH only if caller explicitly signals real WebSocket data.
             if fill_realism_source == FILL_GRADE_OBSERVED:
                 result.fill_realism_grade = FILL_GRADE_OBSERVED
@@ -257,11 +264,36 @@ class MakerLane:
                 result.fill_realism_grade = FILL_GRADE_PROVISIONAL_MULTI
             result.fill_evaluable = True
 
-            min_price = min(intra_window_prices)
-            if min_price <= intended_price:
+            # Conservative fill confirmation rule:
+            #   SKIP the first collected price point (intra_window_prices[0]).
+            #   Reason: the first post-decision REST poll often coincides with
+            #   the decision-time midpoint (same-tick risk).  A price at exactly
+            #   the limit in the first poll is tautological — it does not prove
+            #   that resting sell-side liquidity existed at that level.
+            #
+            # Fill rule (preferred — <=):
+            #   filled = True iff any LATER point (index >= 1) <= intended_price
+            #
+            # Documented examples (intended_price = 0.87):
+            #   path=[0.87, 0.91] → skip 0.87; later=[0.91] > 0.87 → NOT filled
+            #   path=[0.87, 0.87] → skip 0.87; later=[0.87] <= 0.87 → filled
+            #                        (second independent observation confirms level)
+            #   path=[0.87, 0.86] → skip 0.87; later=[0.86] <= 0.87 → filled
+            #   path=[0.88, 0.86] → skip 0.88; later=[0.86] <= 0.87 → filled
+            #   path=[0.88, 0.88] → skip 0.88; later=[0.88] > 0.87  → NOT filled
+            later_points = intra_window_prices[1:]
+            confirmation_idx = None
+            for i, pt in enumerate(later_points):
+                if pt <= intended_price:
+                    confirmation_idx = i + 1   # 1-based index in original path
+                    break
+
+            if confirmation_idx is not None:
                 result.filled = True
                 result.fill_price = intended_price   # Assume fill at limit price.
                 result.shares = self._shares
+                result.fill_confirmed_by_later_point = True
+                result.fill_confirmation_index = confirmation_idx
             else:
                 result.filled = False
                 result.fill_price = None
