@@ -654,12 +654,13 @@ def test_report_audit_fields():
         check("audit_format_txt_runs", False, str(exc))
 
 
-# ── 11. discovery admission/rejection (Market Selection Truth Patch) ──────────
+# ── 11. discovery admission/rejection (Market Selection Truth Patch v2) ───────
 
 def test_discovery_admission_rejection():
-    print("\n=== market_discovery admission/rejection (fail-closed) ===")
+    print("\n=== market_discovery admission/rejection (fail-closed, two paths) ===")
 
-    CANONICAL_START = 1774356600  # matches reference URL timestamp
+    # Reference timestamp from canonical URL: btc-updown-5m-1774358400
+    CANONICAL_START = 1774358400
 
     def _make_raw(
         question,
@@ -671,74 +672,191 @@ def test_discovery_admission_rejection():
         description="",
     ):
         """Build a minimal raw market dict for classification tests."""
-        if start_ts is None:
-            start_ts = CANONICAL_START
-        if end_ts is None:
-            end_ts = CANONICAL_START + 300
         raw = {
-            "condition_id":   condition_id,
-            "question":       question,
-            "description":    description,
-            "game_start_time": start_ts,
-            "end_date_iso":   datetime.fromtimestamp(end_ts, tz=timezone.utc).isoformat(),
+            "condition_id": condition_id,
+            "question":     question,
+            "description":  description,
             "tokens": tokens if tokens is not None else [
                 {"token_id": "TOKEN_UP_001",   "outcome": "Up"},
                 {"token_id": "TOKEN_DOWN_001", "outcome": "Down"},
             ],
         }
+        if start_ts is not None:
+            raw["game_start_time"] = start_ts
+        if end_ts is not None:
+            raw["end_date_iso"] = datetime.fromtimestamp(end_ts, tz=timezone.utc).isoformat()
         if slug is not None:
             raw["market_slug"] = slug
         return raw
 
-    # ── POSITIVE: canonical BTC 5m Up/Down market ─────────────────────────────
-    canonical = _make_raw(
-        question="Bitcoin Up or Down - 5 Minutes",
-        condition_id="COND_BTC5M_CANONICAL",
-        slug="btc-updown-5m-1774356600",
-    )
-    r = market_discovery._classify_market(canonical)
-    check("canonical_btc5m_admitted",
+    def _admit(raw):
+        r = market_discovery._classify_market(raw)
+        return r
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # PATH A — canonical slug (PRIMARY signal)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # ── A1: canonical slug + full timing → admitted ───────────────────────────
+    r = _admit(_make_raw(
+        "Bitcoin Up or Down - 5 Minutes",
+        condition_id="COND_A1",
+        start_ts=CANONICAL_START,
+        end_ts=CANONICAL_START + 300,
+        slug="btc-updown-5m-1774358400",
+    ))
+    check("path_a_canonical_full_timing_admitted",
           r["admit"] is True,
-          f"reason={r['rejection_reason']}  detail={r['details'].get('reason_detail')}")
+          f"reason={r['rejection_reason']} detail={r['details'].get('reason_detail')}")
+    check("path_a_admission_path_slug_primary",
+          r["admission_path"] == "slug_primary")
+    check("path_a_timing_source_api",
+          r["details"].get("timing_source") == "api_fields")
 
-    # ── POSITIVE: canonical market without slug field (slug absent = not rejected) ─
-    no_slug = _make_raw(
-        question="Bitcoin Up or Down - 5 Minutes",
-        condition_id="COND_BTC5M_NOSLUG",
-    )
-    # no market_slug key at all
-    no_slug.pop("market_slug", None)
-    r2 = market_discovery._classify_market(no_slug)
-    check("canonical_no_slug_admitted",
-          r2["admit"] is True,
-          f"reason={r2['rejection_reason']}  detail={r2['details'].get('reason_detail')}")
+    # ── A2: canonical slug + NULL game_start_time (slug-derived timing) ───────
+    # This is the critical fix: API timing absent but slug provides it.
+    r = _admit({
+        "condition_id": "COND_A2",
+        "question":     "Bitcoin Up or Down - 5 Minutes",
+        "description":  "",
+        "market_slug":  "btc-updown-5m-1774358400",
+        # game_start_time and end_date_iso deliberately absent
+        "tokens": [
+            {"token_id": "T_UP", "outcome": "Up"},
+            {"token_id": "T_DN", "outcome": "Down"},
+        ],
+    })
+    check("path_a_slug_derived_timing_admitted",
+          r["admit"] is True,
+          f"reason={r['rejection_reason']} detail={r['details'].get('reason_detail')}")
+    check("path_a_slug_derived_timing_source",
+          r["details"].get("timing_source") == "slug_derived",
+          f"timing_source={r['details'].get('timing_source')}")
+    check("path_a_slug_derived_window_300",
+          abs((r["details"].get("window_seconds") or 0) - 300) < 1,
+          f"window={r['details'].get('window_seconds')}")
 
-    # ── POSITIVE: alternative question phrasing ───────────────────────────────
-    alt_q = _make_raw(
-        question="BTC Up or Down - 5 Min",
-        condition_id="COND_BTC5M_ALT",
-    )
-    r3 = market_discovery._classify_market(alt_q)
-    check("alt_question_btc5m_admitted",
-          r3["admit"] is True,
-          f"reason={r3['rejection_reason']}  detail={r3['details'].get('reason_detail')}")
+    # ── A3: question uses time-range format "9:20-9:25AM ET" + canonical slug ─
+    # Canonical live question variant: title has clock range instead of "5 Minutes".
+    # With slug as primary proof, question does not need "5 minute" string.
+    r = _admit({
+        "condition_id": "COND_A3",
+        "question":     "Bitcoin Up or Down - 9:20-9:25AM ET",
+        "description":  "",
+        "market_slug":  "btc-updown-5m-1774358400",
+        "tokens": [
+            {"token_id": "T_UP", "outcome": "Up"},
+            {"token_id": "T_DN", "outcome": "Down"},
+        ],
+    })
+    check("path_a_time_range_question_admitted",
+          r["admit"] is True,
+          f"reason={r['rejection_reason']} detail={r['details'].get('reason_detail')}")
 
-    # ── NEGATIVE: hashprice market ────────────────────────────────────────────
-    hashprice = _make_raw(
-        question="Bitcoin hashprice above 50 PH/s before June 1?",
-        condition_id="COND_HASH_001",
-    )
-    rh = market_discovery._classify_market(hashprice)
-    check("hashprice_rejected",
-          rh["admit"] is False,
-          f"should be rejected, got admit={rh['admit']}")
-    check("hashprice_reason_semantics",
-          rh["rejection_reason"] == "wrong_market_semantics",
-          f"reason={rh['rejection_reason']}")
+    # ── A4: BTC Up or Down (abbreviated) + canonical slug ────────────────────
+    r = _admit({
+        "condition_id": "COND_A4",
+        "question":     "BTC Up or Down - 5 Minutes",
+        "description":  "",
+        "market_slug":  "btc-updown-5m-1774358400",
+        "tokens": [
+            {"token_id": "T_UP", "outcome": "Up"},
+            {"token_id": "T_DN", "outcome": "Down"},
+        ],
+    })
+    check("path_a_btc_abbrev_admitted",
+          r["admit"] is True,
+          f"reason={r['rejection_reason']}")
 
-    # ── NEGATIVE: long-dated Bitcoin before-June market ───────────────────────
-    longdated = {
-        "condition_id":   "COND_LONG_001",
+    # ── A5: canonical slug + blocking term in question → rejected ─────────────
+    r = _admit({
+        "condition_id": "COND_A5",
+        "question":     "Bitcoin hashprice Up or Down - 5 Minutes",
+        "description":  "",
+        "market_slug":  "btc-updown-5m-1774358400",
+        "tokens": [
+            {"token_id": "T_UP", "outcome": "Up"},
+            {"token_id": "T_DN", "outcome": "Down"},
+        ],
+    })
+    check("path_a_blocking_term_still_rejected",
+          r["admit"] is False,
+          f"blocking term must override canonical slug")
+    check("path_a_blocking_term_reason",
+          r["rejection_reason"] == "wrong_market_semantics",
+          f"reason={r['rejection_reason']}")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # PATH B — no canonical slug (question must prove family)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # ── B1: canonical question + full timing, no slug ─────────────────────────
+    r = _admit(_make_raw(
+        "Bitcoin Up or Down - 5 Minutes",
+        condition_id="COND_B1",
+        start_ts=CANONICAL_START,
+        end_ts=CANONICAL_START + 300,
+    ))
+    check("path_b_no_slug_full_question_admitted",
+          r["admit"] is True,
+          f"reason={r['rejection_reason']}")
+    check("path_b_admission_path_question_primary",
+          r["admission_path"] == "question_primary")
+
+    # ── B2: no slug + no timing → rejected (Path B cannot derive from slug) ───
+    r = _admit({
+        "condition_id": "COND_B2",
+        "question":     "Bitcoin Up or Down - 5 Minutes",
+        "description":  "",
+        # no slug, no timing fields
+        "tokens": [
+            {"token_id": "T_UP", "outcome": "Up"},
+            {"token_id": "T_DN", "outcome": "Down"},
+        ],
+    })
+    check("path_b_no_slug_no_timing_rejected",
+          r["admit"] is False,
+          "Path B must not admit without timing")
+    check("path_b_no_timing_reason",
+          r["rejection_reason"] == "missing_timing",
+          f"reason={r['rejection_reason']}")
+
+    # ── B3: 5-minute indicator in description (not question) → admitted ───────
+    r = _admit({
+        "condition_id":   "COND_B3",
+        "question":       "Bitcoin Up or Down",
+        "description":    "Recurring 5 minute BTC prediction market",
+        "game_start_time": CANONICAL_START,
+        "end_date_iso":   datetime.fromtimestamp(
+            CANONICAL_START + 300, tz=timezone.utc
+        ).isoformat(),
+        "tokens": [
+            {"token_id": "T_UP", "outcome": "Up"},
+            {"token_id": "T_DN", "outcome": "Down"},
+        ],
+    })
+    check("path_b_5min_in_description_admitted",
+          r["admit"] is True,
+          f"reason={r['rejection_reason']}")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # REJECTION TESTS — wrong Bitcoin market families
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # ── R1: hashprice market ──────────────────────────────────────────────────
+    r = _admit(_make_raw(
+        "Bitcoin hashprice above 50 PH/s before June 1?",
+        condition_id="COND_R1",
+        start_ts=CANONICAL_START,
+        end_ts=CANONICAL_START + 300,
+    ))
+    check("hashprice_rejected",       r["admit"] is False)
+    check("hashprice_reason",         r["rejection_reason"] == "wrong_market_semantics",
+          f"reason={r['rejection_reason']}")
+
+    # ── R2: before-June long-dated market ────────────────────────────────────
+    r = _admit({
+        "condition_id":   "COND_R2",
         "question":       "Will Bitcoin price be above $100,000 before June?",
         "description":    "",
         "game_start_time": CANONICAL_START,
@@ -749,51 +867,73 @@ def test_discovery_admission_rejection():
             {"token_id": "T_YES", "outcome": "Yes"},
             {"token_id": "T_NO",  "outcome": "No"},
         ],
-    }
-    rl = market_discovery._classify_market(longdated)
-    check("longdated_rejected",
-          rl["admit"] is False,
-          f"should be rejected, got admit={rl['admit']}")
-    # Either wrong_market_semantics (no up+down words) or wrong_window; both correct
-    check("longdated_reason_is_semantics_or_window",
-          rl["rejection_reason"] in ("wrong_market_semantics", "wrong_window"),
-          f"reason={rl['rejection_reason']}")
+    })
+    check("before_june_rejected", r["admit"] is False)
+    check("before_june_reason",
+          r["rejection_reason"] in ("wrong_market_semantics", "wrong_window"),
+          f"reason={r['rejection_reason']}")
 
-    # ── NEGATIVE: blank outcome labels ────────────────────────────────────────
-    blank_tok = _make_raw(
-        question="Bitcoin Up or Down - 5 Minutes",
-        condition_id="COND_BLANK_001",
-        tokens=[
-            {"token_id": "T1", "outcome": ""},
-            {"token_id": "T2", "outcome": ""},
+    # ── R3: above-X price-level market ───────────────────────────────────────
+    r = _admit({
+        "condition_id":   "COND_R3",
+        "question":       "Will Bitcoin be above $110,000 by May?",
+        "description":    "",
+        "game_start_time": CANONICAL_START,
+        "end_date_iso":   datetime.fromtimestamp(
+            CANONICAL_START + 30 * 24 * 3600, tz=timezone.utc
+        ).isoformat(),
+        "tokens": [
+            {"token_id": "T_YES", "outcome": "Yes"},
+            {"token_id": "T_NO",  "outcome": "No"},
         ],
-    )
-    rb = market_discovery._classify_market(blank_tok)
-    check("blank_outcomes_rejected",
-          rb["admit"] is False,
-          f"should be rejected, got admit={rb['admit']}")
+    })
+    check("above_x_btc_rejected", r["admit"] is False,
+          f"above-X price bet must be rejected, got admit={r['admit']}")
+
+    # ── R4: long-dated one-off Bitcoin event market ───────────────────────────
+    r = _admit({
+        "condition_id":   "COND_R4",
+        "question":       "Will Bitcoin reach $200,000 this year?",
+        "description":    "",
+        "game_start_time": CANONICAL_START,
+        "end_date_iso":   datetime.fromtimestamp(
+            CANONICAL_START + 365 * 24 * 3600, tz=timezone.utc
+        ).isoformat(),
+        "tokens": [
+            {"token_id": "T_YES", "outcome": "Yes"},
+            {"token_id": "T_NO",  "outcome": "No"},
+        ],
+    })
+    check("longdated_event_rejected", r["admit"] is False,
+          f"long-dated event market must be rejected, got admit={r['admit']}")
+
+    # ── R5: blank outcome labels ──────────────────────────────────────────────
+    r = _admit(_make_raw(
+        "Bitcoin Up or Down - 5 Minutes",
+        condition_id="COND_R5",
+        start_ts=CANONICAL_START, end_ts=CANONICAL_START + 300,
+        tokens=[{"token_id": "T1", "outcome": ""}, {"token_id": "T2", "outcome": ""}],
+    ))
+    check("blank_outcomes_rejected",  r["admit"] is False)
     check("blank_outcomes_reason",
-          rb["rejection_reason"] in ("invalid_outcomes", "unknown_token_mapping"),
-          f"reason={rb['rejection_reason']}")
+          r["rejection_reason"] in ("invalid_outcomes", "unknown_token_mapping"),
+          f"reason={r['rejection_reason']}")
 
-    # ── NEGATIVE: None / empty market_id ─────────────────────────────────────
-    no_id_raw = _make_raw("Bitcoin Up or Down - 5 Minutes", condition_id="")
-    no_id_raw["condition_id"] = None
-    no_id_raw.pop("market_id", None)
-    rn = market_discovery._classify_market(no_id_raw)
-    check("none_market_id_rejected",
-          rn["admit"] is False,
-          f"should be rejected, got admit={rn['admit']}")
-    check("none_market_id_reason",
-          rn["rejection_reason"] == "missing_market_id",
-          f"reason={rn['rejection_reason']}")
+    # ── R6: None market_id ────────────────────────────────────────────────────
+    raw_noid = _make_raw("Bitcoin Up or Down - 5 Minutes",
+                         start_ts=CANONICAL_START, end_ts=CANONICAL_START + 300)
+    raw_noid["condition_id"] = None
+    raw_noid.pop("market_id", None)
+    r = _admit(raw_noid)
+    check("none_market_id_rejected",  r["admit"] is False)
+    check("none_market_id_reason",    r["rejection_reason"] == "missing_market_id",
+          f"reason={r['rejection_reason']}")
 
-    # ── NEGATIVE: missing start time ─────────────────────────────────────────
-    no_start = {
-        "condition_id": "COND_NOSTART_001",
+    # ── R7: missing start time (Path B, no slug) ──────────────────────────────
+    r = _admit({
+        "condition_id": "COND_R7",
         "question":     "Bitcoin Up or Down - 5 Minutes",
         "description":  "",
-        # no game_start_time, no start_date_iso
         "end_date_iso": datetime.fromtimestamp(
             CANONICAL_START + 300, tz=timezone.utc
         ).isoformat(),
@@ -801,146 +941,183 @@ def test_discovery_admission_rejection():
             {"token_id": "T_UP", "outcome": "Up"},
             {"token_id": "T_DN", "outcome": "Down"},
         ],
-    }
-    rst = market_discovery._classify_market(no_start)
-    check("missing_start_rejected",
-          rst["admit"] is False,
-          f"should be rejected, got admit={rst['admit']}")
-    check("missing_start_reason",
-          rst["rejection_reason"] == "missing_timing",
-          f"reason={rst['rejection_reason']}")
+    })
+    check("missing_start_rejected",   r["admit"] is False)
+    check("missing_start_reason",     r["rejection_reason"] == "missing_timing",
+          f"reason={r['rejection_reason']}")
 
-    # ── NEGATIVE: missing end time ────────────────────────────────────────────
-    no_end = {
-        "condition_id":   "COND_NOEND_001",
+    # ── R8: missing end time (Path B, no slug) ────────────────────────────────
+    r = _admit({
+        "condition_id":    "COND_R8",
+        "question":        "Bitcoin Up or Down - 5 Minutes",
+        "description":     "",
+        "game_start_time": CANONICAL_START,
+        # end absent
+        "tokens": [
+            {"token_id": "T_UP", "outcome": "Up"},
+            {"token_id": "T_DN", "outcome": "Down"},
+        ],
+    })
+    check("missing_end_rejected",     r["admit"] is False)
+    check("missing_end_reason",       r["rejection_reason"] == "missing_timing",
+          f"reason={r['rejection_reason']}")
+
+    # ── R9: unknown token mapping ─────────────────────────────────────────────
+    r = _admit(_make_raw(
+        "Bitcoin Up or Down - 5 Minutes",
+        condition_id="COND_R9",
+        start_ts=CANONICAL_START, end_ts=CANONICAL_START + 300,
+        tokens=[{"token_id": "T1", "outcome": "Banana"}, {"token_id": "T2", "outcome": "Apple"}],
+    ))
+    check("unknown_token_rejected",   r["admit"] is False)
+    check("unknown_token_reason",     r["rejection_reason"] == "unknown_token_mapping",
+          f"reason={r['rejection_reason']}")
+
+    # ── R10: wrong window via API fields ──────────────────────────────────────
+    r = _admit(_make_raw(
+        "Bitcoin Up or Down - 5 Minutes",
+        condition_id="COND_R10",
+        start_ts=CANONICAL_START,
+        end_ts=CANONICAL_START + 30 * 24 * 3600,  # 30 days
+    ))
+    check("wrong_window_rejected",    r["admit"] is False)
+    check("wrong_window_reason",      r["rejection_reason"] == "wrong_window",
+          f"reason={r['rejection_reason']}")
+
+    # ── R11: slug present but wrong pattern ───────────────────────────────────
+    r = _admit({
+        "condition_id":    "COND_R11",
+        "question":        "Bitcoin Up or Down - 5 Minutes",
+        "description":     "",
+        "market_slug":     "bitcoin-hashprice-before-june",
+        "game_start_time": CANONICAL_START,
+        "end_date_iso":    datetime.fromtimestamp(
+            CANONICAL_START + 300, tz=timezone.utc
+        ).isoformat(),
+        "tokens": [
+            {"token_id": "T_UP", "outcome": "Up"},
+            {"token_id": "T_DN", "outcome": "Down"},
+        ],
+    })
+    check("wrong_slug_rejected",      r["admit"] is False)
+    check("wrong_slug_reason",        r["rejection_reason"] == "wrong_market_semantics",
+          f"reason={r['rejection_reason']}")
+
+    # ── R12: partial token mapping (1 token) ──────────────────────────────────
+    r = _admit(_make_raw(
+        "Bitcoin Up or Down - 5 Minutes",
+        condition_id="COND_R12",
+        start_ts=CANONICAL_START, end_ts=CANONICAL_START + 300,
+        tokens=[{"token_id": "T_UP", "outcome": "Up"}],  # Down missing
+    ))
+    check("partial_mapping_rejected", r["admit"] is False)
+    check("partial_mapping_reason",
+          r["rejection_reason"] in ("unknown_token_mapping", "invalid_outcomes"),
+          f"reason={r['rejection_reason']}")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TIMING FIELDS — alternate API field names (startDate, endDate etc.)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # ── T1: camelCase timing fields (startDate / endDate) ────────────────────
+    r = _admit({
+        "condition_id": "COND_T1",
+        "question":     "Bitcoin Up or Down - 5 Minutes",
+        "description":  "",
+        "startDate":    CANONICAL_START,
+        "endDate":      CANONICAL_START + 300,
+        "tokens": [
+            {"token_id": "T_UP", "outcome": "Up"},
+            {"token_id": "T_DN", "outcome": "Down"},
+        ],
+    })
+    check("camel_case_timing_admitted",
+          r["admit"] is True,
+          f"reason={r['rejection_reason']} detail={r['details'].get('reason_detail')}")
+
+    # ── T2: end_date (snake_case variant) ────────────────────────────────────
+    r = _admit({
+        "condition_id":   "COND_T2",
         "question":       "Bitcoin Up or Down - 5 Minutes",
         "description":    "",
         "game_start_time": CANONICAL_START,
-        # no end_date_iso, no end_date
+        "end_date":       CANONICAL_START + 300,   # not end_date_iso
         "tokens": [
             {"token_id": "T_UP", "outcome": "Up"},
             {"token_id": "T_DN", "outcome": "Down"},
         ],
-    }
-    ren = market_discovery._classify_market(no_end)
-    check("missing_end_rejected",
-          ren["admit"] is False,
-          f"should be rejected, got admit={ren['admit']}")
-    check("missing_end_reason",
-          ren["rejection_reason"] == "missing_timing",
-          f"reason={ren['rejection_reason']}")
+    })
+    check("end_date_variant_admitted",
+          r["admit"] is True,
+          f"reason={r['rejection_reason']} detail={r['details'].get('reason_detail')}")
 
-    # ── NEGATIVE: unknown token mapping (unrecognised labels) ─────────────────
-    weird_tok = _make_raw(
-        question="Bitcoin Up or Down - 5 Minutes",
-        condition_id="COND_WEIRD_001",
-        tokens=[
-            {"token_id": "T1", "outcome": "Banana"},
-            {"token_id": "T2", "outcome": "Apple"},
-        ],
-    )
-    rw = market_discovery._classify_market(weird_tok)
-    check("unknown_token_mapping_rejected",
-          rw["admit"] is False,
-          f"should be rejected, got admit={rw['admit']}")
-    check("unknown_token_reason",
-          rw["rejection_reason"] == "unknown_token_mapping",
-          f"reason={rw['rejection_reason']}")
+    # ══════════════════════════════════════════════════════════════════════════
+    # AUDIT — fetch_all_markets emits discovery_audit file
+    # ══════════════════════════════════════════════════════════════════════════
 
-    # ── NEGATIVE: wrong window (30-day window) ────────────────────────────────
-    wrong_win = _make_raw(
-        question="Bitcoin Up or Down - 5 Minutes",
-        condition_id="COND_WRONGWIN_001",
-        end_ts=CANONICAL_START + 30 * 24 * 3600,   # 30 days
-    )
-    rww = market_discovery._classify_market(wrong_win)
-    check("wrong_window_rejected",
-          rww["admit"] is False,
-          f"should be rejected, got admit={rww['admit']}")
-    check("wrong_window_reason",
-          rww["rejection_reason"] == "wrong_window",
-          f"reason={rww['rejection_reason']}")
-
-    # ── NEGATIVE: slug present but wrong pattern ──────────────────────────────
-    bad_slug = _make_raw(
-        question="Bitcoin Up or Down - 5 Minutes",
-        condition_id="COND_BADSLUG_001",
-        slug="bitcoin-hashprice-before-june",
-    )
-    rbs = market_discovery._classify_market(bad_slug)
-    check("wrong_slug_rejected",
-          rbs["admit"] is False,
-          f"should be rejected, got admit={rbs['admit']}")
-    check("wrong_slug_reason",
-          rbs["rejection_reason"] == "wrong_market_semantics",
-          f"reason={rbs['rejection_reason']}")
-
-    # ── NEGATIVE: partial token mapping ──────────────────────────────────────
-    partial_tok = _make_raw(
-        question="Bitcoin Up or Down - 5 Minutes",
-        condition_id="COND_PARTIAL_001",
-        tokens=[
-            {"token_id": "T_UP", "outcome": "Up"},
-            # Down side missing
-        ],
-    )
-    rp = market_discovery._classify_market(partial_tok)
-    check("partial_mapping_rejected",
-          rp["admit"] is False,
-          f"should be rejected, got admit={rp['admit']}")
-    # partial mapping (1 token) hits invalid_outcomes (< 2 non-blank labels) first;
-    # both invalid_outcomes and unknown_token_mapping are correct rejections here
-    check("partial_mapping_reason",
-          rp["rejection_reason"] in ("unknown_token_mapping", "invalid_outcomes"),
-          f"reason={rp['rejection_reason']}")
-
-    # ── INVARIANT: window=None is never admitted ───────────────────────────────
-    # This tests that the old bug ("window unknown but pass anyway") is gone.
-    # Build a market that passes all other checks but has no timing at all.
-    no_timing = {
-        "condition_id": "COND_NOTIMING_001",
-        "question":     "Bitcoin Up or Down - 5 Minutes",
-        "description":  "",
-        # deliberately no start or end fields
-        "tokens": [
-            {"token_id": "T_UP", "outcome": "Up"},
-            {"token_id": "T_DN", "outcome": "Down"},
-        ],
-    }
-    rnt = market_discovery._classify_market(no_timing)
-    check("no_timing_invariant_rejected",
-          rnt["admit"] is False,
-          "'window unknown but pass anyway' must never happen")
-    check("no_timing_reason",
-          rnt["rejection_reason"] == "missing_timing",
-          f"reason={rnt['rejection_reason']}")
-
-    # ── AUDIT: fetch_all_markets emits discovery_audit file ───────────────────
-    # Test via mocked HTTP returning a mix of admitted and rejected markets
     from unittest.mock import patch, MagicMock
-    import tempfile, pathlib as _pl, os
+    import tempfile, pathlib as _pl
 
     page1 = {
         "data": [
-            # Admitted
-            _make_raw("Bitcoin Up or Down - 5 Minutes", condition_id="COND_OK_001",
-                      slug="btc-updown-5m-1774356600"),
-            # Rejected: hashprice near-miss
-            _make_raw("Bitcoin hashprice above 50 PH/s before June 1?",
-                      condition_id="COND_HASH_002"),
-            # Rejected: missing timing
+            # Admitted via slug + api timing
             {
-                "condition_id": "COND_NOTIMING_002",
-                "question": "Bitcoin Up or Down - 5 Minutes",
-                "description": "",
+                "condition_id": "COND_OK_001",
+                "question":     "Bitcoin Up or Down - 5 Minutes",
+                "description":  "",
+                "market_slug":  "btc-updown-5m-1774358400",
+                "game_start_time": CANONICAL_START,
+                "end_date_iso": datetime.fromtimestamp(
+                    CANONICAL_START + 300, tz=timezone.utc
+                ).isoformat(),
                 "tokens": [
                     {"token_id": "T_UP", "outcome": "Up"},
                     {"token_id": "T_DN", "outcome": "Down"},
                 ],
             },
-            # Rejected: totally unrelated market (not btc)
-            {"condition_id": "COND_XYZ", "question": "Will it rain tomorrow?",
-             "tokens": []},
+            # Admitted via slug-derived timing (no API timing fields)
+            {
+                "condition_id": "COND_OK_002",
+                "question":     "Bitcoin Up or Down - 9:20-9:25AM ET",
+                "description":  "",
+                "market_slug":  "btc-updown-5m-1774358400",
+                # no timing fields
+                "tokens": [
+                    {"token_id": "T_UP2", "outcome": "Up"},
+                    {"token_id": "T_DN2", "outcome": "Down"},
+                ],
+            },
+            # Rejected: hashprice near-miss
+            {
+                "condition_id":    "COND_HASH_001",
+                "question":        "Bitcoin hashprice above 50 PH/s before June 1?",
+                "description":     "",
+                "game_start_time": CANONICAL_START,
+                "end_date_iso":    datetime.fromtimestamp(
+                    CANONICAL_START + 300, tz=timezone.utc
+                ).isoformat(),
+                "tokens": [
+                    {"token_id": "T_YES", "outcome": "Yes"},
+                    {"token_id": "T_NO",  "outcome": "No"},
+                ],
+            },
+            # Rejected: no slug, no timing (Path B)
+            {
+                "condition_id": "COND_NOTIME_001",
+                "question":     "Bitcoin Up or Down - 5 Minutes",
+                "description":  "",
+                # no timing, no slug
+                "tokens": [
+                    {"token_id": "T_UP", "outcome": "Up"},
+                    {"token_id": "T_DN", "outcome": "Down"},
+                ],
+            },
+            # Ignored: totally unrelated
+            {
+                "condition_id": "COND_XYZ",
+                "question":     "Will it rain tomorrow?",
+                "tokens":       [],
+            },
         ],
         "next_cursor": "",
     }
@@ -967,21 +1144,34 @@ def test_discovery_admission_rejection():
         with open(audit_file) as af:
             audit_data = json.load(af)
 
-        check("audit_total_scanned_4",   audit_data["total_scanned"] == 4,
+        check("audit_total_scanned_5",   audit_data["total_scanned"] == 5,
               f"scanned={audit_data['total_scanned']}")
-        check("audit_total_admitted_1",  audit_data["total_admitted"] == 1,
+        check("audit_total_admitted_2",  audit_data["total_admitted"] == 2,
               f"admitted={audit_data['total_admitted']}")
         check("audit_total_rejected_3",  audit_data["total_rejected"] == 3,
               f"rejected={audit_data['total_rejected']}")
-        check("audit_admitted_id_ok",
+        check("audit_admitted_ok001",
               "COND_OK_001" in audit_data["admitted_market_ids"],
+              f"ids={audit_data['admitted_market_ids']}")
+        check("audit_admitted_ok002",
+              "COND_OK_002" in audit_data["admitted_market_ids"],
               f"ids={audit_data['admitted_market_ids']}")
         check("audit_has_rejection_buckets",
               "rejection_buckets" in audit_data)
 
-    check("admitted_market_has_correct_id",
-          len(admitted) == 1 and admitted[0]["market_id"] == "COND_OK_001",
-          f"admitted={[m['market_id'] for m in admitted]}")
+    # Both slug-derived and api-field markets should be in admitted
+    ids = [m["market_id"] for m in admitted]
+    check("admitted_contains_ok001",
+          "COND_OK_001" in ids, f"admitted={ids}")
+    check("admitted_contains_ok002_slug_derived",
+          "COND_OK_002" in ids,
+          f"slug-derived timing market must be admitted, admitted={ids}")
+
+    # Verify timing_source is "slug_derived" for COND_OK_002
+    ok002 = next((m for m in admitted if m["market_id"] == "COND_OK_002"), None)
+    check("ok002_timing_source_slug_derived",
+          ok002 is not None and ok002.get("timing_source") == "slug_derived",
+          f"timing_source={ok002.get('timing_source') if ok002 else 'not found'}")
 
 
 # ── run all ───────────────────────────────────────────────────────────────────

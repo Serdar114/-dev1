@@ -1,35 +1,53 @@
 """
 market_discovery.py - Fetch and persist active Polymarket BTC 5-minute markets.
 
-ADMISSION POLICY (fail-closed):
-A market is admitted ONLY when ALL of the following pass:
+ADMISSION POLICY (fail-closed, two paths):
 
-  1. market_id (condition_id or market_id) is non-empty
-  2. Question semantics match the BTC 5-minute Up/Down recurring pattern:
-       - contains BTC keyword (btc / bitcoin)
-       - contains BOTH 'up' AND 'down' as word tokens (directional pair)
-       - contains a 5-minute indicator
-  3. If a slug field is present in the API response, it must also match the
-     BTC 5-minute Up/Down slug pattern (btc-updown-5m-<ts> family).
-     A slug that doesn't match is a hard reject — not ignored.
-  4. No blocking terms present in question or description
-     (hashprice, hashrate, long-dated event markers, etc.)
-  5. Outcome labels list is non-empty and has at least 2 non-blank labels
-  6. Token mapping confidence is 'exact' or 'directional'.
-     'unknown' and 'partial' → reject.
-  7. Both start and end timestamps parse successfully.
-     Missing or unparseable timing → reject (never 'assume OK').
-  8. Window duration (end − start) is within WINDOW_TOLERANCE of WINDOW_SECONDS (300 s).
+PATH A — Canonical slug (PRIMARY signal):
+  Triggered when market_slug matches the btc-updown-5m-<timestamp> family.
+  The slug IS structural proof of the recurring 5-minute BTC Up/Down family.
+  Requirements:
+    1. condition_id present
+    2. Slug matches btc-updown-5m-<timestamp> pattern
+    3. No blocking contradiction in question/description
+    4. Outcome labels non-blank, token mapping exact or directional (Up/Down)
+    5. Timing: try all known API field names; if still absent, derive from slug timestamp.
+       Slug-derived timing is logged explicitly.
+    6. No window violation when API timing is present.
+       Slug-derived timing always yields exactly 300 s.
+  Question check: only requires BTC keyword (no "5 minute" string needed).
+  The slug already proves this is the 5-minute family.
 
-Any single failure → reject with a labelled reason bucket.
-No partial admission. No 'window unknown but pass anyway'.
+PATH B — No canonical slug:
+  Triggered when no slug field is present in the API response.
+  Higher bar required because the slug confirmation is absent.
+  Requirements:
+    1. condition_id present
+    2. Question/description must contain BTC + up + down + 5-minute indicator
+    3. No blocking terms
+    4. Same outcome and timing checks as Path A
+    5. Timing MUST come from API fields (no slug to derive from)
+    6. Window must be ~300 s
+
+ALWAYS REJECTED regardless of path:
+  - market_id missing
+  - token mapping confidence unknown or partial
+  - slug present but does not match btc-updown-5m family
+  - blocking terms present (hashprice, hashrate, before-June, before-date,
+    above/below long-dated event markers)
+  - fewer than 2 non-blank outcome labels
+  - timing absent AND no slug to derive from (Path B)
+  - window outside tolerance when timing comes from API fields
 
 Reference canonical market family:
-  URL slug:  btc-updown-5m-<unix_timestamp>
+  URL/slug:  btc-updown-5m-<unix_timestamp>
   Question:  "Bitcoin Up or Down - 5 Minutes"
+             "BTC Up or Down - 5 Minutes"
+             "Bitcoin Up or Down - 9:20-9:25AM ET"  (time-range variant)
   Outcomes:  Up / Down
-  Window:    300 s
+  Window:    300 s exactly
   Source:    Chainlink BTC/USD stream
+  Tags:      Bitcoin, Recurring, Up or Down, 5M
 """
 
 import csv
@@ -50,14 +68,15 @@ logging.basicConfig(level=logging.INFO, format=config.LOG_FORMAT, datefmt=config
 
 
 # ── Blocking terms ─────────────────────────────────────────────────────────────
-# Markets whose question/description contains any of these are never BTC 5m up/down.
+# Any market whose question/description contains these is never the BTC 5m up/down family.
 _BLOCKING_TERMS: List[str] = [
     # wrong market type
     "hashprice", "hash price", "hashrate", "hash rate",
     "mining difficulty", "mining reward",
     "all time high", "all-time high",
     "will bitcoin reach", "will bitcoin hit",
-    # long-dated / event markets
+    "above $", "below $",           # above/below price-level bets
+    # long-dated / event markets with explicit month/date markers
     "before june", "before july", "before august", "before september",
     "before october", "before november", "before december",
     "before may", "before april", "before march",
@@ -80,7 +99,23 @@ _REJECTION_BUCKETS: Tuple[str, ...] = (
     "inactive_or_closed",
 )
 
-# Maximum rejection examples stored per bucket in the audit
+# ── Known timing field names in Polymarket CLOB API ───────────────────────────
+# Ordered by preference. First non-None value wins.
+_TIMING_START_FIELDS = (
+    "game_start_time",
+    "start_date_iso",
+    "startDate",
+    "start_date",
+    "startTime",
+)
+_TIMING_END_FIELDS = (
+    "end_date_iso",
+    "end_date",
+    "endDate",
+    "endTime",
+    "end_time",
+)
+
 _MAX_EXAMPLES_PER_BUCKET = 5
 
 
@@ -116,36 +151,106 @@ def _window_seconds(
     return (end - start).total_seconds()
 
 
-# ── Structural classifiers ─────────────────────────────────────────────────────
+# ── Slug helpers ───────────────────────────────────────────────────────────────
 
 def _slug_is_btc_5m_updown(slug: str) -> bool:
     """
-    True if slug matches the BTC 5-minute Up/Down market family.
-    Canonical form: btc-updown-5m-<timestamp>
-    Also accepts minor separator variants.
+    True if slug matches the btc-updown-5m-<timestamp> canonical family.
+    Canonical form: btc-updown-5m-1774358400
+    Also accepts minor separator/spelling variants.
     """
     s = slug.lower().strip()
     has_btc = "btc" in s or "bitcoin" in s
-    # compound 'updown' or separator variants
     has_updown = "updown" in s or "up-down" in s or "up_down" in s
     if not has_updown:
-        # fallback: separate word tokens for 'up' and 'down'
         tokens = set(re.findall(r"\b\w+\b", s))
         has_updown = "up" in tokens and "down" in tokens
     has_5m = "5m" in s or "5min" in s or "5-min" in s
     return has_btc and has_updown and has_5m
 
 
-def _question_is_btc_5m_updown(question: str) -> bool:
+def _extract_ts_from_slug(slug: str) -> Optional[int]:
     """
-    True if question semantically matches the BTC 5-minute Up/Down recurring pattern.
+    Extract the Unix timestamp suffix from a btc-updown-5m-<timestamp> slug.
+    Returns the integer timestamp, or None if not found.
+    """
+    m = re.search(r"btc-updown-5m-(\d{8,12})", slug.lower())
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return None
+    return None
 
-    Requires ALL of:
-      - BTC keyword (btc / bitcoin)
-      - Both 'up' AND 'down' as whole-word tokens (directional pair)
-      - A 5-minute indicator
+
+# ── Timing helper ──────────────────────────────────────────────────────────────
+
+def _get_timing(
+    raw: Dict, slug: str = ""
+) -> Tuple[Optional[datetime], Optional[datetime], str]:
     """
-    q = question.lower()
+    Resolve (start_dt, end_dt, source) for a raw market object.
+
+    Source values:
+      "api_fields"        – both timestamps found in API response fields
+      "slug_derived"      – both derived from slug timestamp (API fields absent)
+      "partial_api_slug"  – one from API, one derived from slug
+      "missing"           – timing unavailable
+    """
+    # Try all known API field names in preference order
+    start_raw = None
+    for f in _TIMING_START_FIELDS:
+        v = raw.get(f)
+        if v is not None:
+            start_raw = v
+            break
+
+    end_raw = None
+    for f in _TIMING_END_FIELDS:
+        v = raw.get(f)
+        if v is not None:
+            end_raw = v
+            break
+
+    start_dt = _parse_ts(start_raw)
+    end_dt   = _parse_ts(end_raw)
+
+    if start_dt is not None and end_dt is not None:
+        return start_dt, end_dt, "api_fields"
+
+    # Slug-derived fallback for canonical btc-updown-5m family only
+    if slug and _slug_is_btc_5m_updown(slug):
+        slug_ts = _extract_ts_from_slug(slug)
+        if slug_ts is not None:
+            slug_start = datetime.fromtimestamp(slug_ts, tz=timezone.utc)
+            slug_end   = datetime.fromtimestamp(
+                slug_ts + config.WINDOW_SECONDS, tz=timezone.utc
+            )
+            if start_dt is None and end_dt is None:
+                log.info(
+                    "Timing derived from slug '%s': start=%s end=%s",
+                    slug, slug_start.isoformat(), slug_end.isoformat(),
+                )
+                return slug_start, slug_end, "slug_derived"
+            elif start_dt is None:
+                log.info("Start derived from slug '%s', end from API fields", slug)
+                return slug_start, end_dt, "partial_api_slug"
+            else:
+                log.info("End derived from slug '%s', start from API fields", slug)
+                return start_dt, slug_end, "partial_api_slug"
+
+    return start_dt, end_dt, "missing"
+
+
+# ── Semantic classifiers ───────────────────────────────────────────────────────
+
+def _question_is_btc_5m_updown(text: str) -> bool:
+    """
+    Full semantic check used when no canonical slug is present.
+    Text must contain BTC keyword + both 'up' AND 'down' as word tokens + 5-minute indicator.
+    Accepts combined question+description text.
+    """
+    q = text.lower()
     if not ("btc" in q or "bitcoin" in q):
         return False
     words = set(re.findall(r"\b\w+\b", q))
@@ -161,8 +266,14 @@ def _question_is_btc_5m_updown(question: str) -> bool:
     return has_5min
 
 
+def _question_has_btc_keyword(question: str) -> bool:
+    """Minimal BTC presence check used alongside canonical slug (Path A)."""
+    q = question.lower()
+    return "btc" in q or "bitcoin" in q
+
+
 def _blocking_term_present(text: str) -> Optional[str]:
-    """Return the first matching blocking term, or None."""
+    """Return the first matching blocking term found in text, or None."""
     t = text.lower()
     for term in _BLOCKING_TERMS:
         if term in t:
@@ -188,11 +299,7 @@ def _extract_tokens(
       Up   → yes_token_id   (price goes up = YES wins)
       Down → no_token_id    (price goes down = NO wins)
 
-    mapping_confidence values:
-      "exact"       – labels were literally "Yes"/"No"
-      "directional" – labels were "Up"/"Down" mapped to YES/NO
-      "partial"     – only one side found
-      "unknown"     – no recognisable outcome labels
+    mapping_confidence: "exact" | "directional" | "partial" | "unknown"
     """
     tokens = raw.get("tokens", []) or []
     yes_id: Optional[str] = None
@@ -229,27 +336,15 @@ def _extract_tokens(
 
 def _classify_market(raw: Dict) -> Dict:
     """
-    Classify a raw Polymarket market object for BTC 5m Up/Down admission.
+    Classify a raw Polymarket market for BTC 5m Up/Down admission.
 
     Returns:
       {
         "admit": bool,
-        "rejection_reason": str | None,   # one of _REJECTION_BUCKETS or None
-        "details": {
-          "question": str,
-          "slug": str,
-          "condition_id": str,
-          "outcome_labels": list,
-          "token_mapping_confidence": str,
-          "start_time": str | None,
-          "end_time": str | None,
-          "window_seconds": float | None,
-          "reason_detail": str,           # human-readable rejection detail
-          ... additional fields on success ...
-        }
+        "rejection_reason": str | None,
+        "admission_path": "slug_primary" | "question_primary" | None,
+        "details": { ... }
       }
-
-    Fail-closed: every check must pass; failure at any step is an immediate reject.
     """
     question     = (raw.get("question") or "").strip()
     description  = (raw.get("description") or "").strip()
@@ -263,124 +358,182 @@ def _classify_market(raw: Dict) -> Dict:
         "reason_detail": "",
     }
 
-    # ── 1. market_id must exist ────────────────────────────────────────────────
+    # ── 1. market_id required ─────────────────────────────────────────────────
     if not condition_id:
         details["reason_detail"] = "condition_id and market_id both absent or blank"
-        return {"admit": False, "rejection_reason": "missing_market_id", "details": details}
+        return {
+            "admit": False, "rejection_reason": "missing_market_id",
+            "admission_path": None, "details": details,
+        }
 
-    # ── 2. Question must match BTC 5m Up/Down semantic pattern ────────────────
-    if not _question_is_btc_5m_updown(question):
+    # ── 2. Determine admission path ───────────────────────────────────────────
+    slug_is_canonical = bool(slug) and _slug_is_btc_5m_updown(slug)
+
+    # Slug present but not canonical family → hard reject
+    if slug and not slug_is_canonical:
         details["reason_detail"] = (
-            "question lacks required BTC + directional-pair(up/down) + 5-minute pattern"
+            f"slug present but does not match btc-updown-5m pattern: '{slug}'"
         )
-        return {"admit": False, "rejection_reason": "wrong_market_semantics", "details": details}
+        return {
+            "admit": False, "rejection_reason": "wrong_market_semantics",
+            "admission_path": None, "details": details,
+        }
 
-    # ── 3. Slug: if present, must match BTC 5m Up/Down pattern ───────────────
-    if slug and not _slug_is_btc_5m_updown(slug):
-        details["reason_detail"] = f"slug present but does not match btc-updown-5m pattern: '{slug}'"
-        return {"admit": False, "rejection_reason": "wrong_market_semantics", "details": details}
-
-    # ── 4. Blocking terms ─────────────────────────────────────────────────────
     combined_text = question + " " + description
-    block = _blocking_term_present(combined_text)
-    if block:
-        details["reason_detail"] = f"blocking term found: '{block}'"
-        return {"admit": False, "rejection_reason": "wrong_market_semantics", "details": details}
 
-    # ── 5. Outcome labels: non-empty, at least 2 non-blank ───────────────────
+    if slug_is_canonical:
+        # PATH A: canonical slug is primary structural proof
+        # Question only needs to not explicitly contradict the family.
+        # Blocking terms remain a hard gate.
+        block = _blocking_term_present(combined_text)
+        if block:
+            details["reason_detail"] = (
+                f"canonical slug but blocking term in question/description: '{block}'"
+            )
+            return {
+                "admit": False, "rejection_reason": "wrong_market_semantics",
+                "admission_path": "slug_primary", "details": details,
+            }
+        admission_path = "slug_primary"
+
+    else:
+        # PATH B: no canonical slug → question must prove the family
+        if not _question_is_btc_5m_updown(combined_text):
+            details["reason_detail"] = (
+                "no canonical slug and question/description lack "
+                "required BTC + directional-pair(up/down) + 5-minute pattern"
+            )
+            return {
+                "admit": False, "rejection_reason": "wrong_market_semantics",
+                "admission_path": "question_primary", "details": details,
+            }
+        block = _blocking_term_present(combined_text)
+        if block:
+            details["reason_detail"] = f"blocking term found: '{block}'"
+            return {
+                "admit": False, "rejection_reason": "wrong_market_semantics",
+                "admission_path": "question_primary", "details": details,
+            }
+        admission_path = "question_primary"
+
+    # ── 3. Outcome labels: non-empty, ≥2 non-blank ───────────────────────────
     yes_id, no_id, confidence, outcome_labels = _extract_tokens(raw)
     details["outcome_labels"] = outcome_labels
     details["token_mapping_confidence"] = confidence
 
     if not outcome_labels:
         details["reason_detail"] = "tokens list absent or empty"
-        return {"admit": False, "rejection_reason": "invalid_outcomes", "details": details}
+        return {
+            "admit": False, "rejection_reason": "invalid_outcomes",
+            "admission_path": admission_path, "details": details,
+        }
 
     non_blank = [lbl for lbl in outcome_labels if lbl.strip()]
     if len(non_blank) < 2:
-        details["reason_detail"] = f"fewer than 2 non-blank outcome labels: {outcome_labels}"
-        return {"admit": False, "rejection_reason": "invalid_outcomes", "details": details}
+        details["reason_detail"] = (
+            f"fewer than 2 non-blank outcome labels: {outcome_labels}"
+        )
+        return {
+            "admit": False, "rejection_reason": "invalid_outcomes",
+            "admission_path": admission_path, "details": details,
+        }
 
-    # ── 6. Token mapping: exact or directional only ───────────────────────────
+    # ── 4. Token mapping: exact or directional only ───────────────────────────
     if confidence == "unknown":
-        details["reason_detail"] = f"unrecognised outcome labels (not Up/Down or Yes/No): {outcome_labels}"
-        return {"admit": False, "rejection_reason": "unknown_token_mapping", "details": details}
+        details["reason_detail"] = (
+            f"unrecognised outcome labels (not Up/Down or Yes/No): {outcome_labels}"
+        )
+        return {
+            "admit": False, "rejection_reason": "unknown_token_mapping",
+            "admission_path": admission_path, "details": details,
+        }
     if confidence == "partial":
-        details["reason_detail"] = f"partial mapping: yes_id={yes_id} no_id={no_id}"
-        return {"admit": False, "rejection_reason": "unknown_token_mapping", "details": details}
+        details["reason_detail"] = (
+            f"partial mapping: yes_id={yes_id} no_id={no_id}"
+        )
+        return {
+            "admit": False, "rejection_reason": "unknown_token_mapping",
+            "admission_path": admission_path, "details": details,
+        }
 
-    # ── 7. Timing: both timestamps required ───────────────────────────────────
-    start_raw = raw.get("game_start_time") or raw.get("start_date_iso")
-    end_raw   = raw.get("end_date_iso") or raw.get("end_date")
-    start_dt  = _parse_ts(start_raw)
-    end_dt    = _parse_ts(end_raw)
-
-    details["start_time"] = start_dt.isoformat() if start_dt else None
-    details["end_time"]   = end_dt.isoformat() if end_dt else None
+    # ── 5. Timing resolution ──────────────────────────────────────────────────
+    start_dt, end_dt, timing_source = _get_timing(raw, slug=slug)
+    details["start_time"]    = start_dt.isoformat() if start_dt else None
+    details["end_time"]      = end_dt.isoformat() if end_dt else None
+    details["timing_source"] = timing_source
 
     if start_dt is None:
         details["reason_detail"] = (
-            f"start timestamp absent or unparseable: raw_value={start_raw!r}. "
-            "Markets without timing are rejected — 'window unknown but pass anyway' is forbidden."
+            "start timestamp absent/unparseable in all known fields"
+            + (" and slug-derived timing unavailable" if not slug_is_canonical else "")
         )
-        return {"admit": False, "rejection_reason": "missing_timing", "details": details}
+        return {
+            "admit": False, "rejection_reason": "missing_timing",
+            "admission_path": admission_path, "details": details,
+        }
     if end_dt is None:
         details["reason_detail"] = (
-            f"end timestamp absent or unparseable: raw_value={end_raw!r}. "
-            "Markets without timing are rejected."
+            "end timestamp absent/unparseable in all known fields"
+            + (" and slug-derived timing unavailable" if not slug_is_canonical else "")
         )
-        return {"admit": False, "rejection_reason": "missing_timing", "details": details}
+        return {
+            "admit": False, "rejection_reason": "missing_timing",
+            "admission_path": admission_path, "details": details,
+        }
 
-    # ── 8. Window duration ────────────────────────────────────────────────────
+    # ── 6. Window validation ──────────────────────────────────────────────────
+    # Slug-derived timing always yields exactly WINDOW_SECONDS → always passes.
+    # API-field timing is validated against tolerance.
     window = _window_seconds(start_dt, end_dt)
     details["window_seconds"] = window
 
-    if window is None or abs(window - config.WINDOW_SECONDS) > config.WINDOW_TOLERANCE:
+    if timing_source == "api_fields" and (
+        window is None or abs(window - config.WINDOW_SECONDS) > config.WINDOW_TOLERANCE
+    ):
         details["reason_detail"] = (
             f"window={window}s expected={config.WINDOW_SECONDS}s "
-            f"tolerance=±{config.WINDOW_TOLERANCE}s"
+            f"tolerance=±{config.WINDOW_TOLERANCE}s (from API fields)"
         )
-        return {"admit": False, "rejection_reason": "wrong_window", "details": details}
+        return {
+            "admit": False, "rejection_reason": "wrong_window",
+            "admission_path": admission_path, "details": details,
+        }
 
     # ── All checks passed ─────────────────────────────────────────────────────
-    details["yes_token_id"]         = yes_id
-    details["no_token_id"]          = no_id
-    details["slug_checked"]         = bool(slug)
-    details["slug_matched"]         = bool(slug) or None  # None = not checked (absent)
-    details["question_match"]       = True
-    details["admission_reason"]     = (
-        f"question_match=True slug_match={'yes' if slug else 'n/a'} "
-        f"confidence={confidence} window={window:.0f}s"
+    details["yes_token_id"]     = yes_id
+    details["no_token_id"]      = no_id
+    details["admission_reason"] = (
+        f"path={admission_path} slug_canonical={slug_is_canonical} "
+        f"confidence={confidence} window={window:.0f}s timing={timing_source}"
     )
-    return {"admit": True, "rejection_reason": None, "details": details}
+    return {
+        "admit": True, "rejection_reason": None,
+        "admission_path": admission_path, "details": details,
+    }
 
 
 # ── Record flattener ───────────────────────────────────────────────────────────
 
 def _flatten(raw: Dict, fetched_utc: str) -> Dict:
     """Flatten an admitted raw market object into the canonical session record."""
-    start_dt = _parse_ts(raw.get("game_start_time") or raw.get("start_date_iso"))
-    end_dt   = _parse_ts(raw.get("end_date_iso") or raw.get("end_date"))
-    window   = _window_seconds(start_dt, end_dt)
+    slug     = (raw.get("market_slug") or raw.get("slug") or "").strip()
     yes_id, no_id, confidence, outcome_labels = _extract_tokens(raw)
+    start_dt, end_dt, timing_source = _get_timing(raw, slug=slug)
+    window = _window_seconds(start_dt, end_dt)
 
     log.info(
-        "ADMITTED: market_id=%s | question=%s | outcomes=%s | "
-        "yes_token=%s | no_token=%s | start=%s | end=%s | window=%.0fs | confidence=%s",
+        "ADMITTED: market_id=%s | path=%s | timing=%s | outcomes=%s | "
+        "window=%.0fs | q=%s",
         (raw.get("condition_id") or raw.get("market_id") or "")[:16],
-        (raw.get("question") or "")[:70],
+        "slug_primary" if (_slug_is_btc_5m_updown(slug) if slug else False) else "question_primary",
+        timing_source,
         outcome_labels,
-        (yes_id or "")[:16],
-        (no_id or "")[:16],
-        start_dt.isoformat() if start_dt else None,
-        end_dt.isoformat() if end_dt else None,
         window or 0,
-        confidence,
+        (raw.get("question") or "")[:70],
     )
 
     tick_size    = raw.get("minimum_tick_size") or raw.get("tick_size")
     min_order_sz = raw.get("min_order_size")
-
     if min_order_sz is None:
         log.warning(
             "min_order_size not present for market %s – "
@@ -399,6 +552,7 @@ def _flatten(raw: Dict, fetched_utc: str) -> Dict:
         "outcome_labels":           outcome_labels,
         "start_time_utc":           start_dt.isoformat() if start_dt else None,
         "end_time_utc":             end_dt.isoformat() if end_dt else None,
+        "timing_source":            timing_source,
         "window_seconds":           window,
         "tick_size":                tick_size,
         "min_order_size":           min_order_sz,
@@ -452,15 +606,15 @@ def fetch_all_markets(session_id: str) -> List[Dict]:
     persist output files, return list of admitted flattened records.
 
     Output files:
-      data/markets/markets_<session_id>.jsonl        – admitted records (one per line)
+      data/markets/markets_<session_id>.jsonl        – admitted records
       data/markets/markets_<session_id>.csv          – admitted records (no raw_json)
       data/markets/markets_raw_<session_id>.jsonl    – every raw market seen
       data/markets/discovery_audit_<session_id>.json – full admission/rejection audit
     """
-    jsonl_path  = config.MARKETS_DIR / f"markets_{session_id}.jsonl"
-    csv_path    = config.MARKETS_DIR / f"markets_{session_id}.csv"
-    raw_path    = config.MARKETS_DIR / f"markets_raw_{session_id}.jsonl"
-    audit_path  = config.MARKETS_DIR / f"discovery_audit_{session_id}.json"
+    jsonl_path = config.MARKETS_DIR / f"markets_{session_id}.jsonl"
+    csv_path   = config.MARKETS_DIR / f"markets_{session_id}.csv"
+    raw_path   = config.MARKETS_DIR / f"markets_raw_{session_id}.jsonl"
+    audit_path = config.MARKETS_DIR / f"discovery_audit_{session_id}.json"
 
     admitted_markets: List[Dict] = []
     audit: Dict[str, Any] = {
@@ -495,26 +649,24 @@ def fetch_all_markets(session_id: str) -> List[Dict]:
                     admitted_markets.append(flat)
                     audit["total_admitted"] += 1
                     audit["admitted_market_ids"].append(flat["market_id"])
-
                 else:
                     reason = classification["rejection_reason"]
                     audit["total_rejected"] += 1
 
-                    # Log BTC near-misses (Bitcoin-related markets that were rejected)
                     if _is_btc_near_miss(raw):
                         log.warning(
-                            "REJECTED near-miss: reason=%s | question=%s | detail=%s",
+                            "REJECTED near-miss: reason=%s | q=%s | detail=%s",
                             reason,
                             (raw.get("question") or "")[:80],
                             classification["details"].get("reason_detail", ""),
                         )
 
-                    # Record examples per bucket (capped)
                     bucket = audit["rejection_buckets"].get(reason)
                     if bucket is not None and len(bucket) < _MAX_EXAMPLES_PER_BUCKET:
                         bucket.append({
                             "question":      (raw.get("question") or "")[:100],
                             "condition_id":  (raw.get("condition_id") or ""),
+                            "slug":          (raw.get("market_slug") or ""),
                             "reason_detail": classification["details"].get("reason_detail", ""),
                         })
 
@@ -539,27 +691,31 @@ def fetch_all_markets(session_id: str) -> List[Dict]:
     log.info("  rejection breakdown:")
     for bucket, examples in audit["rejection_buckets"].items():
         if examples:
-            log.info("    %-30s %d examples", bucket, len(examples))
+            log.info("    %-32s %d examples", bucket, len(examples))
             for ex in examples:
-                log.info("      q=%.70s  detail=%s", ex["question"], ex["reason_detail"])
+                log.info(
+                    "      slug=%-30s  q=%.60s  detail=%s",
+                    ex.get("slug", ""), ex["question"], ex["reason_detail"],
+                )
     log.info("=" * 70)
 
-    # ── Save audit JSON ────────────────────────────────────────────────────────
     with open(audit_path, "w") as af:
         json.dump(audit, af, indent=2)
     log.info("Saved discovery audit to %s", audit_path)
 
     if not admitted_markets:
-        log.warning("No BTC 5-minute markets admitted – check filters or market availability")
+        log.warning(
+            "No BTC 5-minute markets admitted. "
+            "Check discovery_audit_%s.json for rejection details.", session_id
+        )
         return []
 
-    # ── Persist admitted markets JSONL ─────────────────────────────────────────
+    # ── Persist admitted markets ───────────────────────────────────────────────
     with open(jsonl_path, "w") as jf:
         for rec in admitted_markets:
             jf.write(json.dumps(rec) + "\n")
     log.info("Saved %d admitted markets to %s", len(admitted_markets), jsonl_path)
 
-    # ── Persist admitted markets CSV ───────────────────────────────────────────
     csv_fields = [k for k in admitted_markets[0].keys() if k != "raw_json"]
     with open(csv_path, "w", newline="") as cf:
         writer = csv.DictWriter(cf, fieldnames=csv_fields)
@@ -600,6 +756,7 @@ if __name__ == "__main__":
         print(
             f"  {(m['market_id'] or '')[:16]}…  "
             f"status={m['status']:10s}  "
+            f"timing={m['timing_source']:18s}  "
             f"window={m['window_seconds']}s  "
             f"confidence={m['token_mapping_confidence']}  "
             f"q={m['question'][:55]}"
