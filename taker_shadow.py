@@ -76,6 +76,7 @@ def _make_candidate(
     direction_signal: Optional[str],  # "UP", "DOWN", or None
     true_prob_estimate: Optional[float],  # None = no honest estimate available
     bankroll_remaining: float,
+    fee_truth_info: Optional[Dict] = None,  # from fee_fetcher; None → config_fallback
 ) -> Dict:
     """
     Build and evaluate a taker candidate record.
@@ -169,6 +170,9 @@ def _make_candidate(
             price_per_share=best_ask,
             shares=size_check["shares_floored"],
             true_prob=true_prob_estimate,
+            fee_truth_info=fee_truth_info,
+            token_id=token_id,
+            min_order_size_used=min_order_size,
         )
         net_ev = order.edge_at_true_prob
         if net_ev is not None:
@@ -187,6 +191,9 @@ def _make_candidate(
                 price_per_share=best_ask,
                 shares=size_check["shares_floored"],
                 true_prob=true_prob_estimate,
+                fee_truth_info=fee_truth_info,
+                token_id=token_id,
+                min_order_size_used=min_order_size,
             )
             order_detail = order.to_dict()
         except Exception as exc:
@@ -309,6 +316,7 @@ class TakerShadowEvaluator:
         runtime_logger,
         shutdown_event: threading.Event,
         bankroll_ref: List[float],
+        fee_results: Optional[Dict] = None,  # from fee_fetcher.session_fee_fetch()
     ):
         self.session_id    = session_id
         self.market_id     = market.get("market_id") or market.get("condition_id", "?")
@@ -318,6 +326,9 @@ class TakerShadowEvaluator:
         self.runtime_log   = runtime_logger
         self.shutdown      = shutdown_event
         self.bankroll_ref  = bankroll_ref
+        # fee_results: dict keyed by token_id -> fee_truth_info dict
+        # If None (not yet wired), all order costs default to config_fallback labeling
+        self._fee_results  = fee_results or {}
 
         # min_order_size: prefer market data, fall back to default with explicit log
         raw_min = market.get("min_order_size")
@@ -433,6 +444,13 @@ class TakerShadowEvaluator:
         # provides a calibrated true probability.
         true_prob = None
 
+        # Look up fee truth info for this specific token; fall back to global or None
+        fee_truth_info = (
+            self._fee_results.get(book_rec.token_id)
+            or self._fee_results.get("_global")
+            or None
+        )
+
         candidate = _make_candidate(
             session_id=self.session_id,
             market_id=self.market_id,
@@ -450,6 +468,7 @@ class TakerShadowEvaluator:
             direction_signal=direction_signal,
             true_prob_estimate=true_prob,
             bankroll_remaining=self.bankroll_ref[0],
+            fee_truth_info=fee_truth_info,
         )
 
         return candidate
@@ -620,6 +639,7 @@ def run_taker_shadows(
     runtime_logger,
     shutdown_event: threading.Event,
     bankroll_ref: List[float],
+    fee_results: Optional[Dict] = None,       # from fee_fetcher.session_fee_fetch()
 ) -> Dict[str, "TakerShadowEvaluator"]:
     """
     Launch one taker shadow evaluator per market.
@@ -628,6 +648,9 @@ def run_taker_shadows(
     (from reference_recorder.run_reference_recorders()), NOT a dict of
     snapshot list copies. The evaluators read .snapshots from the recorder
     in real time.
+
+    fee_results is from fee_fetcher.session_fee_fetch(). If None, all order
+    costs default to fee_rate_source="config_fallback", fee_truth_status="assumed".
     """
     evaluators: Dict[str, TakerShadowEvaluator] = {}
 
@@ -651,6 +674,7 @@ def run_taker_shadows(
             runtime_logger=runtime_logger,
             shutdown_event=shutdown_event,
             bankroll_ref=bankroll_ref,
+            fee_results=fee_results,
         )
         t = threading.Thread(target=ev.run, name=f"taker-shadow-{mid[:8]}", daemon=True)
         t.start()

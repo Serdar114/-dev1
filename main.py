@@ -44,6 +44,7 @@ import runtime_logger as rl_module
 import taker_shadow
 import maker_shadow
 import verdict_report
+import fee_fetcher
 
 log = logging.getLogger(__name__)
 
@@ -67,6 +68,12 @@ class Session:
 
         # Shared mutable bankroll (single-element list for thread-safe pass-by-ref)
         self.bankroll_ref: List[float] = [config.BANKROLL_USDC]
+
+        # Fee fetch results (set in _launch_recorders before shadow threads start)
+        self.fee_results: Dict = {}
+
+        # Settlement details – list of per-market refetch records (set in _annotate_settlements)
+        self.settlement_details: List[Dict] = []
 
         # Runtime logger (singleton for session)
         self.runtime = rl_module.RuntimeLogger(session_id)
@@ -170,6 +177,18 @@ class Session:
         """Launch all recording threads for all markets."""
         runtime_log_fn = self.runtime.as_log_fn(source="book_recorder")
 
+        # ── Fee rate fetch (attempt live; fall back to config with explicit label) ─
+        log.info("[main] Fetching live fee rate from CLOB...")
+        self.fee_results = fee_fetcher.session_fee_fetch(self.markets)
+        g = self.fee_results.get("_global", {})
+        log.info(
+            "[main] Fee rate: value=%.4f  source=%s  truth_status=%s  model_assumption=%s",
+            g.get("fee_rate_value", config.TAKER_FEE_RATE),
+            g.get("fee_rate_source", "?"),
+            g.get("fee_truth_status", "?"),
+            g.get("fee_model_assumption", "?"),
+        )
+
         # Reference recorders
         self.ref_recorders = reference_recorder.run_reference_recorders(
             session_id=self.session_id,
@@ -199,6 +218,7 @@ class Session:
             runtime_logger=self.runtime,
             shutdown_event=self.shutdown,
             bankroll_ref=self.bankroll_ref,
+            fee_results=self.fee_results,
         )
 
         # Maker shadow evaluators
@@ -212,73 +232,120 @@ class Session:
 
     def _annotate_settlements(self):
         """
-        Attempt to determine the resolved outcome for each market and annotate
-        taker candidates with settlement data.
+        Refetch each market from CLOB REST at session finalization and annotate
+        taker candidates with settlement truth.
 
-        Settlement source hierarchy (in order of trust):
-          1. market.closed == True AND outcome_prices indicates a resolved winner
-             → settlement_source = "market_resolved"
-          2. market.closed == True but no resolved outcome available
-             → settlement_source = "market_closed_no_outcome"
-          3. market.closed is False or unknown
-             → settlement_source = "unresolved"
+        NEVER uses self.markets (discovery-time snapshot) as settlement truth.
+        ALWAYS refetches a fresh copy of the market object.
 
-        We do NOT use last_trade_price as a settlement proxy. A trade at 0.96
-        shortly before close is NOT a resolved outcome. Only official resolution
-        data from the market object or a dedicated resolution endpoint counts.
-
-        If resolution is unavailable, all candidates are labelled "unresolved" or
-        "pending" and hypothetical_pnl remains None.
+        Settlement truth status labels:
+          resolved_confirmed        – refetch success, market closed, outcome_prices
+                                      contains exactly 1.0 or 0.0 for YES token
+          unresolved                – refetch success, market not yet closed
+          pending                   – refetch success, market closed but no
+                                      outcome_prices yet (resolution may lag)
+          unknown                   – refetch failed, or data present but not
+                                      parseable to an exact binary outcome
         """
-        import requests
+        self.settlement_details = []
 
         for market in self.markets:
             mid       = market.get("market_id") or market.get("condition_id", "?")
             evaluator = self.taker_evaluators.get(mid)
 
-            if evaluator is None or not evaluator.candidates:
-                continue
+            # Record discovery-time state (for audit)
+            discovery_closed = market.get("closed") is True
 
-            # Try to get current market state from CLOB
+            # ── Fresh refetch ─────────────────────────────────────────────────
+            refetch_rec = _refetch_market(mid)
+
+            fresh = refetch_rec.get("raw")
+            refetch_success = refetch_rec.get("success", False)
+
+            # ── Determine settlement truth from fresh data ────────────────────
             settled_yes: Optional[float] = None
-            settlement_source = "unresolved"
+            settlement_truth_status = "unknown"
+            official_outcome_available = False
+            final_market_closed = False
 
-            if market.get("closed") is True:
-                # Market is closed; look for outcome_prices which on resolved
-                # Polymarket markets contains [1.0, 0.0] or [0.0, 1.0]
-                outcome_prices = market.get("outcome_prices")
-                if outcome_prices and len(outcome_prices) >= 2:
-                    try:
-                        yes_price = float(outcome_prices[0])
-                        # Polymarket resolved binary: exactly 1.0 or 0.0
-                        if yes_price == 1.0 or yes_price == 0.0:
-                            settled_yes = yes_price
-                            settlement_source = "market_resolved"
-                            log.info("[main] market=%s resolved via outcome_prices YES=%.1f",
-                                     mid[:12], settled_yes)
-                        else:
+            if refetch_success and fresh is not None:
+                final_market_closed = fresh.get("closed") is True
+
+                if final_market_closed:
+                    outcome_prices = fresh.get("outcome_prices")
+                    if outcome_prices and len(outcome_prices) >= 2:
+                        try:
+                            yes_price = float(outcome_prices[0])
+                            if yes_price == 1.0 or yes_price == 0.0:
+                                settled_yes = yes_price
+                                settlement_truth_status = "resolved_confirmed"
+                                official_outcome_available = True
+                                log.info(
+                                    "[main] market=%s settlement=resolved_confirmed "
+                                    "YES=%.1f (from fresh refetch)",
+                                    mid[:12], settled_yes,
+                                )
+                            else:
+                                settlement_truth_status = "unknown"
+                                log.warning(
+                                    "[main] market=%s outcome_prices[0]=%s not 0 or 1 "
+                                    "in fresh refetch – cannot resolve",
+                                    mid[:12], yes_price,
+                                )
+                        except (ValueError, TypeError) as exc:
+                            settlement_truth_status = "unknown"
                             log.warning(
-                                "[main] market=%s closed but outcome_prices[0]=%s "
-                                "is not 0 or 1 – not treating as resolved",
-                                mid[:12], yes_price,
+                                "[main] market=%s outcome_prices parse error in refetch: %s",
+                                mid[:12], exc,
                             )
-                            settlement_source = "market_closed_ambiguous"
-                    except (ValueError, TypeError) as exc:
-                        log.warning("[main] market=%s outcome_prices parse error: %s",
-                                    mid[:12], exc)
-                        settlement_source = "market_closed_no_outcome"
+                    else:
+                        # Closed but no outcome_prices yet; resolution may lag
+                        settlement_truth_status = "pending"
+                        log.warning(
+                            "[main] market=%s closed (refetch) but outcome_prices absent "
+                            "– settlement_truth_status=pending. "
+                            "Do NOT infer from last trade price.",
+                            mid[:12],
+                        )
                 else:
-                    log.warning(
-                        "[main] market=%s closed but no outcome_prices – "
-                        "outcome unknown. Do NOT infer from last trade price.",
-                        mid[:12],
-                    )
-                    settlement_source = "market_closed_no_outcome"
+                    settlement_truth_status = "unresolved"
+                    log.info("[main] market=%s not closed at refetch time – unresolved", mid[:12])
             else:
-                log.info("[main] market=%s not yet closed – settlement pending", mid[:12])
-                settlement_source = "unresolved"
+                settlement_truth_status = "unknown"
+                log.warning(
+                    "[main] market=%s settlement refetch failed: %s – "
+                    "status=unknown. Stale discovery snapshot NOT used.",
+                    mid[:12], refetch_rec.get("error"),
+                )
 
-            evaluator.annotate_settlement(settled_yes, settlement_source)
+            # Annotated result label for report
+            if settled_yes == 1.0:
+                annotated_result = "YES"
+            elif settled_yes == 0.0:
+                annotated_result = "NO"
+            else:
+                annotated_result = None
+
+            detail = {
+                "market_id":                  mid,
+                "discovery_closed":           discovery_closed,
+                "final_refetch_attempted":    True,
+                "final_refetch_source":       refetch_rec.get("source_url"),
+                "final_refetch_success":      refetch_success,
+                "final_refetch_ts_utc":       refetch_rec.get("fetch_ts_utc"),
+                "final_market_closed":        final_market_closed,
+                "official_outcome_available": official_outcome_available,
+                "settlement_truth_status":    settlement_truth_status,
+                "annotated_result":           annotated_result,
+                "refetch_error":              refetch_rec.get("error"),
+            }
+            self.settlement_details.append(detail)
+
+            if evaluator is not None and evaluator.candidates:
+                evaluator.annotate_settlement(
+                    settled_yes_price=settled_yes,
+                    settlement_source=settlement_truth_status,
+                )
 
     def _finalize(self):
         """Generate verdict report and print to console."""
@@ -295,6 +362,8 @@ class Session:
             maker_evaluators=self.maker_evaluators,
             runtime_logger=self.runtime,
             session_start_ts=self.start_ts,
+            fee_results=self.fee_results,
+            settlement_details=self.settlement_details,
         )
 
         print()
@@ -312,6 +381,85 @@ def _market_still_open(market: Dict) -> bool:
         return end_dt > datetime.now(timezone.utc)
     except ValueError:
         return True
+
+
+def _refetch_market(condition_id: str) -> Dict:
+    """
+    Fetch a fresh copy of a market object from the CLOB REST API.
+
+    Tries:
+      1. GET /markets/{condition_id}         (single-market endpoint)
+      2. GET /markets?condition_id=<id>      (filtered list endpoint)
+
+    Returns a dict with:
+      success      : bool
+      raw          : dict or None (fresh market object)
+      source_url   : str (endpoint that succeeded or last tried)
+      fetch_ts_utc : ISO timestamp of fetch
+      error        : str or None
+    """
+    import requests as _req
+    from datetime import datetime as _dt, timezone as _tz
+
+    now_utc = _dt.now(_tz.utc).isoformat(timespec="milliseconds")
+    result = {
+        "success":      False,
+        "raw":          None,
+        "source_url":   None,
+        "fetch_ts_utc": now_utc,
+        "error":        None,
+    }
+
+    # Attempt 1: direct single-market endpoint
+    url1 = f"{config.CLOB_BASE_URL}/markets/{condition_id}"
+    result["source_url"] = url1
+    try:
+        resp = _req.get(url1, timeout=config.HTTP_TIMEOUT_S,
+                        headers={"Accept": "application/json"})
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, dict):
+                result["success"] = True
+                result["raw"]     = data
+                log.info("[main] _refetch_market: %s via %s", condition_id[:12], url1)
+                return result
+    except Exception as exc:
+        result["error"] = f"attempt1 {type(exc).__name__}: {exc}"
+
+    # Attempt 2: filtered list endpoint
+    url2 = f"{config.CLOB_BASE_URL}/markets"
+    result["source_url"] = url2
+    try:
+        resp = _req.get(url2, params={"condition_id": condition_id},
+                        timeout=config.HTTP_TIMEOUT_S,
+                        headers={"Accept": "application/json"})
+        if resp.status_code == 200:
+            data = resp.json()
+            # Response may be {"data": [...], ...} or a direct list
+            items = data.get("data", data) if isinstance(data, dict) else data
+            if isinstance(items, list):
+                for item in items:
+                    if (item.get("condition_id") == condition_id
+                            or item.get("market_id") == condition_id):
+                        result["success"]    = True
+                        result["raw"]        = item
+                        result["source_url"] = url2
+                        log.info("[main] _refetch_market: %s via %s (list)",
+                                 condition_id[:12], url2)
+                        return result
+        result["error"] = (
+            (result.get("error") or "") +
+            f" | attempt2 HTTP {resp.status_code}"
+        )
+    except Exception as exc:
+        result["error"] = (
+            (result.get("error") or "") +
+            f" | attempt2 {type(exc).__name__}: {exc}"
+        )
+
+    log.warning("[main] _refetch_market FAILED for %s: %s",
+                condition_id[:12], result["error"])
+    return result
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────

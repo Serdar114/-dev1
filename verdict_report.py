@@ -259,6 +259,194 @@ def _build_spread_data(book_recorders: Dict[str, Dict]) -> Dict:
     return spread_data
 
 
+# ── fee truth audit builder ───────────────────────────────────────────────────
+
+def _build_fee_truth_audit(
+    fee_results: Optional[Dict],
+    markets: List[Dict],
+    taker_candidates: List[Dict],
+) -> Dict:
+    """
+    Summarise fee truth status for this session.
+    Answers:
+      - was live fee fetched?
+      - what rate was used?
+      - what model assumption was applied?
+      - how many order outputs are assumption-contaminated?
+    """
+    if not fee_results:
+        return {
+            "live_fee_fetched":              False,
+            "fetch_attempted":               False,
+            "fetch_success":                 False,
+            "fetch_error":                   "fee_fetcher not called",
+            "fee_rate_used":                 config.TAKER_FEE_RATE,
+            "fee_rate_source":               "config_fallback",
+            "fee_truth_status":              "assumed",
+            "fee_model_assumption":          "unresolved",
+            "tokens_with_live_rate":         0,
+            "tokens_with_fallback_rate":     0,
+            "order_outputs_contaminated":    len(taker_candidates),
+            "note": "fee_fetcher.session_fee_fetch() was not called this session",
+        }
+
+    global_r = fee_results.get("_global", {})
+    live_fetched = global_r.get("fetch_success", False)
+
+    # Count tokens with live vs fallback rate
+    token_results = {k: v for k, v in fee_results.items() if k != "_global"}
+    live_count     = sum(1 for v in token_results.values() if v.get("fee_rate_source") == "live_endpoint")
+    fallback_count = len(token_results) - live_count
+
+    # Count taker candidates with assumption-contaminated order costs
+    contaminated = sum(
+        1 for c in taker_candidates
+        if c.get("order_detail", {}).get("fee_fallback_used", True)
+    )
+
+    return {
+        "live_fee_fetched":          live_fetched,
+        "fetch_attempted":           global_r.get("fetch_attempted", False),
+        "fetch_success":             global_r.get("fetch_success", False),
+        "fetch_error":               global_r.get("fetch_error"),
+        "endpoint_used":             global_r.get("endpoint_used"),
+        "fee_rate_used":             global_r.get("fee_rate_value", config.TAKER_FEE_RATE),
+        "fee_rate_source":           global_r.get("fee_rate_source", "config_fallback"),
+        "fee_truth_status":          global_r.get("fee_truth_status", "assumed"),
+        "fee_model_assumption":      global_r.get("fee_model_assumption", "unresolved"),
+        "tokens_tracked":            len(token_results),
+        "tokens_with_live_rate":     live_count,
+        "tokens_with_fallback_rate": fallback_count,
+        "order_outputs_contaminated": contaminated,
+        "total_order_outputs":       len(taker_candidates),
+        "note": (
+            "fee_model_assumption=unresolved always: "
+            "usdc_extra vs share_cut cannot be determined from REST alone"
+        ),
+    }
+
+
+def _build_settlement_truth_audit(
+    settlement_details: Optional[List[Dict]],
+    markets: List[Dict],
+) -> Dict:
+    """
+    Summarise settlement truth status for this session.
+    Answers:
+      - was final state refetched?
+      - was official outcome available?
+      - which markets remain unresolved?
+    """
+    if not settlement_details:
+        return {
+            "refetch_attempted":        False,
+            "markets_total":            len(markets),
+            "markets_resolved_confirmed":    0,
+            "markets_pending":          0,
+            "markets_unresolved":       0,
+            "markets_unknown":          0,
+            "all_refetched":            False,
+            "decision_grade":           False,
+            "note": "_annotate_settlements() did not run or produced no details",
+            "per_market":               [],
+        }
+
+    resolved  = sum(1 for d in settlement_details if d.get("settlement_truth_status") == "resolved_confirmed")
+    pending   = sum(1 for d in settlement_details if d.get("settlement_truth_status") == "pending")
+    unresolved= sum(1 for d in settlement_details if d.get("settlement_truth_status") == "unresolved")
+    unknown   = sum(1 for d in settlement_details if d.get("settlement_truth_status") == "unknown")
+    all_ok    = all(d.get("final_refetch_success") for d in settlement_details)
+    all_confirmed = (resolved == len(settlement_details)) if settlement_details else False
+
+    endpoint_limit_note = None
+    if pending > 0:
+        endpoint_limit_note = (
+            f"{pending} market(s) closed but outcome_prices absent at refetch time. "
+            "Polymarket resolution may lag settlement by seconds to minutes. "
+            "Re-run with longer post-close wait or retry refetch."
+        )
+
+    return {
+        "refetch_attempted":             True,
+        "markets_total":                 len(settlement_details),
+        "markets_resolved_confirmed":    resolved,
+        "markets_pending":               pending,
+        "markets_unresolved":            unresolved,
+        "markets_unknown":               unknown,
+        "all_refetch_success":           all_ok,
+        "all_resolved_confirmed":        all_confirmed,
+        "decision_grade":                all_confirmed,
+        "endpoint_limit_note":           endpoint_limit_note,
+        "per_market":                    settlement_details,
+    }
+
+
+def _build_harness_verdict(
+    fee_truth_audit: Dict,
+    settlement_truth_audit: Dict,
+    bottleneck_label: str,
+) -> Dict:
+    """
+    Top-level verdict on whether this run is decision-grade.
+
+    fee_decision_grade=True requires:
+      - live fee fetch succeeded (source=live_endpoint)
+      (Note: fee_model_assumption will remain unresolved until fill receipts examined)
+
+    settlement_decision_grade=True requires:
+      - all markets refetched successfully
+      - all markets show resolved_confirmed
+    """
+    fee_grade        = fee_truth_audit.get("fee_rate_source") == "live_endpoint"
+    settlement_grade = settlement_truth_audit.get("all_resolved_confirmed", False)
+
+    # Identify the single most load-bearing unknown
+    unknowns = []
+    if not fee_grade:
+        unknowns.append(
+            "fee_rate_source=config_fallback: taker fee rate not confirmed from live endpoint"
+        )
+    # fee_model is always unresolved; always surfaces this
+    unknowns.append(
+        "fee_model_assumption=unresolved: usdc_extra vs share_cut cannot be "
+        "confirmed from REST alone; requires fill receipt examination"
+    )
+    if not settlement_grade:
+        unresolved_count = settlement_truth_audit.get("markets_unresolved", 0)
+        pending_count    = settlement_truth_audit.get("markets_pending", 0)
+        unknown_count    = settlement_truth_audit.get("markets_unknown", 0)
+        if unknown_count > 0:
+            unknowns.append(
+                f"{unknown_count} market(s) settlement=unknown: refetch failed or data unparseable"
+            )
+        if pending_count > 0:
+            unknowns.append(
+                f"{pending_count} market(s) settlement=pending: "
+                "market closed but official outcome not yet in API response"
+            )
+        if unresolved_count > 0:
+            unknowns.append(
+                f"{unresolved_count} market(s) settlement=unresolved: "
+                "market not yet closed at finalization"
+            )
+
+    load_bearing_unknown = unknowns[0] if unknowns else "none"
+
+    return {
+        "fee_decision_grade":         fee_grade,
+        "settlement_decision_grade":  settlement_grade,
+        "overall_decision_grade":     fee_grade and settlement_grade,
+        "load_bearing_unknown":       load_bearing_unknown,
+        "all_unknowns":               unknowns,
+        "bottleneck_label":           bottleneck_label,
+        "note": (
+            "decision_grade=True requires both fee and settlement truth confirmed. "
+            "fee_model_assumption=unresolved is a permanent constraint until "
+            "fill receipts are examined."
+        ),
+    }
+
+
 # ── main report generator ─────────────────────────────────────────────────────
 
 def generate_report(
@@ -269,6 +457,8 @@ def generate_report(
     maker_evaluators: Dict,    # market_id -> List[MakerShadowEvaluator]
     runtime_logger,
     session_start_ts: float,
+    fee_results: Optional[Dict] = None,          # from fee_fetcher.session_fee_fetch()
+    settlement_details: Optional[List[Dict]] = None,  # from main._annotate_settlements()
 ) -> Dict:
     """
     Generate the full verdict report. Saves to JSON, TXT, and appends CSV.
@@ -367,6 +557,15 @@ def generate_report(
         markets, all_taker_candidates, all_maker_summaries, runtime_summary, bottleneck_label
     )
 
+    # ── fee truth audit ───────────────────────────────────────────────────────
+    fee_truth_audit = _build_fee_truth_audit(fee_results, markets, all_taker_candidates)
+
+    # ── settlement truth audit ────────────────────────────────────────────────
+    settlement_truth_audit = _build_settlement_truth_audit(settlement_details, markets)
+
+    # ── harness verdict ───────────────────────────────────────────────────────
+    harness_verdict = _build_harness_verdict(fee_truth_audit, settlement_truth_audit, bottleneck_label)
+
     # ── assemble report ───────────────────────────────────────────────────────
     report = {
         "session_id":             session_id,
@@ -426,6 +625,10 @@ def generate_report(
             "any_progress":   any_progress,
             "findings":       candidacy_findings,
         },
+
+        "fee_truth_audit":          fee_truth_audit,
+        "settlement_truth_audit":   settlement_truth_audit,
+        "harness_verdict":          harness_verdict,
     }
 
     # ── persist JSON ──────────────────────────────────────────────────────────
@@ -586,6 +789,57 @@ def _format_txt(report: Dict) -> List[str]:
     ca = report["candidacy_assessment"]
     for finding in ca["findings"]:
         lines.append(f"  {finding}")
+
+    # ── fee truth audit ────────────────────────────────────────────────────────
+    lines += ["", "FEE TRUTH AUDIT", thin]
+    fa = report.get("fee_truth_audit") or {}
+    lines.append(f"  live_fee_fetched        : {fa.get('live_fee_fetched')}")
+    lines.append(f"  fetch_success           : {fa.get('fetch_success')}")
+    lines.append(f"  fetch_error             : {fa.get('fetch_error') or '(none)'}")
+    lines.append(f"  endpoint_used           : {fa.get('endpoint_used') or '(none)'}")
+    lines.append(f"  fee_rate_used           : {fa.get('fee_rate_used')}")
+    lines.append(f"  fee_rate_source         : {fa.get('fee_rate_source')}")
+    lines.append(f"  fee_truth_status        : {fa.get('fee_truth_status')}")
+    lines.append(f"  fee_model_assumption    : {fa.get('fee_model_assumption')}")
+    lines.append(f"  tokens_with_live_rate   : {fa.get('tokens_with_live_rate', '?')}")
+    lines.append(f"  tokens_with_fallback    : {fa.get('tokens_with_fallback_rate', '?')}")
+    lines.append(f"  order_outputs_contaminated: {fa.get('order_outputs_contaminated', '?')} / {fa.get('total_order_outputs', '?')}")
+    if fa.get("note"):
+        lines.append(f"  NOTE: {fa['note']}")
+
+    # ── settlement truth audit ─────────────────────────────────────────────────
+    lines += ["", "SETTLEMENT TRUTH AUDIT", thin]
+    sa = report.get("settlement_truth_audit") or {}
+    lines.append(f"  refetch_attempted       : {sa.get('refetch_attempted')}")
+    lines.append(f"  all_refetch_success     : {sa.get('all_refetch_success')}")
+    lines.append(f"  resolved_confirmed      : {sa.get('markets_resolved_confirmed', 0)}")
+    lines.append(f"  pending                 : {sa.get('markets_pending', 0)}")
+    lines.append(f"  unresolved              : {sa.get('markets_unresolved', 0)}")
+    lines.append(f"  unknown                 : {sa.get('markets_unknown', 0)}")
+    if sa.get("endpoint_limit_note"):
+        lines.append(f"  ENDPOINT LIMIT: {sa['endpoint_limit_note']}")
+    for d in (sa.get("per_market") or []):
+        mid_s = (d.get("market_id") or "?")[:12]
+        lines.append(
+            f"    {mid_s:<12s}  refetch={d.get('final_refetch_success')}  "
+            f"closed={d.get('final_market_closed')}  "
+            f"official={d.get('official_outcome_available')}  "
+            f"status={d.get('settlement_truth_status')}  "
+            f"result={d.get('annotated_result')}"
+        )
+
+    # ── harness verdict ────────────────────────────────────────────────────────
+    lines += ["", "HARNESS VERDICT", thin]
+    hv = report.get("harness_verdict") or {}
+    lines.append(f"  fee_decision_grade        : {hv.get('fee_decision_grade')}")
+    lines.append(f"  settlement_decision_grade : {hv.get('settlement_decision_grade')}")
+    lines.append(f"  overall_decision_grade    : {hv.get('overall_decision_grade')}")
+    lines.append(f"  load_bearing_unknown      :")
+    lines.append(f"    {hv.get('load_bearing_unknown', '(none)')}")
+    for u in (hv.get("all_unknowns") or [])[1:]:
+        lines.append(f"  + {u}")
+    if hv.get("note"):
+        lines.append(f"  NOTE: {hv['note']}")
 
     lines += ["", sep]
     return lines

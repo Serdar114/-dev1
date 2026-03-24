@@ -5,13 +5,13 @@ FEE MODEL UNCERTAINTY (read before trusting any output):
   Polymarket CLOB documentation describes a 2% taker fee on notional.
   Two mechanically distinct implementations exist:
 
-  Model A – "USDC extra" (assumed here):
+  Model A – "usdc_extra" (assumed here):
     You order N shares at price p.
     You pay:         p * N * (1 + fee_rate)  USDC out of wallet
     You receive:     N shares
     Net shares held: N
 
-  Model B – "share cut":
+  Model B – "share_cut":
     You order N shares at price p.
     You pay:         p * N  USDC
     You receive:     N * (1 - fee_rate) shares
@@ -19,25 +19,23 @@ FEE MODEL UNCERTAINTY (read before trusting any output):
 
   Break-even true probability differs between models:
     Model A: p_break_even = ask * (1 + fee_rate)      e.g. 0.50 * 1.02 = 0.510
-    Model B: p_break_even = ask / (1 - fee_rate)       e.g. 0.50 / 0.98 = 0.510
+    Model B: p_break_even = ask / (1 - fee_rate)       e.g. 0.50 / 0.98 ≈ 0.510
 
   At 2% fee the numerical difference is small (~0.04pp at mid-price),
   but the gross/net shares breakdown matters for position sizing.
 
-  This module implements Model A. The constant FEE_MODEL = "usdc_extra" is
-  stamped on every OrderCost so callers know which assumption was made.
-  If empirical testing shows Model B is correct, change compute_taker_buy()
-  and update FEE_MODEL = "share_cut".
+  fee_model_assumption is stamped on every OrderCost.
+  Use compute_both_models() to get both side-by-side.
 
 FEE RATE UNCERTAINTY:
   TAKER_FEE_RATE is read from config.TAKER_FEE_RATE (default 0.02 = 2%).
-  Polymarket has historically operated at 2% but this is not guaranteed to
-  be current. The rate MUST be verified against live API or documentation
-  before any live trading. This code does not auto-fetch the live fee rate.
+  Use fee_fetcher.session_fee_fetch() to attempt live retrieval.
+  On fallback, fee_rate_source = "config_fallback" and fee_truth_status = "assumed".
+  These fields are stamped on every OrderCost via the fee_truth_info parameter.
 
-Sources:
-  Polymarket CLOB docs (as of build date)
-  Fee model: 2% taker fee on USDC notional. Maker fee: 0%. No rebates.
+FEE MODEL RESOLUTION:
+  fee_model_assumption is always "unresolved" unless fill receipts have been
+  examined to confirm which model is in use. Do NOT upgrade it without evidence.
 """
 
 from dataclasses import dataclass, asdict, field
@@ -47,7 +45,7 @@ import json
 import config
 
 
-FEE_MODEL = "usdc_extra"   # see docstring above; change if empirically wrong
+FEE_MODEL = "usdc_extra"   # assumed; change only with empirical fill evidence
 
 
 # ── core data structure ───────────────────────────────────────────────────────
@@ -57,15 +55,9 @@ class OrderCost:
     """
     Full breakdown of a taker order's economics.
 
-    Under FEE_MODEL='usdc_extra':
-      shares_gross == shares_net (you receive what you ordered)
-      fee_shares == 0
-      fee_usdc = price_per_share * shares_gross * taker_fee_rate
-
-    Under FEE_MODEL='share_cut' (not current):
-      shares_net = shares_gross * (1 - taker_fee_rate)
-      fee_shares = shares_gross * taker_fee_rate
-      fee_usdc = 0
+    fee_truth_info fields (fee_rate_source, fee_truth_status, fee_model_assumption)
+    are set by the caller via fee_truth_info dict from fee_fetcher.
+    Defaults are the most conservative (config_fallback, assumed, unresolved).
     """
 
     # inputs
@@ -85,7 +77,7 @@ class OrderCost:
     total_cost_usdc: float = 0.0   # net USDC out of wallet (BUY side)
     net_received_usdc: float = 0.0 # net USDC into wallet (SELL side)
 
-    # settlement scenarios (BUY side, Model A)
+    # settlement scenarios (BUY side)
     pnl_if_win: Optional[float] = None    # shares_net * 1.0 - total_cost_usdc
     pnl_if_loss: Optional[float] = None   # -total_cost_usdc
 
@@ -98,18 +90,50 @@ class OrderCost:
     roi_if_win: Optional[float] = None    # pnl_if_win / total_cost_usdc
     effective_price: Optional[float] = None  # total_cost_usdc / shares_net
 
+    # ── fee truth tracking (set via fee_truth_info from fee_fetcher) ──────────
+    token_id: Optional[str] = None
+    fee_rate_source: str = "config_fallback"     # "live_endpoint" | "config_fallback"
+    fee_truth_status: str = "assumed"            # "confirmed" | "assumed" | "unresolved"
+    fee_model_assumption: str = "unresolved"     # "usdc_extra" | "share_cut" | "unresolved"
+    fee_fallback_used: bool = True               # True when fee_rate_source != "live_endpoint"
+    min_order_size_used: Optional[float] = None  # min_order_size that was enforced
+
     # backwards compat alias
     @property
     def shares(self) -> float:
         return self.shares_gross
 
+    @property
+    def fee_rate_value(self) -> float:
+        """Alias for taker_fee_rate for fee truth audit compatibility."""
+        return self.taker_fee_rate
+
     def to_dict(self) -> Dict:
         d = asdict(self)
-        d["shares"] = self.shares  # keep compat alias in output
+        d["shares"] = self.shares            # keep compat alias
+        d["fee_rate_value"] = self.taker_fee_rate  # audit alias
         return d
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), default=str)
+
+
+# ── fee truth info helper ─────────────────────────────────────────────────────
+
+def _apply_fee_truth(order: OrderCost, fee_truth_info: Optional[Dict]) -> OrderCost:
+    """
+    Stamp fee truth tracking fields onto an OrderCost from a fee_truth_info dict
+    (as returned by fee_fetcher.fetch_live_fee_rate or session_fee_fetch).
+    Returns the same order object (mutated in place).
+    """
+    if fee_truth_info is None:
+        return order
+    order.token_id           = fee_truth_info.get("token_id") or order.token_id
+    order.fee_rate_source    = fee_truth_info.get("fee_rate_source", "config_fallback")
+    order.fee_truth_status   = fee_truth_info.get("fee_truth_status", "assumed")
+    order.fee_model_assumption = fee_truth_info.get("fee_model_assumption", "unresolved")
+    order.fee_fallback_used  = (order.fee_rate_source != "live_endpoint")
+    return order
 
 
 # ── core computation ──────────────────────────────────────────────────────────
@@ -119,17 +143,27 @@ def compute_taker_buy(
     shares: float,
     true_prob: Optional[float] = None,
     fee_rate: float = config.TAKER_FEE_RATE,
+    fee_truth_info: Optional[Dict] = None,
+    token_id: Optional[str] = None,
+    min_order_size_used: Optional[float] = None,
 ) -> OrderCost:
     """
     Compute full cost and PnL for a TAKER BUY order under FEE_MODEL='usdc_extra'.
 
     Args:
-        price_per_share : ask price in USDC per share (0 < p < 1)
-        shares          : gross shares ordered (= shares received under this model)
-        true_prob       : caller's estimate of true win probability (optional).
-                          If None, edge_at_true_prob is None and edge_known=False.
-                          DO NOT pass mid-price as true_prob – that is circular.
-        fee_rate        : taker fee rate (default from config, verify against live API)
+        price_per_share    : ask price in USDC per share (0 < p < 1)
+        shares             : gross shares ordered (= shares received under this model)
+        true_prob          : caller's estimate of true win probability (optional).
+                             If None, edge_at_true_prob is None and edge_known=False.
+                             DO NOT pass mid-price as true_prob – that is circular.
+        fee_rate           : taker fee rate (default from config; use fee_truth_info
+                             to propagate a live-fetched rate with provenance)
+        fee_truth_info     : dict from fee_fetcher.fetch_live_fee_rate() or
+                             session_fee_fetch(). Stamps fee_rate_source,
+                             fee_truth_status, fee_model_assumption onto output.
+                             If None: fee_rate_source="config_fallback", status="assumed".
+        token_id           : token this order is for (stamped on output)
+        min_order_size_used: the min_order_size that was enforced for this order
 
     Returns:
         OrderCost with all fields populated. fee_model='usdc_extra'.
@@ -167,7 +201,7 @@ def compute_taker_buy(
 
     roi = pnl_win / total_cost if total_cost > 0 else None
 
-    return OrderCost(
+    order = OrderCost(
         side="BUY",
         price_per_share=price_per_share,
         shares_gross=round(shares, 8),
@@ -186,7 +220,10 @@ def compute_taker_buy(
         edge_known=edge_known,
         roi_if_win=round(roi, 6) if roi is not None else None,
         effective_price=round(eff_price, 8),
+        token_id=token_id,
+        min_order_size_used=min_order_size_used,
     )
+    return _apply_fee_truth(order, fee_truth_info)
 
 
 def compute_taker_sell(
@@ -220,6 +257,148 @@ def compute_taker_sell(
         total_cost_usdc=0.0,
         net_received_usdc=round(net_recv, 8),
     )
+
+
+# ── share_cut model ────────────────────────────────────────────────────────────
+
+def compute_taker_buy_share_cut(
+    price_per_share: float,
+    shares: float,
+    true_prob: Optional[float] = None,
+    fee_rate: float = config.TAKER_FEE_RATE,
+    fee_truth_info: Optional[Dict] = None,
+    token_id: Optional[str] = None,
+    min_order_size_used: Optional[float] = None,
+) -> OrderCost:
+    """
+    Compute full cost and PnL for a TAKER BUY order under FEE_MODEL='share_cut'.
+
+    Under share_cut:
+      You pay:    price_per_share * shares  USDC (no USDC surcharge)
+      You receive: shares * (1 - fee_rate)  net shares
+      fee_shares:  shares * fee_rate        (deducted from fill)
+      fee_usdc:    0.0
+    """
+    if not (0 < price_per_share < 1):
+        raise ValueError(f"price_per_share must be in (0, 1), got {price_per_share}")
+    if shares <= 0:
+        raise ValueError(f"shares must be > 0, got {shares}")
+    if not (0 <= fee_rate < 1):
+        raise ValueError(f"fee_rate must be in [0, 1), got {fee_rate}")
+
+    fee_shares  = shares * fee_rate
+    shares_net  = shares - fee_shares          # = shares * (1 - fee_rate)
+    notional    = price_per_share * shares
+    fee_usdc    = 0.0
+    total_cost  = notional                     # no USDC surcharge
+    eff_price   = total_cost / shares_net      # effective cost per share received
+
+    pnl_win  = shares_net * 1.0 - total_cost
+    pnl_loss = -total_cost
+
+    # Break-even: p_true * shares_net = total_cost → p_true = total_cost / shares_net
+    be_prob = eff_price
+
+    edge = None
+    edge_known = False
+    if true_prob is not None:
+        edge = true_prob - eff_price
+        edge_known = True
+
+    roi = pnl_win / total_cost if total_cost > 0 else None
+
+    order = OrderCost(
+        side="BUY",
+        price_per_share=price_per_share,
+        shares_gross=round(shares, 8),
+        taker_fee_rate=fee_rate,
+        fee_model="share_cut",
+        fee_shares=round(fee_shares, 8),
+        shares_net=round(shares_net, 8),
+        notional_usdc=round(notional, 8),
+        fee_usdc=0.0,
+        total_cost_usdc=round(total_cost, 8),
+        net_received_usdc=0.0,
+        pnl_if_win=round(pnl_win, 8),
+        pnl_if_loss=round(pnl_loss, 8),
+        break_even_true_prob=round(be_prob, 8),
+        edge_at_true_prob=round(edge, 8) if edge is not None else None,
+        edge_known=edge_known,
+        roi_if_win=round(roi, 6) if roi is not None else None,
+        effective_price=round(eff_price, 8),
+        token_id=token_id,
+        min_order_size_used=min_order_size_used,
+    )
+    return _apply_fee_truth(order, fee_truth_info)
+
+
+def compute_both_models(
+    price_per_share: float,
+    shares: float,
+    true_prob: Optional[float] = None,
+    fee_rate: float = config.TAKER_FEE_RATE,
+    fee_truth_info: Optional[Dict] = None,
+    token_id: Optional[str] = None,
+    min_order_size_used: Optional[float] = None,
+) -> Dict:
+    """
+    Compute taker buy cost under BOTH fee models and return side-by-side.
+
+    Use this when fee_model_assumption is "unresolved" to expose the full
+    range of possible economic outcomes.
+
+    Returns:
+      {
+        "usdc_extra": OrderCost,       # fee paid as extra USDC
+        "share_cut":  OrderCost,       # fee deducted from shares received
+        "delta": {                     # difference between models (share_cut - usdc_extra)
+          "shares_net_delta":    float,
+          "fee_usdc_delta":      float,
+          "total_cost_delta":    float,
+          "pnl_if_win_delta":    float,
+          "break_even_delta":    float,
+        },
+        "fee_model_assumption": "unresolved",
+        "note": "...",
+      }
+    """
+    # Build fee_truth_info copies stamped with explicit model assumption
+    ue_info = dict(fee_truth_info) if fee_truth_info else {
+        "fee_rate_source": "config_fallback",
+        "fee_truth_status": "assumed",
+    }
+    ue_info["fee_model_assumption"] = "usdc_extra"
+
+    sc_info = dict(ue_info)
+    sc_info["fee_model_assumption"] = "share_cut"
+
+    ue = compute_taker_buy(
+        price_per_share, shares, true_prob, fee_rate, ue_info, token_id, min_order_size_used
+    )
+    sc = compute_taker_buy_share_cut(
+        price_per_share, shares, true_prob, fee_rate, sc_info, token_id, min_order_size_used
+    )
+
+    delta = {
+        "shares_net_delta":  round(sc.shares_net   - ue.shares_net, 8),
+        "fee_usdc_delta":    round(sc.fee_usdc     - ue.fee_usdc,   8),
+        "total_cost_delta":  round(sc.total_cost_usdc - ue.total_cost_usdc, 8),
+        "pnl_if_win_delta":  round((sc.pnl_if_win or 0) - (ue.pnl_if_win or 0), 8),
+        "break_even_delta":  round(
+            (sc.break_even_true_prob or 0) - (ue.break_even_true_prob or 0), 8
+        ),
+    }
+
+    return {
+        "usdc_extra":           ue,
+        "share_cut":            sc,
+        "delta":                delta,
+        "fee_model_assumption": "unresolved",
+        "note": (
+            "fee_model_assumption=unresolved: both outputs shown. "
+            "Cannot determine which model applies without examining fill receipts."
+        ),
+    }
 
 
 # ── bankroll-constrained position sizing ─────────────────────────────────────
