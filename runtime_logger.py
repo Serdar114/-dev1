@@ -188,12 +188,28 @@ class RuntimeLogger:
             }, source=source)
             raise
 
+    def notify_ws_msg(self, market_id: str):
+        """
+        Call this EACH TIME a WebSocket message is received for a market.
+        This is the mechanism that prevents false-positive heartbeat gap alerts.
+
+        Must be called from WSBookRecorder._on_message (and any other WS handler).
+        Calling only on connect/reconnect is insufficient – the monitor needs
+        ongoing message timestamps, not just connection timestamps.
+        """
+        self._last_ws_msg_ts[market_id] = time.time()
+
     # ── heartbeat monitor ─────────────────────────────────────────────────────
 
     def start_heartbeat_monitor(self, markets: List[str]):
         """
         Background thread: check each market's WS last-message time.
         Log EV_WS_HEARTBEAT_GAP if no message for > WS_HEARTBEAT_TIMEOUT_S.
+
+        The monitor only fires a gap alert if the WS was previously connected
+        (ws_state == "connected") and has gone quiet. It does NOT fire for
+        markets that were never connected (ws_state == "unknown" / "disconnected").
+        This prevents false positives during WS startup or after explicit close.
         """
         if self._heartbeat_monitor_active:
             return
@@ -203,23 +219,32 @@ class RuntimeLogger:
             while not self._shutdown.is_set():
                 now = time.time()
                 for mid in markets:
-                    last = self._last_ws_msg_ts.get(mid, now)
-                    gap  = now - last
+                    ws_state = self._ws_state.get(mid, "unknown")
+                    if ws_state != "connected":
+                        # Not connected – heartbeat gaps are expected, don't alert
+                        continue
+                    last = self._last_ws_msg_ts.get(mid)
+                    if last is None:
+                        # Connected but never received a message – flag once
+                        self.log(EV_WS_HEARTBEAT_GAP, {
+                            "market_id":   mid,
+                            "gap_seconds": None,
+                            "ws_state":    ws_state,
+                            "note":        "connected but no messages received yet",
+                        }, source="heartbeat_monitor")
+                        continue
+                    gap = now - last
                     if gap > config.WS_HEARTBEAT_TIMEOUT_S:
                         self.log(EV_WS_HEARTBEAT_GAP, {
-                            "market_id":  mid,
+                            "market_id":   mid,
                             "gap_seconds": round(gap, 1),
-                            "ws_state":   self._ws_state.get(mid, "unknown"),
+                            "ws_state":    ws_state,
                         }, source="heartbeat_monitor")
                 self._shutdown.wait(timeout=5.0)
 
         t = threading.Thread(target=_monitor, name="heartbeat-monitor", daemon=True)
         t.start()
         log.info("[runtime] Heartbeat monitor started for %d markets", len(markets))
-
-    def notify_ws_msg(self, market_id: str):
-        """Call this each time a WS message is received for a market."""
-        self._last_ws_msg_ts[market_id] = time.time()
 
     # ── summary / query ───────────────────────────────────────────────────────
 
@@ -241,25 +266,37 @@ class RuntimeLogger:
                 }
 
         ws_disconnects = counts.get(EV_WS_DISCONNECT, 0)
+        ws_reconnects  = counts.get(EV_WS_RECONNECT, 0)
         ws_errors      = counts.get(EV_WS_ERROR, 0) + counts.get(EV_WS_FATAL, 0)
         hb_gaps        = counts.get(EV_WS_HEARTBEAT_GAP, 0)
         rate_limits    = counts.get(EV_RATE_LIMIT, 0)
         rest_errors    = counts.get(EV_REST_ERROR, 0)
         order_rejects  = counts.get(EV_ORDER_REJECT, 0)
 
+        # Median RTT across all endpoints
+        all_rtts: List[float] = []
+        for s in self._rtt_samples.values():
+            all_rtts.extend(s)
+        median_rtt = None
+        worst_rtt  = None
+        if all_rtts:
+            sorted_rtts = sorted(all_rtts)
+            median_rtt  = round(sorted_rtts[len(sorted_rtts) // 2], 2)
+            worst_rtt   = round(sorted_rtts[-1], 2)
+
         return {
             "total_events":     total,
             "event_counts":     counts,
             "rtt_stats":        rtt_stats,
             "ws_disconnects":   ws_disconnects,
+            "ws_reconnects":    ws_reconnects,
             "ws_errors":        ws_errors,
             "heartbeat_gaps":   hb_gaps,
             "rate_limits":      rate_limits,
             "rest_errors":      rest_errors,
             "order_rejects":    order_rejects,
-            "worst_rtt_ms":     max(
-                (v["max_ms"] for v in rtt_stats.values()), default=None
-            ),
+            "median_rtt_ms":    median_rtt,
+            "worst_rtt_ms":     worst_rtt,
         }
 
     def get_events(self, event_type: Optional[str] = None) -> List[Dict]:

@@ -138,14 +138,14 @@ def _identify_bottleneck(
         issues.append((5, "high_rest_latency",
                        f"Worst REST RTT = {worst_rtt:.0f}ms – too slow for late-window taker timing"))
 
-    # No taker candidates passed
-    passed_count = sum(1 for c in taker_candidates if c.get("all_gates_pass"))
+    # No taker candidates passed execution tier
+    exec_count = sum(1 for c in taker_candidates if c.get("execution_candidate"))
     if not taker_candidates:
         issues.append((4, "no_taker_evaluated",
                        "No taker candidates evaluated – likely no markets or book data missing"))
-    elif passed_count == 0:
+    elif exec_count == 0:
         issues.append((3, "no_taker_passed_gates",
-                       f"{len(taker_candidates)} taker candidates evaluated, 0 passed all gates"))
+                       f"{len(taker_candidates)} taker candidates evaluated, 0 reached execution tier"))
 
     # Runtime errors
     rest_errors = runtime_summary.get("rest_errors", 0)
@@ -182,23 +182,30 @@ def _assess_candidacy(
         findings.append(f"[+] {len(markets)} BTC 5m market(s) discovered and tracked")
         any_progress = True
 
-    passed = [c for c in taker_candidates if c.get("all_gates_pass")]
-    if passed:
-        findings.append(
-            f"[+] {len(passed)} taker candidate(s) passed all gates "
-            f"(timing, spread, depth, min_size, signal, EV, bankroll) "
-            f"– verify settlement outcome before drawing any conclusions"
-        )
-        wins = sum(1 for c in passed if c.get("would_have_won") is True)
-        losses = sum(1 for c in passed if c.get("would_have_won") is False)
-        if wins + losses > 0:
-            findings.append(
-                f"  → Of those: {wins} would-win, {losses} would-lose "
-                f"(n={wins+losses}, settlement annotated)"
-            )
+    # Taker tier breakdown
+    signal_c   = sum(1 for c in taker_candidates if c.get("signal_candidate"))
+    pricing_c  = sum(1 for c in taker_candidates if c.get("pricing_candidate"))
+    exec_c     = sum(1 for c in taker_candidates if c.get("execution_candidate"))
+    ev_true    = sum(1 for c in taker_candidates if c.get("ev_candidate") is True)
+    ev_unknown = sum(1 for c in taker_candidates if c.get("ev_candidate") is None and c.get("execution_candidate"))
+
+    findings.append(
+        f"[~] Taker tiers: signal={signal_c}  pricing={pricing_c}  "
+        f"execution={exec_c}  ev=True:{ev_true}/Unknown:{ev_unknown}"
+    )
+    if exec_c > 0:
         any_progress = True
+        findings.append(
+            f"[+] {exec_c} execution candidate(s) – timing/spread/depth/size gates passed. "
+            f"EV unknown ({ev_unknown}) because no external true_prob was supplied. "
+            f"This is the expected state at this measurement stage."
+        )
+        wins   = sum(1 for c in taker_candidates if c.get("execution_candidate") and c.get("would_have_won") is True)
+        losses = sum(1 for c in taker_candidates if c.get("execution_candidate") and c.get("would_have_won") is False)
+        unres  = sum(1 for c in taker_candidates if c.get("execution_candidate") and c.get("would_have_won") is None)
+        findings.append(f"  → Settlement: win={wins} loss={losses} unresolved={unres}")
     else:
-        findings.append(f"[-] 0/{len(taker_candidates)} taker candidates passed all gates")
+        findings.append(f"[-] 0 execution candidates – check spread/depth/min_size gates")
 
     fill_count = sum(s.get("total_fills", 0) for s in maker_summaries)
     if fill_count > 0:
@@ -291,21 +298,64 @@ def generate_report(
     # ── spread data ───────────────────────────────────────────────────────────
     spread_data = _build_spread_data(book_recorders)
 
+    # ── open reference truth summary ─────────────────────────────────────────
+    open_ref_summary: List[Dict] = []
+    for market in markets:
+        mid = market.get("market_id") or market.get("condition_id", "?")
+        # Pull from ref_recorders if passed (they're in taker_evaluators)
+        ev = taker_evaluators.get(mid)
+        ref_rec = getattr(ev, "_ref_recorder", None) if ev else None
+        if ref_rec is not None:
+            open_ref_summary.append({
+                "market_id":              mid[:12],
+                "open_reference_is_true": ref_rec.open_reference_is_true,
+                "open_reference_lag_s":   ref_rec.open_reference_lag_s,
+                "market_window_open_utc": ref_rec.market_window_open_time.isoformat()
+                                          if ref_rec.market_window_open_time else None,
+                "recorder_start_utc":     ref_rec.recorder_start_time.isoformat()
+                                          if ref_rec.recorder_start_time else None,
+                "snap_count":             len(ref_rec.snapshots),
+            })
+        else:
+            open_ref_summary.append({
+                "market_id":              mid[:12],
+                "open_reference_is_true": None,
+                "open_reference_lag_s":   None,
+                "note":                   "no ref recorder available",
+            })
+
+    # ── token mapping summary ─────────────────────────────────────────────────
+    token_mapping_summary: List[Dict] = []
+    for mkt in markets:
+        token_mapping_summary.append({
+            "market_id":               (mkt.get("market_id") or "")[:12],
+            "token_mapping_confidence": mkt.get("token_mapping_confidence", "unknown"),
+            "outcome_labels":          mkt.get("outcome_labels", []),
+            "yes_token_id":            (mkt.get("yes_token_id") or "MISSING")[:16],
+            "no_token_id":             (mkt.get("no_token_id") or "MISSING")[:16],
+        })
+
     # ── min_order_size findings ───────────────────────────────────────────────
     min_size_findings: List[Dict] = []
     for mkt in markets:
         min_sz  = mkt.get("min_order_size")
         tick_sz = mkt.get("tick_size")
+        source  = mkt.get("min_order_size_source", "unknown")
+        ask_guess = 0.60
         if min_sz is not None:
-            ask_guess = 0.60
             cost_at_guess = float(min_sz) * ask_guess * (1 + config.TAKER_FEE_RATE)
-            min_size_findings.append({
-                "market_id":       mkt.get("market_id", "")[:12],
-                "min_order_size":  min_sz,
-                "tick_size":       tick_sz,
-                "cost_usdc_at_0.60_ask": round(cost_at_guess, 4),
-                "fits_max_pos":    cost_at_guess <= config.MAX_POSITION_USDC,
-            })
+            fits = cost_at_guess <= config.MAX_POSITION_USDC
+        else:
+            cost_at_guess = None
+            fits = None
+        min_size_findings.append({
+            "market_id":              mkt.get("market_id", "")[:12],
+            "min_order_size":         min_sz,
+            "min_order_size_source":  source,
+            "tick_size":              tick_sz,
+            "cost_usdc_at_0.60_ask":  round(cost_at_guess, 4) if cost_at_guess else None,
+            "fits_max_pos":           fits,
+        })
 
     # ── bottleneck ────────────────────────────────────────────────────────────
     bottleneck_label, bottleneck_explanation = _identify_bottleneck(
@@ -341,7 +391,11 @@ def generate_report(
 
         "taker_summary": {
             "total_evaluated":   len(all_taker_candidates),
-            "total_passed":      sum(1 for c in all_taker_candidates if c.get("all_gates_pass")),
+            "signal_candidates": sum(1 for c in all_taker_candidates if c.get("signal_candidate")),
+            "pricing_candidates": sum(1 for c in all_taker_candidates if c.get("pricing_candidate")),
+            "execution_candidates": sum(1 for c in all_taker_candidates if c.get("execution_candidate")),
+            "ev_true":           sum(1 for c in all_taker_candidates if c.get("ev_candidate") is True),
+            "ev_unknown":        sum(1 for c in all_taker_candidates if c.get("ev_candidate") is None and c.get("execution_candidate")),
             "by_market":         taker_by_market,
             "settled_wins":      sum(1 for c in all_taker_candidates if c.get("would_have_won") is True),
             "settled_losses":    sum(1 for c in all_taker_candidates if c.get("would_have_won") is False),
@@ -357,9 +411,11 @@ def generate_report(
             "by_side":           all_maker_summaries,
         },
 
-        "spread_distribution":    spread_data,
+        "open_ref_summary":        open_ref_summary,
+        "token_mapping_summary":   token_mapping_summary,
+        "spread_distribution":     spread_data,
         "min_order_size_findings": min_size_findings,
-        "runtime_summary":        runtime_summary,
+        "runtime_summary":         runtime_summary,
 
         "bottleneck": {
             "label":       bottleneck_label,
@@ -405,7 +461,7 @@ def generate_report(
             "session_duration_s":  session_duration_s,
             "markets_observed":    len(markets),
             "taker_evaluated":     report["taker_summary"]["total_evaluated"],
-            "taker_passed":        report["taker_summary"]["total_passed"],
+            "taker_passed":        report["taker_summary"].get("execution_candidates", 0),
             "maker_fills":         report["maker_summary"]["total_fills"],
             "mean_adverse_rate":   report["maker_summary"]["mean_adverse_rate"] or "",
             "ws_disconnects":      runtime_summary.get("ws_disconnects", 0),
@@ -444,12 +500,40 @@ def _format_txt(report: Dict) -> List[str]:
             f"window={m['window_seconds']}s  {m['question'][:50]}"
         )
 
+    lines += ["", "OPEN REFERENCE TRUTH", thin]
+    for r in (report.get("open_ref_summary") or []):
+        lag = r.get("open_reference_lag_s")
+        lag_str = f"{lag:.1f}s lag" if lag is not None else "lag=?"
+        true_flag = r.get("open_reference_is_true")
+        lines.append(
+            f"  {r['market_id']:<14s}  open_ref_is_true={true_flag}  {lag_str}"
+            + (f"  snaps={r['snap_count']}" if "snap_count" in r else "")
+            + (f"  [{r['note']}]" if r.get("note") else "")
+        )
+    if not report.get("open_ref_summary"):
+        lines.append("  (no ref recorder data)")
+
+    lines += ["", "TOKEN MAPPING", thin]
+    for t in (report.get("token_mapping_summary") or []):
+        conf = t.get("token_mapping_confidence", "unknown")
+        labels = t.get("outcome_labels", [])
+        lines.append(
+            f"  {t['market_id']:<14s}  confidence={conf:<12s}  "
+            f"labels={labels}  yes={t['yes_token_id']}  no={t['no_token_id']}"
+        )
+    if not report.get("token_mapping_summary"):
+        lines.append("  (no markets)")
+
     lines += ["", "TAKER SHADOW", thin]
     ts = report["taker_summary"]
-    lines.append(f"  Evaluated : {ts['total_evaluated']}")
-    lines.append(f"  Passed    : {ts['total_passed']}")
-    lines.append(f"  Settled W : {ts['settled_wins']}")
-    lines.append(f"  Settled L : {ts['settled_losses']}")
+    lines.append(f"  Evaluated         : {ts['total_evaluated']}")
+    lines.append(f"  signal_candidates : {ts.get('signal_candidates', '?')}")
+    lines.append(f"  pricing_candidates: {ts.get('pricing_candidates', '?')}")
+    lines.append(f"  execution_cands   : {ts.get('execution_candidates', '?')}")
+    lines.append(f"  ev=True           : {ts.get('ev_true', '?')}")
+    lines.append(f"  ev=Unknown        : {ts.get('ev_unknown', '?')}  (no external true_prob)")
+    lines.append(f"  Settled W         : {ts['settled_wins']}")
+    lines.append(f"  Settled L         : {ts['settled_losses']}")
 
     lines += ["", "MAKER SHADOW", thin]
     ms = report["maker_summary"]
@@ -472,9 +556,10 @@ def _format_txt(report: Dict) -> List[str]:
 
     lines += ["", "MIN ORDER SIZE FINDINGS", thin]
     for f in (report.get("min_order_size_findings") or []):
-        fits = "OK" if f["fits_max_pos"] else "TOO LARGE"
+        fits = "OK" if f.get("fits_max_pos") else ("TOO LARGE" if f.get("fits_max_pos") is False else "?")
+        src = f.get("min_order_size_source", "unknown")
         lines.append(
-            f"  {f['market_id']:<14s}  min_size={f['min_order_size']}  "
+            f"  {f['market_id']:<14s}  min_size={f['min_order_size']} ({src})  "
             f"tick={f['tick_size']}  cost@0.60=${f['cost_usdc_at_0.60_ask']}  [{fits}]"
         )
 

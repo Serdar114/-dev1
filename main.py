@@ -71,12 +71,13 @@ class Session:
         # Runtime logger (singleton for session)
         self.runtime = rl_module.RuntimeLogger(session_id)
 
-    def _ref_snapshots_by_market(self) -> Dict[str, List[Dict]]:
-        """Provide live reference snapshots to taker shadow evaluators."""
-        result: Dict[str, List[Dict]] = {}
-        for mid, rec in self.ref_recorders.items():
-            result[mid] = list(rec.snapshots)
-        return result
+    def _ref_recorders_by_market(self) -> Dict:
+        """
+        Return the live recorder objects keyed by market_id.
+        Do NOT copy the snapshots list here – taker shadow evaluators
+        must hold a reference to the recorder so they read live .snapshots.
+        """
+        return dict(self.ref_recorders)
 
     def run(self, max_duration_s: float = 3600.0):
         """Main session loop."""
@@ -182,18 +183,19 @@ class Session:
             markets=self.markets,
             shutdown_event=self.shutdown,
             runtime_log_fn=runtime_log_fn if not self.no_ws else None,
+            heartbeat_notify_fn=self.runtime.notify_ws_msg if not self.no_ws else None,
         )
 
         # Give book recorders a head start before shadow evaluators read from them
         time.sleep(2)
 
-        # Taker shadow evaluators
-        ref_snaps_by_market = self._ref_snapshots_by_market()
+        # Taker shadow evaluators – pass live recorder objects, NOT snapshot copies
+        ref_recs_by_market = self._ref_recorders_by_market()
         self.taker_evaluators = taker_shadow.run_taker_shadows(
             session_id=self.session_id,
             markets=self.markets,
             book_recorders=self.book_recorders,
-            ref_snapshots_by_market=ref_snaps_by_market,
+            ref_recorders_by_market=ref_recs_by_market,
             runtime_logger=self.runtime,
             shutdown_event=self.shutdown,
             bankroll_ref=self.bankroll_ref,
@@ -210,43 +212,73 @@ class Session:
 
     def _annotate_settlements(self):
         """
-        Fetch settled price for each market and annotate taker candidates.
-        For binary markets: YES settles at 1.0 (win) or 0.0 (loss).
-        We attempt to fetch final trade price from CLOB.
+        Attempt to determine the resolved outcome for each market and annotate
+        taker candidates with settlement data.
+
+        Settlement source hierarchy (in order of trust):
+          1. market.closed == True AND outcome_prices indicates a resolved winner
+             → settlement_source = "market_resolved"
+          2. market.closed == True but no resolved outcome available
+             → settlement_source = "market_closed_no_outcome"
+          3. market.closed is False or unknown
+             → settlement_source = "unresolved"
+
+        We do NOT use last_trade_price as a settlement proxy. A trade at 0.96
+        shortly before close is NOT a resolved outcome. Only official resolution
+        data from the market object or a dedicated resolution endpoint counts.
+
+        If resolution is unavailable, all candidates are labelled "unresolved" or
+        "pending" and hypothetical_pnl remains None.
         """
         import requests
 
         for market in self.markets:
             mid       = market.get("market_id") or market.get("condition_id", "?")
-            yes_tok   = market.get("yes_token_id")
             evaluator = self.taker_evaluators.get(mid)
 
             if evaluator is None or not evaluator.candidates:
                 continue
 
-            settled_yes = None
-            if yes_tok:
-                try:
-                    resp = requests.get(
-                        config.CLOB_LAST_PRICE,
-                        params={"token_id": yes_tok},
-                        timeout=config.HTTP_TIMEOUT_S,
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
-                    price = data.get("price") or data.get("last_trade_price")
-                    if price is not None:
-                        settled_yes = float(price)
-                        # Binary settlement: round to 0 or 1
-                        settled_yes = 1.0 if settled_yes >= 0.95 else 0.0 if settled_yes <= 0.05 else settled_yes
-                except Exception as exc:
-                    log.warning("[main] Could not fetch settlement for %s: %s", mid[:12], exc)
+            # Try to get current market state from CLOB
+            settled_yes: Optional[float] = None
+            settlement_source = "unresolved"
 
-            if settled_yes is not None:
-                evaluator.annotate_settlement(settled_yes)
-                log.info("[main] Annotated settlement for %s: YES=%.1f", mid[:12], settled_yes)
+            if market.get("closed") is True:
+                # Market is closed; look for outcome_prices which on resolved
+                # Polymarket markets contains [1.0, 0.0] or [0.0, 1.0]
+                outcome_prices = market.get("outcome_prices")
+                if outcome_prices and len(outcome_prices) >= 2:
+                    try:
+                        yes_price = float(outcome_prices[0])
+                        # Polymarket resolved binary: exactly 1.0 or 0.0
+                        if yes_price == 1.0 or yes_price == 0.0:
+                            settled_yes = yes_price
+                            settlement_source = "market_resolved"
+                            log.info("[main] market=%s resolved via outcome_prices YES=%.1f",
+                                     mid[:12], settled_yes)
+                        else:
+                            log.warning(
+                                "[main] market=%s closed but outcome_prices[0]=%s "
+                                "is not 0 or 1 – not treating as resolved",
+                                mid[:12], yes_price,
+                            )
+                            settlement_source = "market_closed_ambiguous"
+                    except (ValueError, TypeError) as exc:
+                        log.warning("[main] market=%s outcome_prices parse error: %s",
+                                    mid[:12], exc)
+                        settlement_source = "market_closed_no_outcome"
+                else:
+                    log.warning(
+                        "[main] market=%s closed but no outcome_prices – "
+                        "outcome unknown. Do NOT infer from last trade price.",
+                        mid[:12],
+                    )
+                    settlement_source = "market_closed_no_outcome"
             else:
-                log.warning("[main] No settlement price for %s – candidates not annotated", mid[:12])
+                log.info("[main] market=%s not yet closed – settlement pending", mid[:12])
+                settlement_source = "unresolved"
+
+            evaluator.annotate_settlement(settled_yes, settlement_source)
 
     def _finalize(self):
         """Generate verdict report and print to console."""

@@ -346,12 +346,16 @@ class WSBookRecorder:
         close_ts: float,
         runtime_log_fn,           # callable(event_type, detail_dict)
         shutdown_event: threading.Event,
+        heartbeat_notify_fn=None, # callable(market_id) – called on EVERY WS message
+                                  # Must be runtime_logger.notify_ws_msg.
+                                  # If None, heartbeat monitor cannot track this WS.
     ):
         self.session_id  = session_id
         self.market_id   = market.get("market_id") or market.get("condition_id", "unknown")
         self.token_ids   = [t for t in token_ids if t]
         self.close_ts    = close_ts
         self.runtime_log = runtime_log_fn
+        self._heartbeat_notify = heartbeat_notify_fn
         self.shutdown    = shutdown_event
         self._ws: Optional[websocket.WebSocketApp] = None
 
@@ -360,11 +364,19 @@ class WSBookRecorder:
         self._last_msg_ts: float = 0.0
         self._connect_count: int = 0
 
+        if heartbeat_notify_fn is None:
+            log.warning(
+                "[ws-book] market=%s: no heartbeat_notify_fn provided – "
+                "runtime heartbeat monitor will not track this WS connection",
+                self.market_id[:12],
+            )
+
     def _on_open(self, ws):
         self._connect_count += 1
         self._last_msg_ts = time.time()
-        log.info("[ws-book] Connected (#%d) for market=%s", self._connect_count, self.market_id[:12])
-        self.runtime_log("ws_connect", {
+        ev = "ws_connect" if self._connect_count == 1 else "ws_reconnect"
+        log.info("[ws-book] %s (#%d) for market=%s", ev, self._connect_count, self.market_id[:12])
+        self.runtime_log(ev, {
             "market_id": self.market_id, "connect_count": self._connect_count,
             "ts_ms": _ts_ms(),
         })
@@ -378,6 +390,12 @@ class WSBookRecorder:
     def _on_message(self, ws, message):
         recv_ts_ms = _ts_ms()
         self._last_msg_ts = time.time()
+
+        # Notify runtime heartbeat monitor on every message received.
+        # This is the critical call that prevents false-positive gap alerts.
+        if self._heartbeat_notify is not None:
+            self._heartbeat_notify(self.market_id)
+
         try:
             data = json.loads(message)
         except json.JSONDecodeError:
@@ -442,10 +460,14 @@ def run_book_recorders(
     markets: List[Dict],
     shutdown_event: threading.Event,
     runtime_log_fn=None,
+    heartbeat_notify_fn=None,  # runtime_logger.notify_ws_msg – required for heartbeat
 ) -> Dict[str, Dict]:
     """
     Launch REST polling + WS threads for each market.
     Returns dict of market_id -> {"yes": MarketBookRecorder, "no": MarketBookRecorder, "ws": WSBookRecorder}
+
+    heartbeat_notify_fn: must be runtime_logger.notify_ws_msg.
+    If not provided, heartbeat monitoring will not track WS message receipt.
     """
     if runtime_log_fn is None:
         def runtime_log_fn(etype, detail): pass
@@ -496,6 +518,7 @@ def run_book_recorders(
             token_ids=token_ids, close_ts=close_ts,
             runtime_log_fn=runtime_log_fn,
             shutdown_event=shutdown_event,
+            heartbeat_notify_fn=heartbeat_notify_fn,
         )
         ws_thread = threading.Thread(
             target=ws_rec.run,

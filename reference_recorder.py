@@ -137,7 +137,9 @@ class SessionCsvWriter:
         "capture_latency_ms",
         "btc_price_usdt", "poly_mid_yes", "poly_mid_no",
         "poly_last_yes", "poly_last_no",
-        "price_at_open", "delta_open", "delta_pct_open",
+        "price_at_open", "open_reference_is_true", "open_reference_lag_s",
+        "market_window_open_utc", "recorder_start_utc",
+        "delta_open", "delta_pct_open",
         "fetch_ok",
     ]
 
@@ -178,6 +180,25 @@ class MarketReferenceRecorder:
         self.csv_writer      = csv_writer
         self.shutdown        = shutdown_event
 
+        # ── Time reference fields ─────────────────────────────────────────────
+        # market_window_open_time: the official start of this 5-minute window
+        #   from the market object. This is the time the question was "opened".
+        # recorder_start_time: when this recorder thread began executing.
+        #   These are NOT the same. The recorder may start minutes after the
+        #   window opened. Any price captured at recorder_start_time is NOT
+        #   the true window-open reference price.
+        start_str = market.get("start_time_utc")
+        self.market_window_open_time: Optional[datetime] = None
+        if start_str:
+            try:
+                self.market_window_open_time = datetime.fromisoformat(
+                    start_str.replace("Z", "+00:00")
+                )
+            except ValueError:
+                pass
+
+        self.recorder_start_time: Optional[datetime] = None  # set in run()
+
         end_str = market.get("end_time_utc")
         self.close_time: Optional[datetime] = None
         if end_str:
@@ -186,7 +207,13 @@ class MarketReferenceRecorder:
             except ValueError:
                 pass
 
+        # price_at_open is the BTC price captured at recorder_start_time.
+        # open_reference_is_true is False when we started after market open.
+        # open_reference_lag_s is how many seconds after window open we started.
         self.price_at_open: Optional[float] = None
+        self.open_reference_is_true: bool = False
+        self.open_reference_lag_s: Optional[float] = None
+
         self.snapshots: List[Dict] = []
 
         # Per-market JSONL
@@ -213,24 +240,33 @@ class MarketReferenceRecorder:
             delta_pct_open = round(delta_open / self.price_at_open * 100, 6)
 
         rec = {
-            "session_id":        self.session_id,
-            "market_id":         self.market_id,
-            "condition_id":      self.condition_id,
-            "yes_token_id":      self.yes_token_id or "",
-            "no_token_id":       self.no_token_id or "",
-            "snapshot_label":    label,
-            "target_utc":        _iso(target_dt),
-            "actual_utc":        _iso(actual_dt),
-            "capture_latency_ms": latency_ms,
-            "btc_price_usdt":    btc_price,
-            "poly_mid_yes":      poly_mid_yes,
-            "poly_mid_no":       poly_mid_no,
-            "poly_last_yes":     poly_last_yes,
-            "poly_last_no":      poly_last_no,
-            "price_at_open":     self.price_at_open,
-            "delta_open":        delta_open,
-            "delta_pct_open":    delta_pct_open,
-            "fetch_ok":          btc_price is not None,
+            "session_id":              self.session_id,
+            "market_id":               self.market_id,
+            "condition_id":            self.condition_id,
+            "yes_token_id":            self.yes_token_id or "",
+            "no_token_id":             self.no_token_id or "",
+            "snapshot_label":          label,
+            "target_utc":              _iso(target_dt),
+            "actual_utc":              _iso(actual_dt),
+            "capture_latency_ms":      latency_ms,
+            "btc_price_usdt":          btc_price,
+            "poly_mid_yes":            poly_mid_yes,
+            "poly_mid_no":             poly_mid_no,
+            "poly_last_yes":           poly_last_yes,
+            "poly_last_no":            poly_last_no,
+            # ── open reference truth fields ────────────────────────────────
+            # price_at_open is the BTC price at recorder_start_time, which is
+            # NOT the market window open time unless open_reference_is_true=True.
+            # Do NOT use delta_open/delta_pct_open as a true window-open delta
+            # unless open_reference_is_true=True.
+            "price_at_open":           self.price_at_open,
+            "open_reference_is_true":  self.open_reference_is_true,
+            "open_reference_lag_s":    self.open_reference_lag_s,
+            "market_window_open_utc":  _iso(self.market_window_open_time),
+            "recorder_start_utc":      _iso(self.recorder_start_time),
+            "delta_open":              delta_open,
+            "delta_pct_open":          delta_pct_open,
+            "fetch_ok":                btc_price is not None,
         }
 
         # Persist JSONL immediately
@@ -270,9 +306,45 @@ class MarketReferenceRecorder:
             return
 
         close_ts = self.close_time.timestamp()
+        self.recorder_start_time = _utcnow()
 
-        # ── T-open snapshot (capture baseline price as soon as we start) ──────
-        open_snap = self._capture_snapshot("T-open", _utcnow())
+        # ── Determine open reference truth ─────────────────────────────────────
+        # If market_window_open_time is known AND recorder started within 10s of
+        # market open, treat the first capture as an approximation of window open.
+        # Otherwise flag it explicitly as NOT the true open reference.
+        if self.market_window_open_time is not None:
+            lag = (self.recorder_start_time - self.market_window_open_time).total_seconds()
+            self.open_reference_lag_s = round(lag, 1)
+            if lag <= 10:
+                # Close enough: first capture approximates window open
+                self.open_reference_is_true = False   # still approximate, not exact
+                log.info(
+                    "[ref] market=%s: recorder started %.1fs after market open – "
+                    "open reference is APPROXIMATED (lag=%.1fs)",
+                    self.market_id[:12], lag, lag,
+                )
+            else:
+                self.open_reference_is_true = False
+                log.warning(
+                    "[ref] market=%s: recorder started %.1fs after market open – "
+                    "open reference is NOT the window-open price. "
+                    "delta_open/delta_pct_open in all snapshots are deltas from "
+                    "recorder start, NOT from true window open.",
+                    self.market_id[:12], lag,
+                )
+        else:
+            self.open_reference_lag_s = None
+            self.open_reference_is_true = False
+            log.warning(
+                "[ref] market=%s: market_window_open_time unknown – "
+                "open reference validity cannot be assessed",
+                self.market_id[:12],
+            )
+
+        # ── T-recorder-start snapshot ──────────────────────────────────────────
+        # Label: "T-recorder-start" NOT "T-open". The window may have been open
+        # for some time before this recorder was launched.
+        open_snap = self._capture_snapshot("T-recorder-start", self.recorder_start_time)
         if open_snap["btc_price_usdt"] is not None:
             self.price_at_open = open_snap["btc_price_usdt"]
         self.snapshots.append(open_snap)

@@ -96,16 +96,48 @@ def _is_btc_5m_market(raw: Dict) -> bool:
 
 
 def _extract_tokens(raw: Dict) -> tuple:
-    """Return (yes_token_id, no_token_id) from the tokens list."""
+    """
+    Return (yes_token_id, no_token_id, mapping_confidence, outcome_labels).
+
+    BTC 5-minute markets use outcome labels "Up"/"Down" rather than "Yes"/"No".
+    We map: Up  -> yes_token_id (price goes up  = YES wins)
+            Down -> no_token_id  (price goes down = NO  wins)
+
+    mapping_confidence values:
+      "exact"       – outcomes were literally "Yes"/"No"
+      "directional" – outcomes were "Up"/"Down" mapped to YES/NO
+      "partial"     – only one side found
+      "unknown"     – no recognisable outcome labels; token IDs will be None
+    """
     tokens = raw.get("tokens", []) or []
     yes_id = no_id = None
+    outcome_labels = []
+
     for tok in tokens:
-        outcome = (tok.get("outcome") or "").upper()
-        if outcome == "YES":
+        outcome = (tok.get("outcome") or "").strip()
+        outcome_labels.append(outcome)
+        ou = outcome.upper()
+        if ou in ("YES",):
             yes_id = tok.get("token_id")
-        elif outcome == "NO":
+        elif ou in ("NO",):
             no_id = tok.get("token_id")
-    return yes_id, no_id
+        elif ou in ("UP",):
+            yes_id = tok.get("token_id")   # Up = YES in directional markets
+        elif ou in ("DOWN",):
+            no_id = tok.get("token_id")    # Down = NO in directional markets
+
+    # Assess confidence
+    uppers = [o.upper() for o in outcome_labels]
+    if set(uppers) >= {"YES", "NO"}:
+        confidence = "exact"
+    elif set(uppers) >= {"UP", "DOWN"}:
+        confidence = "directional"
+    elif yes_id or no_id:
+        confidence = "partial"
+    else:
+        confidence = "unknown"
+
+    return yes_id, no_id, confidence, outcome_labels
 
 
 def _flatten(raw: Dict, fetched_utc: str) -> Dict:
@@ -113,29 +145,68 @@ def _flatten(raw: Dict, fetched_utc: str) -> Dict:
     start_dt = _parse_ts(raw.get("game_start_time") or raw.get("start_date_iso"))
     end_dt   = _parse_ts(raw.get("end_date_iso") or raw.get("end_date"))
     window   = _window_seconds(start_dt, end_dt)
-    yes_id, no_id = _extract_tokens(raw)
+    yes_id, no_id, token_mapping_confidence, outcome_labels = _extract_tokens(raw)
+
+    # Warn loudly on unknown mapping – downstream callers depend on correct token IDs
+    if token_mapping_confidence == "unknown":
+        log.error(
+            "TOKEN MAPPING UNKNOWN for market %s – yes/no token IDs will be None. "
+            "Raw outcome labels: %s",
+            raw.get("condition_id"), outcome_labels,
+        )
+    elif token_mapping_confidence == "partial":
+        log.warning(
+            "TOKEN MAPPING PARTIAL for market %s – one side missing. "
+            "Raw outcome labels: %s",
+            raw.get("condition_id"), outcome_labels,
+        )
+    else:
+        log.info(
+            "TOKEN MAPPING: market=%s  confidence=%s  labels=%s  "
+            "yes_token=%s  no_token=%s",
+            (raw.get("condition_id") or "")[:12],
+            token_mapping_confidence,
+            outcome_labels,
+            (yes_id or "")[:12],
+            (no_id or "")[:12],
+        )
+
+    # Prefer per-token tick_size/min_size if available; otherwise fall back to market level
+    tick_size     = raw.get("minimum_tick_size") or raw.get("tick_size")
+    min_order_sz  = raw.get("min_order_size")
+
+    # Log explicitly whether min_order_size came from API or will use default
+    if min_order_sz is None:
+        log.warning(
+            "min_order_size not present in market data for %s – "
+            "downstream will fall back to DEFAULT_MIN_SHARES=%s",
+            raw.get("condition_id"), config.DEFAULT_MIN_SHARES,
+        )
 
     return {
-        "market_id":          raw.get("condition_id") or raw.get("market_id"),
-        "condition_id":       raw.get("condition_id"),
-        "question":           raw.get("question", ""),
-        "category":           raw.get("category", ""),
-        "yes_token_id":       yes_id,
-        "no_token_id":        no_id,
-        "start_time_utc":     start_dt.isoformat() if start_dt else None,
-        "end_time_utc":       end_dt.isoformat() if end_dt else None,
-        "window_seconds":     window,
-        "tick_size":          raw.get("minimum_tick_size") or raw.get("tick_size"),
-        "min_order_size":     raw.get("min_order_size"),
-        "min_tick_size":      raw.get("minimum_tick_size"),
-        "status":             raw.get("status", "unknown"),
-        "active":             raw.get("active", None),
-        "closed":             raw.get("closed", None),
-        "archived":           raw.get("archived", None),
-        "outcome_yes_label":  raw.get("outcome_prices", [None])[0] if raw.get("outcome_prices") else None,
-        "outcome_no_label":   raw.get("outcome_prices", [None, None])[1] if (raw.get("outcome_prices") or [None, None])[1:] else None,
-        "last_fetched_utc":   fetched_utc,
-        "raw_json":           json.dumps(raw),
+        "market_id":               raw.get("condition_id") or raw.get("market_id"),
+        "condition_id":            raw.get("condition_id"),
+        "question":                raw.get("question", ""),
+        "category":                raw.get("category", ""),
+        "yes_token_id":            yes_id,
+        "no_token_id":             no_id,
+        "token_mapping_confidence": token_mapping_confidence,
+        "outcome_labels":          outcome_labels,
+        "start_time_utc":          start_dt.isoformat() if start_dt else None,
+        "end_time_utc":            end_dt.isoformat() if end_dt else None,
+        "window_seconds":          window,
+        "tick_size":               tick_size,
+        "min_order_size":          min_order_sz,
+        "min_order_size_source":   "market_data" if min_order_sz is not None else "missing",
+        "min_tick_size":           raw.get("minimum_tick_size"),
+        "status":                  raw.get("status", "unknown"),
+        "active":                  raw.get("active", None),
+        "closed":                  raw.get("closed", None),
+        "archived":                raw.get("archived", None),
+        "outcome_yes_label":       raw.get("outcome_prices", [None])[0] if raw.get("outcome_prices") else None,
+        "outcome_no_label":        (raw.get("outcome_prices") or [None, None])[1] if len(raw.get("outcome_prices") or []) > 1 else None,
+        "last_fetched_utc":        fetched_utc,
+        "raw_json":                json.dumps(raw),
     }
 
 
