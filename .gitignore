@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Data output (large, session-specific)
+data/markets/
+data/books/
+data/references/
+data/runtime/
+data/shadows/
+data/reports/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
