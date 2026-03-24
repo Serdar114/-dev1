@@ -12,6 +12,7 @@ Tests run without live network. They verify:
 All assertions raise AssertionError on failure.
 """
 
+import json
 import sys
 import types
 import time
@@ -653,6 +654,336 @@ def test_report_audit_fields():
         check("audit_format_txt_runs", False, str(exc))
 
 
+# ── 11. discovery admission/rejection (Market Selection Truth Patch) ──────────
+
+def test_discovery_admission_rejection():
+    print("\n=== market_discovery admission/rejection (fail-closed) ===")
+
+    CANONICAL_START = 1774356600  # matches reference URL timestamp
+
+    def _make_raw(
+        question,
+        condition_id="COND_BTC5M_001",
+        start_ts=None,
+        end_ts=None,
+        tokens=None,
+        slug=None,
+        description="",
+    ):
+        """Build a minimal raw market dict for classification tests."""
+        if start_ts is None:
+            start_ts = CANONICAL_START
+        if end_ts is None:
+            end_ts = CANONICAL_START + 300
+        raw = {
+            "condition_id":   condition_id,
+            "question":       question,
+            "description":    description,
+            "game_start_time": start_ts,
+            "end_date_iso":   datetime.fromtimestamp(end_ts, tz=timezone.utc).isoformat(),
+            "tokens": tokens if tokens is not None else [
+                {"token_id": "TOKEN_UP_001",   "outcome": "Up"},
+                {"token_id": "TOKEN_DOWN_001", "outcome": "Down"},
+            ],
+        }
+        if slug is not None:
+            raw["market_slug"] = slug
+        return raw
+
+    # ── POSITIVE: canonical BTC 5m Up/Down market ─────────────────────────────
+    canonical = _make_raw(
+        question="Bitcoin Up or Down - 5 Minutes",
+        condition_id="COND_BTC5M_CANONICAL",
+        slug="btc-updown-5m-1774356600",
+    )
+    r = market_discovery._classify_market(canonical)
+    check("canonical_btc5m_admitted",
+          r["admit"] is True,
+          f"reason={r['rejection_reason']}  detail={r['details'].get('reason_detail')}")
+
+    # ── POSITIVE: canonical market without slug field (slug absent = not rejected) ─
+    no_slug = _make_raw(
+        question="Bitcoin Up or Down - 5 Minutes",
+        condition_id="COND_BTC5M_NOSLUG",
+    )
+    # no market_slug key at all
+    no_slug.pop("market_slug", None)
+    r2 = market_discovery._classify_market(no_slug)
+    check("canonical_no_slug_admitted",
+          r2["admit"] is True,
+          f"reason={r2['rejection_reason']}  detail={r2['details'].get('reason_detail')}")
+
+    # ── POSITIVE: alternative question phrasing ───────────────────────────────
+    alt_q = _make_raw(
+        question="BTC Up or Down - 5 Min",
+        condition_id="COND_BTC5M_ALT",
+    )
+    r3 = market_discovery._classify_market(alt_q)
+    check("alt_question_btc5m_admitted",
+          r3["admit"] is True,
+          f"reason={r3['rejection_reason']}  detail={r3['details'].get('reason_detail')}")
+
+    # ── NEGATIVE: hashprice market ────────────────────────────────────────────
+    hashprice = _make_raw(
+        question="Bitcoin hashprice above 50 PH/s before June 1?",
+        condition_id="COND_HASH_001",
+    )
+    rh = market_discovery._classify_market(hashprice)
+    check("hashprice_rejected",
+          rh["admit"] is False,
+          f"should be rejected, got admit={rh['admit']}")
+    check("hashprice_reason_semantics",
+          rh["rejection_reason"] == "wrong_market_semantics",
+          f"reason={rh['rejection_reason']}")
+
+    # ── NEGATIVE: long-dated Bitcoin before-June market ───────────────────────
+    longdated = {
+        "condition_id":   "COND_LONG_001",
+        "question":       "Will Bitcoin price be above $100,000 before June?",
+        "description":    "",
+        "game_start_time": CANONICAL_START,
+        "end_date_iso":   datetime.fromtimestamp(
+            CANONICAL_START + 30 * 24 * 3600, tz=timezone.utc
+        ).isoformat(),
+        "tokens": [
+            {"token_id": "T_YES", "outcome": "Yes"},
+            {"token_id": "T_NO",  "outcome": "No"},
+        ],
+    }
+    rl = market_discovery._classify_market(longdated)
+    check("longdated_rejected",
+          rl["admit"] is False,
+          f"should be rejected, got admit={rl['admit']}")
+    # Either wrong_market_semantics (no up+down words) or wrong_window; both correct
+    check("longdated_reason_is_semantics_or_window",
+          rl["rejection_reason"] in ("wrong_market_semantics", "wrong_window"),
+          f"reason={rl['rejection_reason']}")
+
+    # ── NEGATIVE: blank outcome labels ────────────────────────────────────────
+    blank_tok = _make_raw(
+        question="Bitcoin Up or Down - 5 Minutes",
+        condition_id="COND_BLANK_001",
+        tokens=[
+            {"token_id": "T1", "outcome": ""},
+            {"token_id": "T2", "outcome": ""},
+        ],
+    )
+    rb = market_discovery._classify_market(blank_tok)
+    check("blank_outcomes_rejected",
+          rb["admit"] is False,
+          f"should be rejected, got admit={rb['admit']}")
+    check("blank_outcomes_reason",
+          rb["rejection_reason"] in ("invalid_outcomes", "unknown_token_mapping"),
+          f"reason={rb['rejection_reason']}")
+
+    # ── NEGATIVE: None / empty market_id ─────────────────────────────────────
+    no_id_raw = _make_raw("Bitcoin Up or Down - 5 Minutes", condition_id="")
+    no_id_raw["condition_id"] = None
+    no_id_raw.pop("market_id", None)
+    rn = market_discovery._classify_market(no_id_raw)
+    check("none_market_id_rejected",
+          rn["admit"] is False,
+          f"should be rejected, got admit={rn['admit']}")
+    check("none_market_id_reason",
+          rn["rejection_reason"] == "missing_market_id",
+          f"reason={rn['rejection_reason']}")
+
+    # ── NEGATIVE: missing start time ─────────────────────────────────────────
+    no_start = {
+        "condition_id": "COND_NOSTART_001",
+        "question":     "Bitcoin Up or Down - 5 Minutes",
+        "description":  "",
+        # no game_start_time, no start_date_iso
+        "end_date_iso": datetime.fromtimestamp(
+            CANONICAL_START + 300, tz=timezone.utc
+        ).isoformat(),
+        "tokens": [
+            {"token_id": "T_UP", "outcome": "Up"},
+            {"token_id": "T_DN", "outcome": "Down"},
+        ],
+    }
+    rst = market_discovery._classify_market(no_start)
+    check("missing_start_rejected",
+          rst["admit"] is False,
+          f"should be rejected, got admit={rst['admit']}")
+    check("missing_start_reason",
+          rst["rejection_reason"] == "missing_timing",
+          f"reason={rst['rejection_reason']}")
+
+    # ── NEGATIVE: missing end time ────────────────────────────────────────────
+    no_end = {
+        "condition_id":   "COND_NOEND_001",
+        "question":       "Bitcoin Up or Down - 5 Minutes",
+        "description":    "",
+        "game_start_time": CANONICAL_START,
+        # no end_date_iso, no end_date
+        "tokens": [
+            {"token_id": "T_UP", "outcome": "Up"},
+            {"token_id": "T_DN", "outcome": "Down"},
+        ],
+    }
+    ren = market_discovery._classify_market(no_end)
+    check("missing_end_rejected",
+          ren["admit"] is False,
+          f"should be rejected, got admit={ren['admit']}")
+    check("missing_end_reason",
+          ren["rejection_reason"] == "missing_timing",
+          f"reason={ren['rejection_reason']}")
+
+    # ── NEGATIVE: unknown token mapping (unrecognised labels) ─────────────────
+    weird_tok = _make_raw(
+        question="Bitcoin Up or Down - 5 Minutes",
+        condition_id="COND_WEIRD_001",
+        tokens=[
+            {"token_id": "T1", "outcome": "Banana"},
+            {"token_id": "T2", "outcome": "Apple"},
+        ],
+    )
+    rw = market_discovery._classify_market(weird_tok)
+    check("unknown_token_mapping_rejected",
+          rw["admit"] is False,
+          f"should be rejected, got admit={rw['admit']}")
+    check("unknown_token_reason",
+          rw["rejection_reason"] == "unknown_token_mapping",
+          f"reason={rw['rejection_reason']}")
+
+    # ── NEGATIVE: wrong window (30-day window) ────────────────────────────────
+    wrong_win = _make_raw(
+        question="Bitcoin Up or Down - 5 Minutes",
+        condition_id="COND_WRONGWIN_001",
+        end_ts=CANONICAL_START + 30 * 24 * 3600,   # 30 days
+    )
+    rww = market_discovery._classify_market(wrong_win)
+    check("wrong_window_rejected",
+          rww["admit"] is False,
+          f"should be rejected, got admit={rww['admit']}")
+    check("wrong_window_reason",
+          rww["rejection_reason"] == "wrong_window",
+          f"reason={rww['rejection_reason']}")
+
+    # ── NEGATIVE: slug present but wrong pattern ──────────────────────────────
+    bad_slug = _make_raw(
+        question="Bitcoin Up or Down - 5 Minutes",
+        condition_id="COND_BADSLUG_001",
+        slug="bitcoin-hashprice-before-june",
+    )
+    rbs = market_discovery._classify_market(bad_slug)
+    check("wrong_slug_rejected",
+          rbs["admit"] is False,
+          f"should be rejected, got admit={rbs['admit']}")
+    check("wrong_slug_reason",
+          rbs["rejection_reason"] == "wrong_market_semantics",
+          f"reason={rbs['rejection_reason']}")
+
+    # ── NEGATIVE: partial token mapping ──────────────────────────────────────
+    partial_tok = _make_raw(
+        question="Bitcoin Up or Down - 5 Minutes",
+        condition_id="COND_PARTIAL_001",
+        tokens=[
+            {"token_id": "T_UP", "outcome": "Up"},
+            # Down side missing
+        ],
+    )
+    rp = market_discovery._classify_market(partial_tok)
+    check("partial_mapping_rejected",
+          rp["admit"] is False,
+          f"should be rejected, got admit={rp['admit']}")
+    # partial mapping (1 token) hits invalid_outcomes (< 2 non-blank labels) first;
+    # both invalid_outcomes and unknown_token_mapping are correct rejections here
+    check("partial_mapping_reason",
+          rp["rejection_reason"] in ("unknown_token_mapping", "invalid_outcomes"),
+          f"reason={rp['rejection_reason']}")
+
+    # ── INVARIANT: window=None is never admitted ───────────────────────────────
+    # This tests that the old bug ("window unknown but pass anyway") is gone.
+    # Build a market that passes all other checks but has no timing at all.
+    no_timing = {
+        "condition_id": "COND_NOTIMING_001",
+        "question":     "Bitcoin Up or Down - 5 Minutes",
+        "description":  "",
+        # deliberately no start or end fields
+        "tokens": [
+            {"token_id": "T_UP", "outcome": "Up"},
+            {"token_id": "T_DN", "outcome": "Down"},
+        ],
+    }
+    rnt = market_discovery._classify_market(no_timing)
+    check("no_timing_invariant_rejected",
+          rnt["admit"] is False,
+          "'window unknown but pass anyway' must never happen")
+    check("no_timing_reason",
+          rnt["rejection_reason"] == "missing_timing",
+          f"reason={rnt['rejection_reason']}")
+
+    # ── AUDIT: fetch_all_markets emits discovery_audit file ───────────────────
+    # Test via mocked HTTP returning a mix of admitted and rejected markets
+    from unittest.mock import patch, MagicMock
+    import tempfile, pathlib as _pl, os
+
+    page1 = {
+        "data": [
+            # Admitted
+            _make_raw("Bitcoin Up or Down - 5 Minutes", condition_id="COND_OK_001",
+                      slug="btc-updown-5m-1774356600"),
+            # Rejected: hashprice near-miss
+            _make_raw("Bitcoin hashprice above 50 PH/s before June 1?",
+                      condition_id="COND_HASH_002"),
+            # Rejected: missing timing
+            {
+                "condition_id": "COND_NOTIMING_002",
+                "question": "Bitcoin Up or Down - 5 Minutes",
+                "description": "",
+                "tokens": [
+                    {"token_id": "T_UP", "outcome": "Up"},
+                    {"token_id": "T_DN", "outcome": "Down"},
+                ],
+            },
+            # Rejected: totally unrelated market (not btc)
+            {"condition_id": "COND_XYZ", "question": "Will it rain tomorrow?",
+             "tokens": []},
+        ],
+        "next_cursor": "",
+    }
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = page1
+    mock_resp.raise_for_status.return_value = None
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        orig_markets_dir = config.MARKETS_DIR
+        config.MARKETS_DIR = _pl.Path(tmpdir)
+
+        with patch("market_discovery.requests.get", return_value=mock_resp):
+            admitted = market_discovery.fetch_all_markets("smoke_audit_disc")
+
+        config.MARKETS_DIR = orig_markets_dir
+
+        audit_file = _pl.Path(tmpdir) / "discovery_audit_smoke_audit_disc.json"
+        check("discovery_audit_file_created",
+              audit_file.exists(),
+              f"expected {audit_file}")
+
+        with open(audit_file) as af:
+            audit_data = json.load(af)
+
+        check("audit_total_scanned_4",   audit_data["total_scanned"] == 4,
+              f"scanned={audit_data['total_scanned']}")
+        check("audit_total_admitted_1",  audit_data["total_admitted"] == 1,
+              f"admitted={audit_data['total_admitted']}")
+        check("audit_total_rejected_3",  audit_data["total_rejected"] == 3,
+              f"rejected={audit_data['total_rejected']}")
+        check("audit_admitted_id_ok",
+              "COND_OK_001" in audit_data["admitted_market_ids"],
+              f"ids={audit_data['admitted_market_ids']}")
+        check("audit_has_rejection_buckets",
+              "rejection_buckets" in audit_data)
+
+    check("admitted_market_has_correct_id",
+          len(admitted) == 1 and admitted[0]["market_id"] == "COND_OK_001",
+          f"admitted={[m['market_id'] for m in admitted]}")
+
+
 # ── run all ───────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -667,6 +998,8 @@ if __name__ == "__main__":
     test_fee_math_both_models()
     test_settlement_refetch_paths()
     test_report_audit_fields()
+    # Market Selection Truth Patch
+    test_discovery_admission_rejection()
 
     print()
     failed = [n for n, ok in results if not ok]
