@@ -1,0 +1,12 @@
+# Polymarket BTC 5-minute measurement harness
+# Pin to stable versions. No speculative deps.
+
+# HTTP client
+requests==2.32.3
+
+# WebSocket client (book_recorder WS, Binance WS)
+websocket-client==1.8.0
+
+# Standard library only beyond this point.
+# No pandas, no numpy, no ML libraries.
+# Data goes to csv/jsonl via stdlib csv and json modules.
