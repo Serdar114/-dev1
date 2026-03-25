@@ -143,35 +143,40 @@ async def poll_resolution(
     """
     Poll every RESOLUTION_POLL_INTERVAL seconds until resolved or timeout.
     Returns resolution dict:
-      {outcome, chainlink_price, binance_price_at_close, price_delta, resolved_at_unix}
+      {outcome, chainlink_price, binance_price_at_resolution, price_delta,
+       estimated_lag_seconds, resolved_at_unix}
     """
     deadline = window_close_unix + RESOLUTION_TIMEOUT
-    binance_at_close = btc_price_fn()   # snapshot Binance price at close
 
     while time.time() < deadline:
         market = await get_market(session, slug)
         if market and market["resolved"] and market["outcome"]:
+            resolved_at = int(time.time())
+            # Capture Binance price at the moment resolution is detected
+            binance_at_resolution = btc_price_fn()
             chainlink = market.get("chainlink_price")
             price_delta = None
-            if chainlink is not None and binance_at_close is not None:
-                price_delta = round(float(chainlink) - binance_at_close, 4)
+            if chainlink is not None and binance_at_resolution is not None:
+                price_delta = round(float(chainlink) - binance_at_resolution, 4)
             return {
-                "outcome":               market["outcome"],
-                "chainlink_price":       float(chainlink) if chainlink else None,
-                "binance_price_at_close": binance_at_close,
-                "price_delta":           price_delta,
-                "resolved_at_unix":      int(time.time()),
+                "outcome":                    market["outcome"],
+                "chainlink_price":            float(chainlink) if chainlink else None,
+                "binance_price_at_resolution": binance_at_resolution,
+                "price_delta":                price_delta,
+                "estimated_lag_seconds":      resolved_at - window_close_unix,
+                "resolved_at_unix":           resolved_at,
             }
 
         await _async_sleep(RESOLUTION_POLL_INTERVAL)
 
     logger.warning("Resolution timeout for slug=%s", slug)
     return {
-        "outcome":               "UNRESOLVED",
-        "chainlink_price":       None,
-        "binance_price_at_close": binance_at_close,
-        "price_delta":           None,
-        "resolved_at_unix":      None,
+        "outcome":                    "UNRESOLVED",
+        "chainlink_price":            None,
+        "binance_price_at_resolution": None,
+        "price_delta":                None,
+        "estimated_lag_seconds":      None,
+        "resolved_at_unix":           None,
     }
 
 

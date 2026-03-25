@@ -119,12 +119,14 @@ async def observe_window(
     # ── Fetch market metadata ────────────────────────────────────────────
     market = await get_market(session, state.slug)
     if market:
-        state.yes_token_id  = market.get("yes_token_id")
+        state.yes_token_id   = market.get("yes_token_id")
+        state.no_token_id    = market.get("no_token_id")
         state.min_order_size = market.get("min_order_size")
     else:
         log.warning("Could not fetch market for %s. Snapshots will be null.", state.slug)
 
     # ── Snapshot + snipe evaluation loop ────────────────────────────────
+    # ask_fn always fetches YES token — used by snapshot_loop for yes_ask column
     async def ask_fn() -> float | None:
         if not state.yes_token_id:
             return None
@@ -143,16 +145,26 @@ async def observe_window(
         if not state.snipe_done and 2 < tr < 15:
             btc = feed.btc_price
             if btc is not None and state.open_btc is not None:
-                ask = await ask_fn()
-                if ask is not None:
-                    result = evaluate_snipe(btc, state.open_btc, ask, tr)
-                    if result["triggered"]:
-                        state.paper_snipe = result
-                        state.snipe_done  = True
-                        log.info(
-                            "Paper snipe triggered: dir=%s entry=%.4f tr=%.1fs",
-                            result["direction"], result["entry_price"], tr,
-                        )
+                btc_delta_pct = (btc - state.open_btc) / state.open_btc * 100
+                # Pick token side based on current BTC direction
+                if btc_delta_pct > 0:
+                    token_id   = state.yes_token_id
+                    token_side = "YES"
+                else:
+                    token_id   = state.no_token_id
+                    token_side = "NO"
+                if token_id:
+                    ask = await get_best_ask(session, token_id)
+                    if ask is not None:
+                        result = evaluate_snipe(btc, state.open_btc, ask, tr)
+                        if result["triggered"]:
+                            result["token_side"] = token_side
+                            state.paper_snipe = result
+                            state.snipe_done  = True
+                            log.info(
+                                "Paper snipe triggered: dir=%s side=%s entry=%.4f tr=%.1fs",
+                                result["direction"], token_side, result["entry_price"], tr,
+                            )
         await asyncio.sleep(SNAPSHOT_POLL_INTERVAL)
 
     await snap_task  # ensure it's finished and snapshots are filled

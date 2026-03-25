@@ -52,6 +52,7 @@ class WindowState:
         self.slug:          str          = slug_for(open_ts)
         self.open_btc:      float | None = None
         self.yes_token_id:  str | None   = None
+        self.no_token_id:   str | None   = None
         self.min_order_size: float | None = None
         self.snapshots:     dict         = {}          # key → {btc, yes_ask, ts}
         self.paper_snipe:   dict         = {"triggered": False}
