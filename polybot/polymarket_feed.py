@@ -183,7 +183,7 @@ class PolymarketFeed:
         """Yeni pencere başladığında yeni token'lara subscribe ol."""
         self._subscribed_ids = token_ids
         self._books.clear()
-        if self._ws and not self._ws.closed:
+        if self._ws is not None:
             try:
                 msg = json.dumps({"assets_ids": token_ids, "type": "Market"})
                 await self._ws.send(msg)
