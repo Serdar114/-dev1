@@ -1,100 +1,98 @@
 """
 Paper Trader — simülasyon modu.
 
-Paper trade akışı:
-  1. Sinyal gelir → trade kaydedilir (gerçek emir gönderilmez)
+Trade akışı:
+  1. Sinyal → open_position() → PaperPosition kaydedilir
   2. Pencere kapanır → resolve_pending() çağrılır
-  3. Chainlink BTC/USD Data Streams'den son fiyat çekilir
-  4. open_price vs resolve_price karşılaştırılır
-     - Tie (==) → UP kazanır (spec: tie = başlangıç = Up kazanır)
-  5. PnL hesaplanır → risk_manager.on_trade_result()
+  3. Binance REST'ten pencere kapanış fiyatı çekilir (fallback: open_price → tie → UP kazanır)
+  4. Sonuç belirlenir:
+       UP: btc_close >= btc_open → WIN
+       DOWN: btc_close < btc_open → WIN
+       Tie (==): UP kazanır
+  5. PnL:
+       WIN:  shares * (1.0 - entry_ask) - fee
+       LOSS: -(shares * entry_ask + fee)
+  6. JSONL log: timestamp, window, direction, entry_price, fee, result, pnl
 
-Chainlink resolve:
-  - REST üzerinden son round data çekilir
-  - 64 blok konfirmasyonu ~2 dakika → resolve_confirm_secs=130 beklenir
-  - Fallback: Binance kapanış fiyatı (open_price snapshot)
+Fee formülü (YENİ, config'den):
+  fee = shares * ask * fee_rate * (ask * (1-ask))^fee_exponent
 """
 
 import asyncio
 import aiohttp
 import time
-from dataclasses import dataclass, field
-from fee_engine import compute_fee, net_pnl
+from dataclasses import dataclass
 import logger as log_module
 
 
-# Chainlink BTC/USD Data Streams (Polygon) — public price feed
-# Not: Canlıda py-clob-client ile resmi veri; paper'da public REST yeterli
-CHAINLINK_POLYGON_URL = "https://api.chain.link/v1/query?query=BTC%2FUSD&network=polygon"
 BINANCE_REST_URL = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
 
 
 @dataclass
 class PaperPosition:
     trade_id: str
-    direction: str          # "up" | "down"
+    direction: str       # "up" | "down"
     shares: int
-    p_entry: float
-    open_price: float       # BTC price at window open
-    opened_at: float        # unix timestamp
-    window_ts: int          # pencere başlangıç ts
-    fee_rate: float = 0.072
-    fee_exponent: float = 1.0
+    entry_ask: float     # token ask fiyatı (giriş fiyatı)
+    btc_open: float      # BTC pencere açılış fiyatı
+    fee: float           # önceden hesaplanan fee
+    opened_at: float     # unix timestamp
+    window_ts: int
+    # resolve sonrası doldurulur
     resolved: bool = False
+    btc_close: float = 0.0
+    result: str = ""     # "win" | "loss"
     pnl: float = 0.0
-    resolve_price: float = 0.0
-    outcome: str = ""       # "win" | "loss"
+
+
+def _compute_fee(shares: float, ask: float, fee_rate: float, fee_exponent: float) -> float:
+    """fee = shares * ask * fee_rate * (ask * (1-ask))^fee_exponent"""
+    if not (0 < ask < 1):
+        return 0.0
+    try:
+        raw = shares * ask * fee_rate * (ask * (1.0 - ask)) ** fee_exponent
+        return max(round(raw, 4), 0.0001)
+    except Exception:
+        return 0.0001
 
 
 class PaperTrader:
-    def __init__(
-        self,
-        config: dict,
-        risk_manager=None,
-    ):
+    def __init__(self, config: dict, risk_manager=None):
         self.fee_rate: float = config.get("fee_rate", 0.072)
         self.fee_exponent: float = config.get("fee_exponent", 1.0)
         self.resolve_confirm_secs: int = config.get("resolve_confirm_secs", 130)
         self._positions: list[PaperPosition] = []
-        self._trade_counter: int = 0
+        self._counter: int = 0
         self.risk_manager = risk_manager
 
     def open_position(
         self,
         direction: str,
         shares: int,
-        p_entry: float,
-        open_price: float,
+        entry_ask: float,
+        btc_open: float,
         window_ts: int,
     ) -> PaperPosition:
-        """Paper trade aç."""
-        self._trade_counter += 1
-        trade_id = f"paper-{int(time.time())}-{self._trade_counter}"
-
+        """Paper trade aç — gerçek emir gönderilmez."""
+        self._counter += 1
+        fee = _compute_fee(shares, entry_ask, self.fee_rate, self.fee_exponent)
         pos = PaperPosition(
-            trade_id=trade_id,
+            trade_id=f"paper-{int(time.time())}-{self._counter}",
             direction=direction,
             shares=shares,
-            p_entry=p_entry,
-            open_price=open_price,
+            entry_ask=entry_ask,
+            btc_open=btc_open,
+            fee=fee,
             opened_at=time.time(),
             window_ts=window_ts,
-            fee_rate=self.fee_rate,
-            fee_exponent=self.fee_exponent,
         )
         self._positions.append(pos)
-
         if self.risk_manager:
             self.risk_manager.on_trade_opened()
-
         return pos
 
-    async def _fetch_resolve_price(self, open_btc: float) -> float:
-        """
-        Chainlink'ten BTC kapanış fiyatı çek.
-        Fallback: Binance REST spot price.
-        """
-        # Fallback 1: Binance REST (hızlı, paper için yeterli)
+    async def _fetch_btc_close(self, btc_open: float) -> float:
+        """Binance REST'ten anlık BTC fiyatını çek. Fallback: btc_open (tie → UP kazanır)."""
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
@@ -105,28 +103,20 @@ class PaperTrader:
                         data = await r.json()
                         return float(data["price"])
         except Exception as e:
-            await log_module.log("resolve_binance_error", {"error": str(e)})
+            await log_module.log("resolve_fetch_error", {"error": str(e)})
 
-        # Fallback 2: open_price döndür → tie → UP kazanır
-        await log_module.log("resolve_fallback", {"using": "open_price", "price": open_btc})
-        return open_btc
+        await log_module.log("resolve_fallback", {"using": "btc_open", "price": btc_open})
+        return btc_open
 
-    def _determine_outcome(self, direction: str, open_price: float, resolve_price: float) -> bool:
-        """
-        Kazandı mı?
-        UP: resolve >= open → win (tie = Up kazanır)
-        DOWN: resolve < open → win
-        """
+    @staticmethod
+    def _is_win(direction: str, btc_open: float, btc_close: float) -> bool:
+        """UP: close >= open (tie = UP kazanır). DOWN: close < open."""
         if direction == "up":
-            return resolve_price >= open_price
-        else:
-            return resolve_price < open_price
+            return btc_close >= btc_open
+        return btc_close < btc_open
 
     async def resolve_pending(self, wait_secs: int | None = None) -> list[PaperPosition]:
-        """
-        Tüm bekleyen pozisyonları resolve et.
-        wait_secs: Chainlink konfirmasyon bekleme süresi.
-        """
+        """Bekleyen tüm pozisyonları resolve et."""
         pending = [p for p in self._positions if not p.resolved]
         if not pending:
             return []
@@ -138,37 +128,38 @@ class PaperTrader:
 
         resolved = []
         for pos in pending:
-            resolve_price = await self._fetch_resolve_price(pos.open_price)
-            outcome_win = self._determine_outcome(pos.direction, pos.open_price, resolve_price)
+            try:
+                btc_close = await self._fetch_btc_close(pos.btc_open)
+                win = self._is_win(pos.direction, pos.btc_open, btc_close)
 
-            pnl = net_pnl(
-                shares=pos.shares,
-                p_entry=pos.p_entry,
-                outcome_win=outcome_win,
-                fee_rate=pos.fee_rate,
-                fee_exponent=pos.fee_exponent,
-            )
+                if win:
+                    pnl = pos.shares * (1.0 - pos.entry_ask) - pos.fee
+                else:
+                    pnl = -(pos.shares * pos.entry_ask + pos.fee)
 
-            pos.resolved = True
-            pos.resolve_price = resolve_price
-            pos.pnl = pnl
-            pos.outcome = "win" if outcome_win else "loss"
+                pos.resolved = True
+                pos.btc_close = btc_close
+                pos.result = "win" if win else "loss"
+                pos.pnl = round(pnl, 4)
 
-            if self.risk_manager:
-                self.risk_manager.on_trade_result(pnl)
+                if self.risk_manager:
+                    self.risk_manager.on_trade_result(pos.pnl)
 
-            await log_module.log("trade_resolved", {
-                "trade_id": pos.trade_id,
-                "direction": pos.direction,
-                "shares": pos.shares,
-                "p_entry": pos.p_entry,
-                "open_btc": pos.open_price,
-                "resolve_btc": round(resolve_price, 2),
-                "outcome": pos.outcome,
-                "pnl": round(pnl, 4),
-                "fee": round(compute_fee(pos.shares, pos.p_entry, pos.fee_rate, pos.fee_exponent), 4),
-            })
-            resolved.append(pos)
+                await log_module.log("trade_resolved", {
+                    "trade_id": pos.trade_id,
+                    "timestamp": time.time(),
+                    "window": pos.window_ts,
+                    "direction": pos.direction,
+                    "entry_price": pos.entry_ask,
+                    "fee": pos.fee,
+                    "btc_open": pos.btc_open,
+                    "btc_close": round(btc_close, 2),
+                    "result": pos.result,
+                    "pnl": pos.pnl,
+                })
+                resolved.append(pos)
+            except Exception as e:
+                await log_module.log("resolve_error", {"trade_id": pos.trade_id, "error": str(e)})
 
         return resolved
 

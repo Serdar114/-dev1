@@ -133,33 +133,28 @@ class PolyBot:
             return
 
         direction = signal.direction
-        p_entry = signal.p_entry
+        entry_ask = signal.entry_ask
         shares = self.risk_manager.get_shares()
 
         pos = self.paper_trader.open_position(
             direction=direction,
             shares=shares,
-            p_entry=p_entry,
-            open_price=open_price,
+            entry_ask=entry_ask,
+            btc_open=open_price,
             window_ts=self._window_ts,
         )
         self._signal_sent = True
         p(f"[TRADE] {pos.trade_id} dir={direction} shares={shares} "
-          f"p={p_entry:.4f} edge={signal.edge_pct:.2f}% spread={signal.spread_pct:.1f}%")
+          f"ask={entry_ask:.4f} net_pnl_win={signal.net_pnl_win:.4f} spread={signal.spread_pct:.1f}%")
         await log_module.log("trade_opened", {
             "trade_id": pos.trade_id,
             "mode": self.mode,
             "direction": direction,
             "shares": shares,
-            "p_entry": p_entry,
-            "p_bid": self.pm_feed.get_book(
-                self._window_token_up if direction == "up" else self._window_token_down
-            ).bid if self.pm_feed.get_book(
-                self._window_token_up if direction == "up" else self._window_token_down
-            ) else 0,
+            "entry_ask": entry_ask,
+            "fee": signal.fee,
+            "net_pnl_win": signal.net_pnl_win,
             "spread_pct": signal.spread_pct,
-            "signal_p": signal.p_signal,
-            "edge_pct": round(signal.edge_pct, 2),
             "delta_pct": round(signal.delta_pct, 4),
             "btc_open": open_price,
             "btc_current": btc_mid,
