@@ -179,8 +179,8 @@ class PolyBot:
         p(f"[window] Polymarket WS subscribe: up={market['token_up'][:16]}... down={market['token_down'][:16]}...")
         await self.pm_feed.resubscribe([market["token_up"], market["token_down"]])
 
-        # Orderbook ilk snapshot'ını bekle (max 5s)
-        book_up = await self.pm_feed.wait_for_book(market["token_up"], timeout=5.0)
+        # Orderbook ilk snapshot'ını bekle (max 12s — WS + HTTP fallback için yeterli süre)
+        book_up = await self.pm_feed.wait_for_book(market["token_up"], timeout=12.0)
         if book_up:
             p(f"[window] PM orderbook hazır: up bid={book_up.bid} ask={book_up.ask} spread={book_up.spread_pct:.1f}%")
         else:

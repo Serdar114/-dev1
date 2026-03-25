@@ -167,12 +167,25 @@ class PolymarketFeed:
             print(f"[PM_DEBUG] subscribe HATA: {e}", flush=True)
             await log_module.log("pm_ws_subscribe_error", {"error": str(e)})
 
+    def _books_missing(self) -> bool:
+        """Subscribe edilmiş tokenlar için book verisi eksik mi?"""
+        if not self._subscribed_ids:
+            return False
+        return any(tid not in self._books for tid in self._subscribed_ids)
+
     async def _fallback_poll(self) -> None:
-        """WS bağlı değilken HTTP /book polling — 3s interval, WS gelince durur."""
+        """HTTP /book polling:
+        - WS bağlı DEĞİLSE: her 3s poll
+        - WS bağlı AMA book verisi yoksa: her 3s poll (subscribe cevabı gelmediyse)
+        - Her iki durumda da data gelince durur (ama her pencere başında books clear edilir)
+        """
         poll_count = 0
         while self._running:
             try:
-                if not self._ws_connected and self._subscribed_ids:
+                should_poll = self._subscribed_ids and (
+                    not self._ws_connected or self._books_missing()
+                )
+                if should_poll:
                     poll_count += 1
                     print(f"[PM_DEBUG] HTTP fallback poll #{poll_count} (ws_connected={self._ws_connected})", flush=True)
                     async with aiohttp.ClientSession() as session:
