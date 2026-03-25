@@ -74,7 +74,8 @@ class SignalEngine:
     def __init__(self, config: dict):
         self.min_delta_pct: float = config.get("min_delta_pct", 0.05)
         self.min_edge_pct: float = config.get("min_edge_pct", 1.0)
-        self.max_spread_pct: float = config.get("max_spread_pct", 6.0)
+        self.max_spread_pct: float = config.get("max_spread_pct", 2.0)
+        self.min_depth: float = config.get("min_orderbook_depth", 50.0)
         self.entry_window_start: int = config.get("entry_window_start_ste", 45)
         self.entry_window_end: int = config.get("entry_window_end_ste", 10)
         self.fee_rate: float = config.get("fee_rate", 0.072)
@@ -84,6 +85,10 @@ class SignalEngine:
             "B2": [0.87, 0.90],
             "B3": [0.91, 0.93],
         })
+        # Bucket geçerli fiyat aralığı — config'den türetilir
+        all_vals = [v for bucket in self.quote_buckets.values() for v in bucket]
+        self._bucket_lo: float = min(all_vals)
+        self._bucket_hi: float = max(all_vals)
 
     def _skip(self, reason: str, secs_to_res: int, delta_pct: float = 0.0) -> "Signal":
         return Signal(
@@ -143,10 +148,30 @@ class SignalEngine:
                 reason=f"spread_too_wide({book.spread_pct:.1f}%>{self.max_spread_pct}%)",
             )
 
-        # Entry price: ask (gerçekçi taker fill fiyatı)
+        # Orderbook depth filtresi — ince kitap = güvenilmez fiyat
+        if book.ask_size < self.min_depth or book.bid_size < self.min_depth:
+            return Signal(
+                action="skip", direction=direction,
+                delta_pct=delta_pct, p_entry=book.mid, p_signal=0.0,
+                edge_pct=0.0, spread_pct=book.spread_pct,
+                secs_to_res=secs_to_res,
+                reason=f"depth_low(bid={book.bid_size:.0f}<{self.min_depth} ask={book.ask_size:.0f})",
+            )
+
+        # Entry price: UP sinyali → UP token ask, DOWN → DOWN token ask
         p_entry = book.ask
-        if p_entry <= 0 or p_entry >= 1:
+        if not (0 < p_entry < 1):
             return self._skip("invalid_p_entry", secs_to_res, delta_pct)
+
+        # Bucket range kontrolü — fiyat stratejimizin geçerli aralığında mı?
+        if p_entry < self._bucket_lo or p_entry > self._bucket_hi:
+            return Signal(
+                action="skip", direction=direction,
+                delta_pct=delta_pct, p_entry=p_entry, p_signal=0.0,
+                edge_pct=0.0, spread_pct=book.spread_pct,
+                secs_to_res=secs_to_res,
+                reason=f"no_bucket(ask={p_entry:.3f} range=[{self._bucket_lo},{self._bucket_hi}])",
+            )
 
         # Signal probability (delta büyüklüğünden)
         p_signal = _delta_to_p_signal(delta_abs, self.quote_buckets)

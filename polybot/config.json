@@ -8,7 +8,8 @@
   "entry_window_end_ste": 10,
   "min_delta_pct": 0.05,
   "min_edge_pct": 1.0,
-  "max_spread_pct": 6.0,
+  "max_spread_pct": 2.0,
+  "min_orderbook_depth": 50,
   "fee_rate": 0.072,
   "fee_exponent": 1,
   "quote_buckets": {

@@ -21,9 +21,12 @@ Kullanım:
 import sys
 import asyncio
 
-# Windows: ProactorEventLoop (DNS + WebSocket uyumluluğu için zorunlu)
+# Windows: ProactorEventLoop (DNS + WebSocket için gerekli, 3.14'te deprecated)
 if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    except AttributeError:
+        pass  # Python 3.16+ kaldırıldıysa sessizce geç
 
 import json
 import time
@@ -80,6 +83,7 @@ class PolyBot:
         self._window_token_down: str = ""
         self._window_ts: int = 0
         self._signal_sent = False
+        self._last_eval_sec: int = 0  # tick throttle: aynı saniyede max 1 değerlendirme
 
     async def _on_btc_tick(self, btc_mid: float) -> None:
         """
@@ -88,6 +92,12 @@ class PolyBot:
         """
         if not self._window_active or self._signal_sent:
             return
+
+        # Tick throttle — Binance ~100ms tick, aynı saniyede max 1 değerlendirme
+        current_sec = int(time.time())
+        if current_sec == self._last_eval_sec:
+            return
+        self._last_eval_sec = current_sec
 
         open_price = self.feed.open_price
         if not open_price:
