@@ -138,7 +138,10 @@ class PolyBot:
             if poll_count % 3 == 1:  # her ~15s bir durum satırı
                 p(f"[window] secs_to_res={secs_to_res} btc_open={open_price} btc_mid={current_price} signal_sent={signal_sent}")
 
-            if not signal_sent and open_price and current_price:
+            # Entry window'a 60s kala midpoint sorgulamaya başla (API israfını önle)
+            entry_approach = secs_to_res <= (self.signal_engine.entry_window_start + 15)
+
+            if not signal_sent and open_price and current_price and entry_approach:
                 p(f"[window] midpoint sorgulanıyor... (secs_to_res={secs_to_res})")
                 p_up = await get_orderbook_midpoint(token_up, clob_base)
                 p_down = await get_orderbook_midpoint(token_down, clob_base)

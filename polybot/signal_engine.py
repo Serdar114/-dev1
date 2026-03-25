@@ -95,15 +95,7 @@ class SignalEngine:
 
         Returns Signal dataclass.
         """
-        # Entry window kontrolü
-        if secs_to_res > self.entry_window_start or secs_to_res < self.entry_window_end:
-            return Signal(
-                action="skip", direction="none",
-                delta_pct=0.0, p_entry=0.0, p_signal=0.0, edge_pct=0.0,
-                secs_to_res=secs_to_res, reason="outside_entry_window",
-            )
-
-        # Delta hesapla
+        # Delta hesapla — entry window check'ten ÖNCE (log'da gerçek değer görünsün)
         if open_price <= 0:
             return Signal(
                 action="skip", direction="none",
@@ -113,6 +105,14 @@ class SignalEngine:
 
         delta_pct = (current_price - open_price) / open_price * 100.0
         delta_abs = abs(delta_pct)
+
+        # Entry window kontrolü — delta biliniyor, log'da görünür
+        if secs_to_res > self.entry_window_start or secs_to_res < self.entry_window_end:
+            return Signal(
+                action="skip", direction="none",
+                delta_pct=delta_pct, p_entry=0.0, p_signal=0.0, edge_pct=0.0,
+                secs_to_res=secs_to_res, reason="outside_entry_window",
+            )
 
         # Min delta filtresi
         if delta_abs < self.min_delta_pct:
