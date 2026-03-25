@@ -50,6 +50,10 @@ class PaperPosition:
     resolution_truth_status: str = ""    # "binance_only" | "dual_verified" | "dual_mismatch" | "unresolved_fetch_error"
     resolution_match: str = ""           # "match" | "mismatch" | "unknown"
     chainlink_status: str = ""           # "fetched" | "placeholder" | "error"
+    # unresolved lifecycle tracking
+    resolution_retry_count: int = 0
+    first_resolution_failure_ts: float = 0.0
+    last_resolution_attempt_ts: float = 0.0
 
 
 class PaperTrader:
@@ -124,16 +128,23 @@ class PaperTrader:
 
                 # Fetch başarısız → trade'i final olarak kapatma
                 if truth.winner_source == "none" or truth.winner_binance == "unknown":
+                    now = time.time()
                     pos.resolution_blocked = True
                     pos.result = "unresolved"
                     pos.pnl = 0.0
                     pos.btc_close = 0.0
                     pos.winning_side = ""
+                    pos.resolution_retry_count += 1
+                    pos.last_resolution_attempt_ts = now
+                    if pos.first_resolution_failure_ts == 0.0:
+                        pos.first_resolution_failure_ts = now
                     # resolved=False kalır — trade hâlâ açık sayılır
+
+                    secs_since_first = round(now - pos.first_resolution_failure_ts, 1)
 
                     await log_module.log("trade_resolution_blocked", {
                         "trade_id": pos.trade_id,
-                        "timestamp": time.time(),
+                        "timestamp": now,
                         "window": pos.window_ts,
                         "interval": pos.interval,
                         "btc_open": pos.btc_open,
@@ -141,6 +152,9 @@ class PaperTrader:
                         "winner_source": truth.winner_source,
                         "winner_binance": truth.winner_binance,
                         "chainlink_status": truth.chainlink_status,
+                        "retry_count": pos.resolution_retry_count,
+                        "first_failure_ts": pos.first_resolution_failure_ts,
+                        "secs_since_first_failure": secs_since_first,
                         "note": "Truth layer could not determine winner. "
                                 "Trade NOT finalized. No PnL assigned.",
                     })
@@ -209,9 +223,15 @@ class PaperTrader:
         """10 pencere sonunda rapor için istatistikler."""
         resolved = [pos for pos in self._positions if pos.resolved]
         blocked = [pos for pos in self._positions if pos.resolution_blocked]
+        max_retry = max((pos.resolution_retry_count for pos in blocked), default=0)
         if not resolved:
-            return {"trades": 0, "total_pnl": 0.0, "avg_net_edge": 0.0,
-                    "win_up": 0, "win_down": 0, "unresolved": len(blocked)}
+            return {
+                "trades": 0, "total_pnl": 0.0, "avg_net_edge": 0.0,
+                "win_up": 0, "win_down": 0,
+                "unresolved_count": len(blocked),
+                "blocked_resolution_count": len(blocked),
+                "max_resolution_retry_count": max_retry,
+            }
         total_pnl = sum(pos.pnl for pos in resolved)
         avg_edge = sum(pos.net_edge for pos in resolved) / len(resolved)
         win_up = sum(1 for pos in resolved if pos.result == "win_up")
@@ -223,6 +243,8 @@ class PaperTrader:
             "avg_pnl_per_trade": round(total_pnl / len(resolved), 4),
             "win_up": win_up,
             "win_down": win_down,
-            "unresolved": len(blocked),
+            "unresolved_count": len(blocked),
+            "blocked_resolution_count": len(blocked),
+            "max_resolution_retry_count": max_retry,
             "dual_fill_rate": "100%",  # paper modda her zaman %100
         }
