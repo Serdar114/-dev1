@@ -135,6 +135,7 @@ class PolyBot:
             shares=shares,
             btc_open=btc_open,
             window_ts=self._window_ts,
+            interval=self.interval,
         )
         self._signal_sent = True
         p(f"[DUAL] {pos.trade_id} up_ask={signal.up_ask:.4f} down_ask={signal.down_ask:.4f} "

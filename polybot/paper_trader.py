@@ -21,9 +21,7 @@ import aiohttp
 import time
 from dataclasses import dataclass
 import logger as log_module
-
-
-BINANCE_REST_URL = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+from resolution_truth import resolve_truth
 
 
 @dataclass
@@ -37,12 +35,20 @@ class PaperPosition:
     btc_open: float
     opened_at: float
     window_ts: int
+    interval: str = "5m"
     # resolve sonrası
     resolved: bool = False
     btc_close: float = 0.0
     winning_side: str = ""   # "up" | "down"
     result: str = ""         # "win_up" | "win_down"
     pnl: float = 0.0         # shares * net_edge
+    # resolution truth fields
+    winner_source: str = ""              # "binance" (şimdilik)
+    winner_binance: str = ""             # "up" | "down"
+    winner_chainlink: str = ""           # "up" | "down" | "unknown"
+    resolution_truth_status: str = ""    # "binance_only" | "dual_verified" | "dual_mismatch"
+    resolution_match: str = ""           # "match" | "mismatch" | "unknown"
+    chainlink_status: str = ""           # "fetched" | "placeholder" | "error"
 
 
 class PaperTrader:
@@ -60,6 +66,7 @@ class PaperTrader:
         shares: int,
         btc_open: float,
         window_ts: int,
+        interval: str = "5m",
     ) -> PaperPosition:
         """Dual entry simüle et — her iki taraf ask'tan fill edildi kabul edilir."""
         self._counter += 1
@@ -76,6 +83,7 @@ class PaperTrader:
             btc_open=btc_open,
             opened_at=time.time(),
             window_ts=window_ts,
+            interval=interval,
         )
         self._positions.append(pos)
 
@@ -84,25 +92,8 @@ class PaperTrader:
 
         return pos
 
-    async def _fetch_btc_close(self, btc_open: float) -> float:
-        """Binance REST anlık fiyat. Fallback: btc_open (tie → UP kazanır)."""
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    BINANCE_REST_URL,
-                    timeout=aiohttp.ClientTimeout(total=5),
-                ) as r:
-                    if r.status == 200:
-                        data = await r.json()
-                        return float(data["price"])
-        except Exception as e:
-            await log_module.log("resolve_fetch_error", {"error": str(e)})
-
-        await log_module.log("resolve_fallback", {"using": "btc_open", "price": btc_open})
-        return btc_open
-
     async def resolve_pending(self, wait_secs: int | None = None) -> list[PaperPosition]:
-        """Bekleyen pozisyonları resolve et."""
+        """Bekleyen pozisyonları resolve et — resolution_truth layer üzerinden."""
         pending = [pos for pos in self._positions if not pos.resolved]
         if not pending:
             return []
@@ -115,24 +106,32 @@ class PaperTrader:
         resolved = []
         for pos in pending:
             try:
-                btc_close = await self._fetch_btc_close(pos.btc_open)
+                # Resolution truth layer — Binance + Chainlink (placeholder)
+                truth = await resolve_truth(
+                    window_ts=pos.window_ts,
+                    interval=pos.interval,
+                    btc_open=pos.btc_open,
+                )
 
-                # Kazanan taraf (logging için — PnL her iki durumda aynı)
-                if btc_close >= pos.btc_open:
-                    winning_side = "up"
-                    result = "win_up"
-                else:
-                    winning_side = "down"
-                    result = "win_down"
+                # Winner: şimdilik Binance (tek aktif kaynak)
+                winning_side = truth.winner_binance
+                result = f"win_{winning_side}"
 
                 # PnL: fee yok — post-only maker
                 pnl = round(pos.shares * pos.net_edge, 4)
 
                 pos.resolved = True
-                pos.btc_close = round(btc_close, 2)
+                pos.btc_close = truth.btc_close_binance
                 pos.winning_side = winning_side
                 pos.result = result
                 pos.pnl = pnl
+                # Truth fields
+                pos.winner_source = truth.winner_source
+                pos.winner_binance = truth.winner_binance
+                pos.winner_chainlink = truth.winner_chainlink
+                pos.resolution_truth_status = truth.resolution_truth_status
+                pos.resolution_match = truth.resolution_match
+                pos.chainlink_status = truth.chainlink_status
 
                 if self.risk_manager:
                     self.risk_manager.on_trade_result(pnl)
@@ -141,6 +140,7 @@ class PaperTrader:
                     "trade_id": pos.trade_id,
                     "timestamp": time.time(),
                     "window": pos.window_ts,
+                    "interval": pos.interval,
                     "up_ask": pos.up_ask,
                     "down_ask": pos.down_ask,
                     "pair_sum": pos.pair_sum,
@@ -150,6 +150,13 @@ class PaperTrader:
                     "btc_close": pos.btc_close,
                     "result": pos.result,
                     "pnl": pos.pnl,
+                    # resolution truth fields
+                    "winner_source": pos.winner_source,
+                    "winner_binance": pos.winner_binance,
+                    "winner_chainlink": pos.winner_chainlink,
+                    "resolution_truth_status": pos.resolution_truth_status,
+                    "resolution_match": pos.resolution_match,
+                    "chainlink_status": pos.chainlink_status,
                 })
                 resolved.append(pos)
 
