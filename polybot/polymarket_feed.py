@@ -53,6 +53,7 @@ class PolymarketFeed:
         self._task: asyncio.Task | None = None
         self._fallback_task: asyncio.Task | None = None
         self._ws = None
+        self._debug_msg_count: int = 0   # ilk N mesajı logla
 
     def get_book(self, token_id: str) -> BookSnapshot | None:
         return self._books.get(token_id)
@@ -149,42 +150,78 @@ class PolymarketFeed:
 
     async def _send_subscribe(self, ws) -> None:
         if not self._subscribed_ids:
+            print("[PM_DEBUG] subscribe çağrıldı ama _subscribed_ids boş", flush=True)
             return
+        # Polymarket CLOB WS subscribe formatı — debug için her ikisini de logla
+        payload = {"assets_ids": self._subscribed_ids, "type": "Market"}
+        msg = json.dumps(payload)
+        print(f"[PM_DEBUG] subscribe gönderiliyor: {msg[:200]}", flush=True)
         try:
-            msg = json.dumps({"assets_ids": self._subscribed_ids, "type": "Market"})
             await ws.send(msg)
-            await log_module.log("pm_ws_subscribed", {"tokens": self._subscribed_ids})
+            await log_module.log("pm_ws_subscribed", {
+                "tokens": self._subscribed_ids,
+                "payload": payload,
+            })
+            print(f"[PM_DEBUG] subscribe gönderildi, cevap bekleniyor...", flush=True)
         except Exception as e:
+            print(f"[PM_DEBUG] subscribe HATA: {e}", flush=True)
             await log_module.log("pm_ws_subscribe_error", {"error": str(e)})
 
     async def _fallback_poll(self) -> None:
         """WS bağlı değilken HTTP /book polling — 3s interval, WS gelince durur."""
+        poll_count = 0
         while self._running:
             try:
                 if not self._ws_connected and self._subscribed_ids:
+                    poll_count += 1
+                    print(f"[PM_DEBUG] HTTP fallback poll #{poll_count} (ws_connected={self._ws_connected})", flush=True)
                     async with aiohttp.ClientSession() as session:
                         for token_id in self._subscribed_ids:
+                            url = f"{self.clob_base}/book"
                             try:
                                 async with session.get(
-                                    f"{self.clob_base}/book",
+                                    url,
                                     params={"token_id": token_id},
                                     timeout=aiohttp.ClientTimeout(total=5),
                                 ) as r:
-                                    if r.status == 200:
-                                        data = await r.json()
-                                        self._handle_book_event({
-                                            "asset_id": token_id,
-                                            "bids": data.get("bids", []),
-                                            "asks": data.get("asks", []),
-                                        })
-                            except Exception:
-                                pass
+                                    status = r.status
+                                    raw_text = await r.text()
+                                    print(f"[PM_DEBUG] HTTP /book status={status} token={token_id[:16]} len={len(raw_text)}", flush=True)
+                                    await log_module.log("pm_fallback_http", {
+                                        "token_id": token_id[:32],
+                                        "status": status,
+                                        "response_len": len(raw_text),
+                                        "response_preview": raw_text[:200],
+                                    })
+                                    if status == 200:
+                                        try:
+                                            data = json.loads(raw_text)
+                                            bids = data.get("bids", [])
+                                            asks = data.get("asks", [])
+                                            print(f"[PM_DEBUG] HTTP book: bids={len(bids)} asks={len(asks)}", flush=True)
+                                            self._handle_book_event({
+                                                "asset_id": token_id,
+                                                "bids": bids,
+                                                "asks": asks,
+                                            })
+                                            book = self._books.get(token_id)
+                                            if book:
+                                                print(f"[PM_DEBUG] HTTP book parsed: bid={book.bid} ask={book.ask}", flush=True)
+                                            else:
+                                                print(f"[PM_DEBUG] HTTP book parse sonrası _books boş kaldı — bids/asks içeriği: {raw_text[:300]}", flush=True)
+                                        except Exception as parse_err:
+                                            print(f"[PM_DEBUG] HTTP parse HATA: {parse_err}", flush=True)
+                            except Exception as req_err:
+                                print(f"[PM_DEBUG] HTTP istek HATA: {req_err}", flush=True)
+                                await log_module.log("pm_fallback_request_error", {"error": str(req_err), "token": token_id[:32]})
             except Exception as e:
+                print(f"[PM_DEBUG] fallback_poll genel HATA: {e}", flush=True)
                 await log_module.log("pm_fallback_error", {"error": str(e)})
             await asyncio.sleep(FALLBACK_POLL_INTERVAL)
 
     async def _run_once(self) -> None:
         try:
+            print(f"[PM_DEBUG] WS bağlanıyor: {self.ws_url}", flush=True)
             async with websockets.connect(
                 self.ws_url,
                 ping_interval=20,
@@ -192,28 +229,48 @@ class PolymarketFeed:
             ) as ws:
                 self._ws = ws
                 self._ws_connected = True
+                self._debug_msg_count = 0
+                print("[PM_DEBUG] WS bağlantı kuruldu", flush=True)
                 await log_module.log("pm_ws_connected", {"url": self.ws_url})
                 await self._send_subscribe(ws)
 
                 async for raw in ws:
                     if not self._running:
                         break
+
+                    # İlk 30 mesajı her zaman logla — protokol debug
+                    self._debug_msg_count += 1
+                    if self._debug_msg_count <= 30:
+                        print(f"[PM_DEBUG] raw #{self._debug_msg_count}: {str(raw)[:300]}", flush=True)
+                        await log_module.log("pm_ws_raw", {
+                            "n": self._debug_msg_count,
+                            "raw": str(raw)[:500],
+                        })
+
                     try:
                         msg = json.loads(raw)
                         events = msg if isinstance(msg, list) else [msg]
                         for event in events:
                             etype = event.get("event_type", "")
+                            # Bilinen event_type dışında gelen key'leri logla (protokol keşfi)
+                            if self._debug_msg_count <= 30 and etype not in ("book", "price_change"):
+                                print(f"[PM_DEBUG] bilinmeyen event_type='{etype}' keys={list(event.keys())}", flush=True)
                             if etype == "book":
                                 self._handle_book_event(event)
+                                book = self._books.get(event.get("asset_id", ""))
+                                if book:
+                                    print(f"[PM_DEBUG] book parsed: token={event.get('asset_id','')[:16]} bid={book.bid} ask={book.ask}", flush=True)
                             elif etype == "price_change":
                                 self._handle_price_change(event)
-                    except (json.JSONDecodeError, TypeError):
-                        pass
+                    except (json.JSONDecodeError, TypeError) as e:
+                        print(f"[PM_DEBUG] JSON parse HATA: {e} raw={str(raw)[:100]}", flush=True)
         except Exception as e:
+            print(f"[PM_DEBUG] WS HATA: {e}", flush=True)
             await log_module.log("pm_ws_error", {"error": str(e)})
         finally:
             self._ws = None
             self._ws_connected = False
+            print("[PM_DEBUG] WS bağlantı kapandı, _ws_connected=False", flush=True)
 
     async def run(self) -> None:
         self._running = True
