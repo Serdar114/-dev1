@@ -149,12 +149,23 @@ async def discover_market(
             await log_module.log("token_count_error", {"token_ids": token_ids})
             return None
 
+        secs_left = _secs_to_resolution(interval)
+
+        # Pencere neredeyse kapanmış — işlemek için çok geç
+        if secs_left < 60:
+            await log_module.log("market_too_late", {
+                "slug": market.get("slug", slug),
+                "secs_to_resolution": secs_left,
+                "reason": "less_than_60s_remaining",
+            })
+            return None
+
         result = {
             "slug": market.get("slug", slug),
             "condition_id": market.get("conditionId") or market.get("condition_id", ""),
             "token_up": token_ids[0],    # index 0 = UP token
             "token_down": token_ids[1],  # index 1 = DOWN token
-            "secs_to_resolution": _secs_to_resolution(interval),
+            "secs_to_resolution": secs_left,
             "window_ts": current_ts,
             "interval": interval,
         }

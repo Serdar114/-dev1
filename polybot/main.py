@@ -234,7 +234,10 @@ class PolyBot:
                     # --once: mevcut pencereyi hemen işle, bekletme
                     p("[run] --once modu: mevcut pencereyi hemen işliyorum")
                 else:
-                    await asyncio.sleep(max(0, secs_left - 1))
+                    # +2s: yeni pencere sınırını geç, eski pencereyi yakalamayalım
+                    sleep_secs = max(0, secs_left + 2)
+                    p(f"[run] {sleep_secs:.1f}s bekleniyor (yeni pencere +2s)")
+                    await asyncio.sleep(sleep_secs)
 
                 p("[run] _run_window() başlıyor...")
                 await self._run_window()
