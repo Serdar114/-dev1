@@ -24,6 +24,7 @@ Quote buckets (örn. config):
 
 from dataclasses import dataclass
 from fee_engine import is_edge_positive
+from polymarket_feed import BookSnapshot
 import logger as log_module
 
 
@@ -32,9 +33,10 @@ class Signal:
     action: str          # "buy_up" | "buy_down" | "skip"
     direction: str       # "up" | "down" | "none"
     delta_pct: float
-    p_entry: float       # market fiyatı (midpoint)
+    p_entry: float       # market fiyatı (ask — gerçekçi fill price)
     p_signal: float      # tahmini olasılık
     edge_pct: float
+    spread_pct: float    # orderbook spread kalitesi
     secs_to_res: int
     reason: str
 
@@ -72,6 +74,7 @@ class SignalEngine:
     def __init__(self, config: dict):
         self.min_delta_pct: float = config.get("min_delta_pct", 0.05)
         self.min_edge_pct: float = config.get("min_edge_pct", 1.0)
+        self.max_spread_pct: float = config.get("max_spread_pct", 6.0)
         self.entry_window_start: int = config.get("entry_window_start_ste", 45)
         self.entry_window_end: int = config.get("entry_window_end_ste", 10)
         self.fee_rate: float = config.get("fee_rate", 0.072)
@@ -82,65 +85,73 @@ class SignalEngine:
             "B3": [0.91, 0.93],
         })
 
+    def _skip(self, reason: str, secs_to_res: int, delta_pct: float = 0.0) -> "Signal":
+        return Signal(
+            action="skip", direction="none",
+            delta_pct=delta_pct, p_entry=0.0, p_signal=0.0,
+            edge_pct=0.0, spread_pct=0.0,
+            secs_to_res=secs_to_res, reason=reason,
+        )
+
     def evaluate(
         self,
         open_price: float,
         current_price: float,
-        p_entry_up: float,      # CLOB midpoint for UP token
-        p_entry_down: float,    # CLOB midpoint for DOWN token
+        book_up: BookSnapshot | None,    # UP token orderbook
+        book_down: BookSnapshot | None,  # DOWN token orderbook
         secs_to_res: int,
     ) -> Signal:
         """
-        Sinyal üret.
+        Sinyal üret (tick-driven — her Binance tick'inde çağrılır).
 
         Returns Signal dataclass.
         """
-        # Delta hesapla — entry window check'ten ÖNCE (log'da gerçek değer görünsün)
+        # Delta hesapla — her şeyden önce (log'da her zaman görünsün)
         if open_price <= 0:
-            return Signal(
-                action="skip", direction="none",
-                delta_pct=0.0, p_entry=0.0, p_signal=0.0, edge_pct=0.0,
-                secs_to_res=secs_to_res, reason="no_open_price",
-            )
+            return self._skip("no_open_price", secs_to_res)
 
         delta_pct = (current_price - open_price) / open_price * 100.0
         delta_abs = abs(delta_pct)
 
-        # Entry window kontrolü — delta biliniyor, log'da görünür
+        # Entry window kontrolü
         if secs_to_res > self.entry_window_start or secs_to_res < self.entry_window_end:
-            return Signal(
-                action="skip", direction="none",
-                delta_pct=delta_pct, p_entry=0.0, p_signal=0.0, edge_pct=0.0,
-                secs_to_res=secs_to_res, reason="outside_entry_window",
-            )
+            return self._skip("outside_entry_window", secs_to_res, delta_pct)
+
+        # Orderbook data mevcut mu?
+        if book_up is None or book_down is None:
+            return self._skip("no_orderbook", secs_to_res, delta_pct)
 
         # Min delta filtresi
         if delta_abs < self.min_delta_pct:
-            return Signal(
-                action="skip", direction="none",
-                delta_pct=delta_pct, p_entry=0.0, p_signal=0.0, edge_pct=0.0,
-                secs_to_res=secs_to_res, reason=f"delta_too_small({delta_abs:.3f}%)",
-            )
+            return self._skip(f"delta_too_small({delta_abs:.3f}%)", secs_to_res, delta_pct)
 
         # Yön belirle
         if delta_pct > 0:
             direction = "up"
-            p_entry = p_entry_up
+            book = book_up
         else:
             direction = "down"
-            p_entry = p_entry_down
+            book = book_down
 
-        if p_entry <= 0 or p_entry >= 1:
+        # Spread kalite filtresi — geniş spread = belirsiz fiyat
+        if book.spread_pct > self.max_spread_pct:
             return Signal(
                 action="skip", direction=direction,
-                delta_pct=delta_pct, p_entry=p_entry, p_signal=0.0, edge_pct=0.0,
-                secs_to_res=secs_to_res, reason="invalid_p_entry",
+                delta_pct=delta_pct, p_entry=book.mid, p_signal=0.0,
+                edge_pct=0.0, spread_pct=book.spread_pct,
+                secs_to_res=secs_to_res,
+                reason=f"spread_too_wide({book.spread_pct:.1f}%>{self.max_spread_pct}%)",
             )
 
-        # Signal probability
+        # Entry price: ask (gerçekçi taker fill fiyatı)
+        p_entry = book.ask
+        if p_entry <= 0 or p_entry >= 1:
+            return self._skip("invalid_p_entry", secs_to_res, delta_pct)
+
+        # Signal probability (delta büyüklüğünden)
         p_signal = _delta_to_p_signal(delta_abs, self.quote_buckets)
 
-        # Edge kontrolü
+        # Edge kontrolü (ask fiyatı kullanarak — daha muhafazakâr)
         has_edge, edge_pct = is_edge_positive(
             p_entry=p_entry,
             p_true=p_signal,
@@ -153,15 +164,16 @@ class SignalEngine:
             return Signal(
                 action="skip", direction=direction,
                 delta_pct=delta_pct, p_entry=p_entry, p_signal=p_signal,
-                edge_pct=edge_pct, secs_to_res=secs_to_res,
+                edge_pct=edge_pct, spread_pct=book.spread_pct,
+                secs_to_res=secs_to_res,
                 reason=f"no_edge({edge_pct:.2f}%<{self.min_edge_pct}%)",
             )
 
-        action = f"buy_{direction}"
         return Signal(
-            action=action, direction=direction,
+            action=f"buy_{direction}", direction=direction,
             delta_pct=delta_pct, p_entry=p_entry, p_signal=p_signal,
-            edge_pct=edge_pct, secs_to_res=secs_to_res, reason="edge_ok",
+            edge_pct=edge_pct, spread_pct=book.spread_pct,
+            secs_to_res=secs_to_res, reason="edge_ok",
         )
 
     async def log_signal(self, signal: Signal) -> None:
@@ -172,6 +184,7 @@ class SignalEngine:
             "p_entry": signal.p_entry,
             "p_signal": signal.p_signal,
             "edge_pct": round(signal.edge_pct, 2),
+            "spread_pct": signal.spread_pct,
             "secs_to_res": signal.secs_to_res,
             "reason": signal.reason,
         })

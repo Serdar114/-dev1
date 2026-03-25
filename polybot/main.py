@@ -37,14 +37,14 @@ def p(msg: str) -> None:
 
 import logger as log_module
 from binance_feed import BinanceFeed
-from market_discovery import discover_market, get_orderbook_midpoint, get_market_fee_rate
+from polymarket_feed import PolymarketFeed
+from market_discovery import discover_market
 from signal_engine import SignalEngine
 from risk_manager import RiskManager
 from paper_trader import PaperTrader
 
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
-POLL_INTERVAL = 5  # saniye
 
 
 def load_config(path: Path = CONFIG_PATH) -> dict:
@@ -68,18 +68,97 @@ class PolyBot:
             ws_url=config.get("binance_ws", "wss://stream.binance.com:9443/ws/btcusdt@bookTicker"),
             open_price_capture_secs=config.get("open_price_capture_secs", 5),
         )
+        self.pm_feed = PolymarketFeed()
         self.signal_engine = SignalEngine(config)
         self.risk_manager = RiskManager(config)
         self.paper_trader = PaperTrader(config, risk_manager=self.risk_manager)
 
         self._running = False
+        # Tick-driven state (pencere süresince geçerli)
+        self._window_active = False
+        self._window_token_up: str = ""
+        self._window_token_down: str = ""
+        self._window_ts: int = 0
+        self._signal_sent = False
 
-    async def _on_new_price(self, mid: float) -> None:
-        """Binance subscriber callback — her tick'te çağrılır."""
-        pass  # main loop poll ediyor
+    async def _on_btc_tick(self, btc_mid: float) -> None:
+        """
+        Binance bookTicker tick callback — her tick'te çağrılır.
+        Entry window açıksa signal değerlendir, trade aç.
+        """
+        if not self._window_active or self._signal_sent:
+            return
+
+        open_price = self.feed.open_price
+        if not open_price:
+            return
+
+        divisor = 300 if self.interval == "5m" else 900
+        secs_to_res = self._window_ts + divisor - int(time.time())
+
+        book_up = self.pm_feed.get_book(self._window_token_up)
+        book_down = self.pm_feed.get_book(self._window_token_down)
+
+        signal = self.signal_engine.evaluate(
+            open_price=open_price,
+            current_price=btc_mid,
+            book_up=book_up,
+            book_down=book_down,
+            secs_to_res=secs_to_res,
+        )
+
+        # Sadece entry window'da ve önemli sinyal değişimlerinde logla
+        if signal.action != "skip" or signal.reason not in ("outside_entry_window", "no_orderbook"):
+            p(f"[tick] secs={secs_to_res} delta={signal.delta_pct:.3f}% "
+              f"spread={signal.spread_pct:.1f}% action={signal.action} reason={signal.reason}")
+            await self.signal_engine.log_signal(signal)
+
+        if signal.action == "skip":
+            return
+
+        # Trade aç
+        can_trade, trade_reason = self.risk_manager.can_trade()
+        if not can_trade:
+            p(f"[tick] trade_blocked: {trade_reason}")
+            return
+
+        direction = signal.direction
+        p_entry = signal.p_entry
+        shares = self.risk_manager.get_shares()
+
+        pos = self.paper_trader.open_position(
+            direction=direction,
+            shares=shares,
+            p_entry=p_entry,
+            open_price=open_price,
+            window_ts=self._window_ts,
+        )
+        self._signal_sent = True
+        p(f"[TRADE] {pos.trade_id} dir={direction} shares={shares} "
+          f"p={p_entry:.4f} edge={signal.edge_pct:.2f}% spread={signal.spread_pct:.1f}%")
+        await log_module.log("trade_opened", {
+            "trade_id": pos.trade_id,
+            "mode": self.mode,
+            "direction": direction,
+            "shares": shares,
+            "p_entry": p_entry,
+            "p_bid": self.pm_feed.get_book(
+                self._window_token_up if direction == "up" else self._window_token_down
+            ).bid if self.pm_feed.get_book(
+                self._window_token_up if direction == "up" else self._window_token_down
+            ) else 0,
+            "spread_pct": signal.spread_pct,
+            "signal_p": signal.p_signal,
+            "edge_pct": round(signal.edge_pct, 2),
+            "delta_pct": round(signal.delta_pct, 4),
+            "btc_open": open_price,
+            "btc_current": btc_mid,
+            "secs_to_res": secs_to_res,
+            **self.risk_manager.summary(),
+        })
 
     async def _run_window(self) -> None:
-        """Tek bir 5m pencereyi işle."""
+        """Tek bir 5m pencereyi işle — tick-driven, polling yok."""
         p("[window] market discovery başlıyor...")
         market = await discover_market(
             interval=self.interval,
@@ -88,117 +167,80 @@ class PolyBot:
         )
 
         if not market:
-            p("[window] SKIP: market bulunamadı")
+            p("[window] SKIP: market bulunamadı veya <60s kaldı")
             log_module.log_sync("window_skip", {"reason": "no_market_found"})
             return
 
         p(f"[window] market bulundu: {market['slug']} secs_to_res={market['secs_to_resolution']}")
 
-        token_up = market["token_up"]
-        token_down = market["token_down"]
-        clob_base = self.config.get("clob_api_base", "https://clob.polymarket.com")
+        # Pencere state'ini callback için ayarla
+        self._window_token_up = market["token_up"]
+        self._window_token_down = market["token_down"]
+        self._window_ts = market["window_ts"]
+        self._signal_sent = False
 
+        # Polymarket feed → bu pencereye subscribe ol
+        p(f"[window] Polymarket WS subscribe: up={market['token_up'][:16]}... down={market['token_down'][:16]}...")
+        await self.pm_feed.resubscribe([market["token_up"], market["token_down"]])
+
+        # Orderbook ilk snapshot'ını bekle (max 5s)
+        book_up = await self.pm_feed.wait_for_book(market["token_up"], timeout=5.0)
+        if book_up:
+            p(f"[window] PM orderbook hazır: up bid={book_up.bid} ask={book_up.ask} spread={book_up.spread_pct:.1f}%")
+        else:
+            p("[window] UYARI: 5s içinde PM orderbook gelmedi, devam ediliyor")
+
+        # Open price capture
         self.feed.mark_window_open()
-        p("[window] open_price capture başladı (ilk 5s Binance mid)")
-
-        # Feed bağlıysa ama open_price capture penceresi kaçtıysa: mevcut mid'i fallback yap
-        await asyncio.sleep(0.2)  # tick'in işlenmesi için kısa fırsat
+        await asyncio.sleep(0.2)
         if self.feed.open_price is None and self.feed.mid is not None:
             self.feed._open_price = self.feed.mid
-            p(f"[window] open_price fallback: btc_open={self.feed.mid:.2f} (WS geç bağlandı)")
+            p(f"[window] open_price fallback: btc_open={self.feed.mid:.2f}")
             await log_module.log("open_price_fallback", {"btc_open": self.feed.mid})
 
-        signal_sent = False
-        poll_count = 0
+        # Pencere aktif — tick callback'ler artık sinyal değerlendirecek
+        self._window_active = True
+        p("[window] pencere aktif, Binance tick callback devreye girdi")
 
+        divisor = 300 if self.interval == "5m" else 900
+        last_status_secs = 999
+
+        # Pencere kapanana kadar bekle (sadece durum logu, sinyal callback'te)
         while self._running:
-            secs_to_res = market["window_ts"] + (300 if self.interval == "5m" else 900) - int(time.time())
+            secs_to_res = self._window_ts + divisor - int(time.time())
 
             if secs_to_res <= 0:
-                p("[window] pencere kapandı (secs_to_res=0)")
+                p("[window] pencere kapandı")
                 break
 
-            can_trade, trade_reason = self.risk_manager.can_trade()
-
-            if not can_trade:
-                p(f"[window] trade_blocked: {trade_reason}")
-                log_module.log_sync("trade_blocked", {
-                    "reason": trade_reason,
-                    "secs_to_res": secs_to_res,
-                })
-                if self.risk_manager.is_killed:
-                    self._running = False
-                    return
+            if self.risk_manager.is_killed:
+                self._running = False
                 break
 
-            open_price = self.feed.open_price
-            current_price = self.feed.mid
-            poll_count += 1
+            # Her 30s'de bir durum satırı
+            if last_status_secs - secs_to_res >= 30:
+                book = self.pm_feed.get_book(market["token_up"])
+                spread_str = f"spread={book.spread_pct:.1f}%" if book else "spread=?"
+                p(f"[window] secs={secs_to_res} btc={self.feed.mid} "
+                  f"delta={((self.feed.mid or 0) - (self.feed.open_price or 0)) / max(self.feed.open_price or 1, 1) * 100:.3f}% "
+                  f"{spread_str} signal_sent={self._signal_sent}")
+                last_status_secs = secs_to_res
 
-            if poll_count % 3 == 1:  # her ~15s bir durum satırı
-                p(f"[window] secs_to_res={secs_to_res} btc_open={open_price} btc_mid={current_price} signal_sent={signal_sent}")
+            await asyncio.sleep(1)
 
-            # Entry window'a 60s kala midpoint sorgulamaya başla (API israfını önle)
-            entry_approach = secs_to_res <= (self.signal_engine.entry_window_start + 15)
+        # Pencereyi kapat
+        self._window_active = False
 
-            if not signal_sent and open_price and current_price and entry_approach:
-                p(f"[window] midpoint sorgulanıyor... (secs_to_res={secs_to_res})")
-                p_up = await get_orderbook_midpoint(token_up, clob_base)
-                p_down = await get_orderbook_midpoint(token_down, clob_base)
-                p(f"[window] midpoint: up={p_up} down={p_down}")
-
-                if p_up and p_down:
-                    signal = self.signal_engine.evaluate(
-                        open_price=open_price,
-                        current_price=current_price,
-                        p_entry_up=p_up,
-                        p_entry_down=p_down,
-                        secs_to_res=secs_to_res,
-                    )
-                    await self.signal_engine.log_signal(signal)
-                    p(f"[signal] action={signal.action} direction={signal.direction} delta={signal.delta_pct:.3f}% edge={signal.edge_pct:.2f}% reason={signal.reason}")
-
-                    if signal.action != "skip":
-                        shares = self.risk_manager.get_shares()
-                        direction = signal.direction
-                        p_entry = p_up if direction == "up" else p_down
-
-                        pos = self.paper_trader.open_position(
-                            direction=direction,
-                            shares=shares,
-                            p_entry=p_entry,
-                            open_price=open_price,
-                            window_ts=market["window_ts"],
-                        )
-                        p(f"[TRADE] {pos.trade_id} dir={direction} shares={shares} p={p_entry:.4f} edge={signal.edge_pct:.2f}%")
-                        await log_module.log("trade_opened", {
-                            "trade_id": pos.trade_id,
-                            "mode": self.mode,
-                            "direction": direction,
-                            "shares": shares,
-                            "p_entry": p_entry,
-                            "signal_p": signal.p_signal,
-                            "edge_pct": round(signal.edge_pct, 2),
-                            "delta_pct": round(signal.delta_pct, 4),
-                            "btc_open": open_price,
-                            "btc_current": current_price,
-                            "secs_to_res": secs_to_res,
-                            **self.risk_manager.summary(),
-                        })
-                        signal_sent = True
-
-            await asyncio.sleep(POLL_INTERVAL)
-
-        # Pencere kapandı → resolve
+        # Resolve
         open_pos = self.paper_trader.open_positions()
         if open_pos:
             wait = self.config.get("resolve_confirm_secs", 130)
-            p(f"[resolve] {len(open_pos)} pozisyon bekliyor, {wait}s Chainlink konfirmasyonu...")
+            p(f"[resolve] {len(open_pos)} pozisyon, {wait}s bekleniyor...")
             await self.paper_trader.resolve_pending(wait_secs=wait)
             await self.risk_manager.log_state()
             p(f"[resolve] tamamlandı — total_pnl={self.paper_trader.total_pnl():.4f} USDC")
         else:
-            p("[window] bu pencerede açık pozisyon yok, resolve atlandı")
+            p("[window] bu pencerede açık pozisyon yok")
 
     async def run(self, run_once: bool = False) -> None:
         self._running = True
@@ -211,7 +253,7 @@ class PolyBot:
 
         # Binance feed başlat
         p("[run] Binance WebSocket feed başlatılıyor...")
-        self.feed.subscribe(self._on_new_price)
+        self.feed.subscribe(self._on_btc_tick)
         feed_task = self.feed.start()
         p("[run] feed task oluşturuldu, ilk tick bekleniyor (max 8s)...")
         first_mid = await self.feed.wait_for_mid(timeout=8.0)
@@ -219,6 +261,10 @@ class PolyBot:
             p(f"[run] Binance bağlandı — BTC mid={first_mid:.2f}")
         else:
             p("[run] UYARI: 8s içinde Binance tick gelmedi, devam ediliyor")
+
+        # Polymarket WS feed başlat
+        p("[run] Polymarket CLOB WebSocket feed başlatılıyor...")
+        pm_task = self.pm_feed.start()
 
         try:
             while self._running:
@@ -254,7 +300,9 @@ class PolyBot:
         except asyncio.CancelledError:
             pass
         finally:
+            self._window_active = False
             await self.feed.stop()
+            await self.pm_feed.stop()
             summary = self.risk_manager.summary()
             total_pnl = round(self.paper_trader.total_pnl(), 4)
             p(f"[run] bot_stop total_pnl={total_pnl} bankroll={summary.get('bankroll')}")
