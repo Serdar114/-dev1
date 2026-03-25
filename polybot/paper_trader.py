@@ -38,15 +38,16 @@ class PaperPosition:
     interval: str = "5m"
     # resolve sonrası
     resolved: bool = False
+    resolution_blocked: bool = False  # True = truth layer resolve edemedi
     btc_close: float = 0.0
-    winning_side: str = ""   # "up" | "down"
-    result: str = ""         # "win_up" | "win_down"
-    pnl: float = 0.0         # shares * net_edge
+    winning_side: str = ""   # "up" | "down" | ""
+    result: str = ""         # "win_up" | "win_down" | "unresolved"
+    pnl: float = 0.0         # shares * net_edge (unresolved ise 0.0)
     # resolution truth fields
-    winner_source: str = ""              # "binance" (şimdilik)
-    winner_binance: str = ""             # "up" | "down"
+    winner_source: str = ""              # "binance" | "none"
+    winner_binance: str = ""             # "up" | "down" | "unknown"
     winner_chainlink: str = ""           # "up" | "down" | "unknown"
-    resolution_truth_status: str = ""    # "binance_only" | "dual_verified" | "dual_mismatch"
+    resolution_truth_status: str = ""    # "binance_only" | "dual_verified" | "dual_mismatch" | "unresolved_fetch_error"
     resolution_match: str = ""           # "match" | "mismatch" | "unknown"
     chainlink_status: str = ""           # "fetched" | "placeholder" | "error"
 
@@ -113,7 +114,39 @@ class PaperTrader:
                     btc_open=pos.btc_open,
                 )
 
-                # Winner: şimdilik Binance (tek aktif kaynak)
+                # Truth fields — her durumda doldur
+                pos.winner_source = truth.winner_source
+                pos.winner_binance = truth.winner_binance
+                pos.winner_chainlink = truth.winner_chainlink
+                pos.resolution_truth_status = truth.resolution_truth_status
+                pos.resolution_match = truth.resolution_match
+                pos.chainlink_status = truth.chainlink_status
+
+                # Fetch başarısız → trade'i final olarak kapatma
+                if truth.winner_source == "none" or truth.winner_binance == "unknown":
+                    pos.resolution_blocked = True
+                    pos.result = "unresolved"
+                    pos.pnl = 0.0
+                    pos.btc_close = 0.0
+                    pos.winning_side = ""
+                    # resolved=False kalır — trade hâlâ açık sayılır
+
+                    await log_module.log("trade_resolution_blocked", {
+                        "trade_id": pos.trade_id,
+                        "timestamp": time.time(),
+                        "window": pos.window_ts,
+                        "interval": pos.interval,
+                        "btc_open": pos.btc_open,
+                        "resolution_truth_status": truth.resolution_truth_status,
+                        "winner_source": truth.winner_source,
+                        "winner_binance": truth.winner_binance,
+                        "chainlink_status": truth.chainlink_status,
+                        "note": "Truth layer could not determine winner. "
+                                "Trade NOT finalized. No PnL assigned.",
+                    })
+                    continue
+
+                # Valid winner var — trade'i finalize et
                 winning_side = truth.winner_binance
                 result = f"win_{winning_side}"
 
@@ -125,13 +158,6 @@ class PaperTrader:
                 pos.winning_side = winning_side
                 pos.result = result
                 pos.pnl = pnl
-                # Truth fields
-                pos.winner_source = truth.winner_source
-                pos.winner_binance = truth.winner_binance
-                pos.winner_chainlink = truth.winner_chainlink
-                pos.resolution_truth_status = truth.resolution_truth_status
-                pos.resolution_match = truth.resolution_match
-                pos.chainlink_status = truth.chainlink_status
 
                 if self.risk_manager:
                     self.risk_manager.on_trade_result(pnl)
@@ -150,7 +176,6 @@ class PaperTrader:
                     "btc_close": pos.btc_close,
                     "result": pos.result,
                     "pnl": pos.pnl,
-                    # resolution truth fields
                     "winner_source": pos.winner_source,
                     "winner_binance": pos.winner_binance,
                     "winner_chainlink": pos.winner_chainlink,
@@ -176,12 +201,17 @@ class PaperTrader:
     def total_pnl(self) -> float:
         return sum(pos.pnl for pos in self._positions if pos.resolved)
 
+    def unresolved_positions(self) -> list[PaperPosition]:
+        """Resolution blocked olan pozisyonlar."""
+        return [pos for pos in self._positions if pos.resolution_blocked]
+
     def summary_stats(self) -> dict:
         """10 pencere sonunda rapor için istatistikler."""
         resolved = [pos for pos in self._positions if pos.resolved]
+        blocked = [pos for pos in self._positions if pos.resolution_blocked]
         if not resolved:
             return {"trades": 0, "total_pnl": 0.0, "avg_net_edge": 0.0,
-                    "win_up": 0, "win_down": 0}
+                    "win_up": 0, "win_down": 0, "unresolved": len(blocked)}
         total_pnl = sum(pos.pnl for pos in resolved)
         avg_edge = sum(pos.net_edge for pos in resolved) / len(resolved)
         win_up = sum(1 for pos in resolved if pos.result == "win_up")
@@ -193,5 +223,6 @@ class PaperTrader:
             "avg_pnl_per_trade": round(total_pnl / len(resolved), 4),
             "win_up": win_up,
             "win_down": win_down,
+            "unresolved": len(blocked),
             "dual_fill_rate": "100%",  # paper modda her zaman %100
         }

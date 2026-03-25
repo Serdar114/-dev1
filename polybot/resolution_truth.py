@@ -35,8 +35,9 @@ class ResolutionResult:
 
     # Binance layer
     btc_open: float
-    btc_close_binance: float
-    winner_binance: str          # "up" | "down"
+    btc_close_binance: float     # 0.0 = fetch başarısız
+    binance_fetch_ok: bool       # True = gerçek fiyat alındı
+    winner_binance: str          # "up" | "down" | "unknown"
 
     # Chainlink layer — PLACEHOLDER
     btc_close_chainlink: float   # 0.0 = henüz fetch edilmedi
@@ -45,8 +46,8 @@ class ResolutionResult:
 
     # Karşılaştırma
     resolution_match: str        # "match" | "mismatch" | "unknown"
-    winner_source: str           # "binance" (şimdilik tek aktif kaynak)
-    resolution_truth_status: str # "binance_only" | "dual_verified" | "dual_mismatch"
+    winner_source: str           # "binance" | "none"
+    resolution_truth_status: str # "binance_only" | "dual_verified" | "dual_mismatch" | "unresolved_fetch_error"
 
     resolve_ts: float            # bu sonucun üretildiği unix ts
 
@@ -66,10 +67,11 @@ def _determine_winner(btc_open: float, btc_close: float) -> str:
     return "down"
 
 
-async def _fetch_btc_close_binance(btc_open_fallback: float) -> tuple[float, bool]:
+async def _fetch_btc_close_binance() -> tuple[float, bool]:
     """
     Binance REST anlık BTC fiyatı.
     Returns: (price, success)
+    Fetch başarısızsa (0.0, False) döner — sahte fallback KULLANILMAZ.
     """
     try:
         async with aiohttp.ClientSession() as session:
@@ -79,10 +81,19 @@ async def _fetch_btc_close_binance(btc_open_fallback: float) -> tuple[float, boo
             ) as r:
                 if r.status == 200:
                     data = await r.json()
-                    return float(data["price"]), True
+                    price = float(data["price"])
+                    if price > 0:
+                        return price, True
+                    await log_module.log("resolution_binance_invalid_price", {
+                        "price": price,
+                    })
+                else:
+                    await log_module.log("resolution_binance_http_error", {
+                        "status": r.status,
+                    })
     except Exception as e:
         await log_module.log("resolution_binance_fetch_error", {"error": str(e)})
-    return btc_open_fallback, False
+    return 0.0, False
 
 
 async def _fetch_btc_close_chainlink(
@@ -130,14 +141,17 @@ async def resolve_truth(
     round_start, round_end = _compute_round_timestamps(window_ts, interval)
 
     # --- Layer 1: Binance ---
-    btc_close_binance, binance_ok = await _fetch_btc_close_binance(btc_open)
-    winner_binance = _determine_winner(btc_open, btc_close_binance)
+    btc_close_binance, binance_ok = await _fetch_btc_close_binance()
 
-    if not binance_ok:
-        await log_module.log("resolution_binance_fallback", {
+    if binance_ok:
+        winner_binance = _determine_winner(btc_open, btc_close_binance)
+    else:
+        # Fetch başarısız — sahte winner üretme
+        winner_binance = "unknown"
+        await log_module.log("resolution_binance_fetch_failed", {
             "window_ts": window_ts,
-            "using": "btc_open",
-            "price": btc_open,
+            "btc_open": btc_open,
+            "note": "Binance close fetch failed. No fallback used. Winner = unknown.",
         })
 
     # --- Layer 2: Chainlink (PLACEHOLDER) ---
@@ -146,7 +160,14 @@ async def resolve_truth(
     )
 
     # --- Karşılaştırma ---
-    if chainlink_status == "fetched" and winner_chainlink != "unknown":
+    # Binance başarısız → hiçbir kaynak yok → unresolved
+    if not binance_ok:
+        resolution_match = "unknown"
+        winner_source = "none"
+        resolution_truth_status = "unresolved_fetch_error"
+    elif chainlink_status == "fetched" and winner_chainlink != "unknown":
+        # İki kaynak da var → karşılaştır
+        winner_source = "binance"
         if winner_binance == winner_chainlink:
             resolution_match = "match"
             resolution_truth_status = "dual_verified"
@@ -154,7 +175,9 @@ async def resolve_truth(
             resolution_match = "mismatch"
             resolution_truth_status = "dual_mismatch"
     else:
+        # Binance var, Chainlink yok/placeholder
         resolution_match = "unknown"
+        winner_source = "binance"
         resolution_truth_status = "binance_only"
 
     result = ResolutionResult(
@@ -164,12 +187,13 @@ async def resolve_truth(
         round_end_ts=round_end,
         btc_open=btc_open,
         btc_close_binance=round(btc_close_binance, 2),
+        binance_fetch_ok=binance_ok,
         winner_binance=winner_binance,
         btc_close_chainlink=round(btc_close_chainlink, 2),
         winner_chainlink=winner_chainlink,
         chainlink_status=chainlink_status,
         resolution_match=resolution_match,
-        winner_source="binance",
+        winner_source=winner_source,
         resolution_truth_status=resolution_truth_status,
         resolve_ts=time.time(),
     )
@@ -181,6 +205,7 @@ async def resolve_truth(
         "round_end_ts": result.round_end_ts,
         "btc_open": result.btc_open,
         "btc_close_binance": result.btc_close_binance,
+        "binance_fetch_ok": result.binance_fetch_ok,
         "winner_binance": result.winner_binance,
         "btc_close_chainlink": result.btc_close_chainlink,
         "winner_chainlink": result.winner_chainlink,
