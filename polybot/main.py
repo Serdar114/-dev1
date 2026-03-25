@@ -101,6 +101,13 @@ class PolyBot:
         self.feed.mark_window_open()
         p("[window] open_price capture başladı (ilk 5s Binance mid)")
 
+        # Feed bağlıysa ama open_price capture penceresi kaçtıysa: mevcut mid'i fallback yap
+        await asyncio.sleep(0.2)  # tick'in işlenmesi için kısa fırsat
+        if self.feed.open_price is None and self.feed.mid is not None:
+            self.feed._open_price = self.feed.mid
+            p(f"[window] open_price fallback: btc_open={self.feed.mid:.2f} (WS geç bağlandı)")
+            await log_module.log("open_price_fallback", {"btc_open": self.feed.mid})
+
         signal_sent = False
         poll_count = 0
 
@@ -203,7 +210,12 @@ class PolyBot:
         p("[run] Binance WebSocket feed başlatılıyor...")
         self.feed.subscribe(self._on_new_price)
         feed_task = self.feed.start()
-        p("[run] feed task oluşturuldu, bağlantı bekleniyor...")
+        p("[run] feed task oluşturuldu, ilk tick bekleniyor (max 8s)...")
+        first_mid = await self.feed.wait_for_mid(timeout=8.0)
+        if first_mid:
+            p(f"[run] Binance bağlandı — BTC mid={first_mid:.2f}")
+        else:
+            p("[run] UYARI: 8s içinde Binance tick gelmedi, devam ediliyor")
 
         try:
             while self._running:

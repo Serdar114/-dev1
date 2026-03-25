@@ -100,6 +100,18 @@ class BinanceFeed:
                 await log_module.log("binance_ws_reconnect", {"delay": RECONNECT_DELAY})
                 await asyncio.sleep(RECONNECT_DELAY)
 
+    async def wait_for_mid(self, timeout: float = 8.0) -> float | None:
+        """
+        İlk Binance tick'ini bekle (max timeout saniye).
+        Bağlantı gelmezse None döndür.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._mid is not None:
+                return self._mid
+            await asyncio.sleep(0.1)
+        return None
+
     def start(self) -> asyncio.Task:
         """Event loop'a task olarak ekle."""
         self._task = asyncio.create_task(self.run())
