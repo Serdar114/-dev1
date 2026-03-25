@@ -88,20 +88,16 @@ class PolyBot:
     async def _on_btc_tick(self, btc_mid: float) -> None:
         """
         Binance bookTicker tick callback — her tick'te çağrılır.
-        Entry window açıksa signal değerlendir, trade aç.
+        Dual side capture: BTC yönü değil, pair_sum kontrol edilir.
         """
         if not self._window_active or self._signal_sent:
             return
 
-        # Tick throttle — Binance ~100ms tick, aynı saniyede max 1 değerlendirme
+        # Tick throttle — aynı saniyede max 1 değerlendirme
         current_sec = int(time.time())
         if current_sec == self._last_eval_sec:
             return
         self._last_eval_sec = current_sec
-
-        open_price = self.feed.open_price
-        if not open_price:
-            return
 
         divisor = 300 if self.interval == "5m" else 900
         secs_to_res = self._window_ts + divisor - int(time.time())
@@ -110,17 +106,15 @@ class PolyBot:
         book_down = self.pm_feed.get_book(self._window_token_down)
 
         signal = self.signal_engine.evaluate(
-            open_price=open_price,
-            current_price=btc_mid,
             book_up=book_up,
             book_down=book_down,
             secs_to_res=secs_to_res,
         )
 
-        # Sadece entry window'da ve önemli sinyal değişimlerinde logla
+        # Sadece entry window'da ve anlamlı sinyallerde logla
         if signal.action != "skip" or signal.reason not in ("outside_entry_window", "no_orderbook"):
-            p(f"[tick] secs={secs_to_res} delta={signal.delta_pct:.3f}% "
-              f"spread={signal.spread_pct:.1f}% action={signal.action} reason={signal.reason}")
+            p(f"[tick] secs={secs_to_res} pair_sum={signal.pair_sum:.4f} "
+              f"net_edge={signal.net_edge:.4f} action={signal.action} reason={signal.reason}")
             await self.signal_engine.log_signal(signal)
 
         if signal.action == "skip":
@@ -132,32 +126,29 @@ class PolyBot:
             p(f"[tick] trade_blocked: {trade_reason}")
             return
 
-        direction = signal.direction
-        entry_ask = signal.entry_ask
-        shares = self.risk_manager.get_shares()
+        shares = self.config.get("shares_per_side", 5)
+        btc_open = self.feed.open_price or btc_mid
 
         pos = self.paper_trader.open_position(
-            direction=direction,
+            up_ask=signal.up_ask,
+            down_ask=signal.down_ask,
             shares=shares,
-            entry_ask=entry_ask,
-            btc_open=open_price,
+            btc_open=btc_open,
             window_ts=self._window_ts,
         )
         self._signal_sent = True
-        p(f"[TRADE] {pos.trade_id} dir={direction} shares={shares} "
-          f"ask={entry_ask:.4f} net_pnl_win={signal.net_pnl_win:.4f} spread={signal.spread_pct:.1f}%")
+        p(f"[DUAL] {pos.trade_id} up_ask={signal.up_ask:.4f} down_ask={signal.down_ask:.4f} "
+          f"pair_sum={signal.pair_sum:.4f} net_edge={signal.net_edge:.4f} shares={shares}")
         await log_module.log("trade_opened", {
             "trade_id": pos.trade_id,
             "mode": self.mode,
-            "direction": direction,
+            "strategy": "dual_side_capture",
+            "up_ask": signal.up_ask,
+            "down_ask": signal.down_ask,
+            "pair_sum": signal.pair_sum,
+            "net_edge": signal.net_edge,
             "shares": shares,
-            "entry_ask": entry_ask,
-            "fee": signal.fee,
-            "net_pnl_win": signal.net_pnl_win,
-            "spread_pct": signal.spread_pct,
-            "delta_pct": round(signal.delta_pct, 4),
-            "btc_open": open_price,
-            "btc_current": btc_mid,
+            "btc_open": btc_open,
             "secs_to_res": secs_to_res,
             **self.risk_manager.summary(),
         })
@@ -224,11 +215,16 @@ class PolyBot:
 
             # Her 30s'de bir durum satırı
             if last_status_secs - secs_to_res >= 30:
-                book = self.pm_feed.get_book(market["token_up"])
-                spread_str = f"spread={book.spread_pct:.1f}%" if book else "spread=?"
-                p(f"[window] secs={secs_to_res} btc={self.feed.mid} "
-                  f"delta={((self.feed.mid or 0) - (self.feed.open_price or 0)) / max(self.feed.open_price or 1, 1) * 100:.3f}% "
-                  f"{spread_str} signal_sent={self._signal_sent}")
+                bu = self.pm_feed.get_book(market["token_up"])
+                bd = self.pm_feed.get_book(market["token_down"])
+                if bu and bd:
+                    pair_sum = round(bu.ask + bd.ask, 4)
+                    p(f"[window] secs={secs_to_res} pair_sum={pair_sum:.4f} "
+                      f"net_edge={round(1-pair_sum,4):.4f} "
+                      f"spread_up={bu.spread_pct:.1f}% spread_down={bd.spread_pct:.1f}% "
+                      f"signal_sent={self._signal_sent}")
+                else:
+                    p(f"[window] secs={secs_to_res} orderbook=? signal_sent={self._signal_sent}")
                 last_status_secs = secs_to_res
 
             await asyncio.sleep(1)
@@ -310,10 +306,15 @@ class PolyBot:
             await self.pm_feed.stop()
             summary = self.risk_manager.summary()
             total_pnl = round(self.paper_trader.total_pnl(), 4)
+            stats = self.paper_trader.summary_stats()
             p(f"[run] bot_stop total_pnl={total_pnl} bankroll={summary.get('bankroll')}")
+            p(f"[RAPOR] trades={stats['trades']} total_pnl={stats['total_pnl']} "
+              f"avg_edge={stats['avg_net_edge']} "
+              f"win_up={stats['win_up']} win_down={stats['win_down']}")
             log_module.log_sync("bot_stop", {
                 "total_pnl": total_pnl,
                 **summary,
+                **stats,
             })
 
 
