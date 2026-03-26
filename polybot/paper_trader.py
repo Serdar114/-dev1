@@ -59,6 +59,9 @@ class PaperPosition:
     resolution_truth_status: str = ""    # "binance_only" | "dual_verified" | "dual_mismatch" | "unresolved_fetch_error"
     resolution_match: str = ""           # "match" | "mismatch" | "unknown"
     chainlink_status: str = ""           # "fetched" | "placeholder" | "error"
+    # fee source visibility
+    fee_source: str = ""           # "config" | "fallback" | "market_discovery" | "unknown"
+    fee_status: str = ""           # "configured" | "fallback_used" | "unproven"
     # unresolved lifecycle tracking
     resolution_retry_count: int = 0
     first_resolution_failure_ts: float = 0.0
@@ -69,8 +72,21 @@ class PaperTrader:
     def __init__(self, config: dict, risk_manager=None):
         self.resolve_confirm_secs: int = config.get("resolve_confirm_secs", 130)
         self.shares_per_side: int = config.get("shares_per_side", 5)
+
+        # Fee source detection — config'de açıkça var mı, yoksa fallback mı?
+        fee_rate_configured = "fee_rate" in config
+        fee_exponent_configured = "fee_exponent" in config
+
         self.fee_rate: float = config.get("fee_rate", 0.072)
         self.fee_exponent: float = config.get("fee_exponent", 1.0)
+
+        if fee_rate_configured:
+            self.fee_source: str = "config"
+            self.fee_status: str = "configured"
+        else:
+            self.fee_source: str = "fallback"
+            self.fee_status: str = "fallback_used"
+
         self._positions: list[PaperPosition] = []
         self._counter: int = 0
         self.risk_manager = risk_manager
@@ -110,6 +126,8 @@ class PaperTrader:
             fee_total=fee_total,
             fee_rate=self.fee_rate,
             fee_exponent=self.fee_exponent,
+            fee_source=self.fee_source,
+            fee_status=self.fee_status,
         )
         self._positions.append(pos)
 
@@ -217,6 +235,8 @@ class PaperTrader:
                     "fee_total": pos.fee_total,
                     "fee_rate": pos.fee_rate,
                     "fee_exponent": pos.fee_exponent,
+                    "fee_source": pos.fee_source,
+                    "fee_status": pos.fee_status,
                     "gross_pnl": pos.gross_pnl,
                     "net_pnl": pos.net_pnl,
                     "winner_source": pos.winner_source,
@@ -251,9 +271,11 @@ class PaperTrader:
 
     def summary_stats(self) -> dict:
         """10 pencere sonunda rapor için istatistikler."""
-        resolved = [pos for pos in self._positions if pos.resolved]
-        blocked = [pos for pos in self._positions if pos.resolution_blocked]
+        all_pos = self._positions
+        resolved = [pos for pos in all_pos if pos.resolved]
+        blocked = [pos for pos in all_pos if pos.resolution_blocked]
         max_retry = max((pos.resolution_retry_count for pos in blocked), default=0)
+        fallback_count = sum(1 for pos in all_pos if pos.fee_source == "fallback")
         if not resolved:
             return {
                 "trades": 0,
@@ -263,6 +285,9 @@ class PaperTrader:
                 "unresolved_count": len(blocked),
                 "blocked_resolution_count": len(blocked),
                 "max_resolution_retry_count": max_retry,
+                "fee_source": self.fee_source,
+                "fee_status": self.fee_status,
+                "fallback_fee_usage_count": fallback_count,
             }
         total_gross = sum(pos.gross_pnl for pos in resolved)
         total_fee = sum(pos.fee_total for pos in resolved)
@@ -283,5 +308,8 @@ class PaperTrader:
             "unresolved_count": len(blocked),
             "blocked_resolution_count": len(blocked),
             "max_resolution_retry_count": max_retry,
+            "fee_source": self.fee_source,
+            "fee_status": self.fee_status,
+            "fallback_fee_usage_count": fallback_count,
             "dual_fill_rate": "100%",  # paper modda her zaman %100
         }

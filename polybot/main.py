@@ -151,6 +151,8 @@ class PolyBot:
             "shares": shares,
             "btc_open": btc_open,
             "secs_to_res": secs_to_res,
+            "fee_source": self.paper_trader.fee_source,
+            "fee_status": self.paper_trader.fee_status,
             **self.risk_manager.summary(),
         })
 
@@ -253,6 +255,10 @@ class PolyBot:
             "mode": self.mode,
             "market_type": self.interval,
             "bankroll": self.config.get("bankroll", 30.0),
+            "fee_rate": self.paper_trader.fee_rate,
+            "fee_exponent": self.paper_trader.fee_exponent,
+            "fee_source": self.paper_trader.fee_source,
+            "fee_status": self.paper_trader.fee_status,
         })
 
         # Binance feed başlat
@@ -319,7 +325,10 @@ class PolyBot:
               f"avg_edge={stats['avg_net_edge']} "
               f"win_up={stats['win_up']} win_down={stats['win_down']} "
               f"unresolved={stats.get('unresolved_count', 0)} "
-              f"max_retry={stats.get('max_resolution_retry_count', 0)}")
+              f"max_retry={stats.get('max_resolution_retry_count', 0)} "
+              f"fee_source={stats.get('fee_source', 'unknown')} "
+              f"fee_status={stats.get('fee_status', 'unknown')} "
+              f"fallback_fee={stats.get('fallback_fee_usage_count', 0)}")
             log_module.log_sync("bot_stop", {
                 "net_pnl": net_pnl,
                 **summary,
