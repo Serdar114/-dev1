@@ -91,6 +91,7 @@ class PaperTrader:
         # Market discovery fee attempt tracking
         self._market_fee_attempted: bool = False
         self._market_fee_ok: bool = False
+        self._market_fee_status: str = "not_attempted"
 
         # Execution lane — paper mode always simulates taker fills at ask, 100% fill
         self.execution_lane: str = "taker_paper"
@@ -102,58 +103,67 @@ class PaperTrader:
     async def try_update_fee_from_market(self, token_id: str) -> dict:
         """
         Market discovery'den fee rate çekmeyi dene.
-        Başarılı → fee_source/fee_status güncelle.
-        Başarısız → mevcut kaynağı koru, dürüst status üret.
-        Döndürür: {"attempted": bool, "ok": bool, "market_fee_rate": float|None, "note": str}
+
+        Epistemik kural:
+          - verified_remote=True  → fee_source="market_discovery", fee_rate güncellenir
+          - verified_remote=False → fee_source DEĞİŞMEZ (config/fallback kalır)
+          - Her iki durumda da deneme kaydedilir: market_fee_attempted, market_fee_status
+
+        Döndürür: {"attempted", "verified_remote", "market_fee_rate", "market_fee_status", "note"}
         """
         from market_discovery import get_market_fee_rate
         self._market_fee_attempted = True
-        result = {"attempted": True, "ok": False, "market_fee_rate": None, "note": ""}
         try:
-            market_fee = await get_market_fee_rate(token_id)
-            # get_market_fee_rate returns 0.072 on failure — no way to distinguish
-            # from real 0.072. But we check if it actually reached the endpoint.
-            # The function returns 0.072 as default, so we can't fully verify.
-            # We trust the call succeeded if no exception was raised,
-            # but mark status as unproven since we can't confirm the endpoint responded.
-            if market_fee > 0:
-                self.fee_rate = market_fee
-                self.fee_source = "market_discovery"
-                self.fee_status = "unproven_market_fee"
-                self._market_fee_ok = True
-                result["ok"] = True
-                result["market_fee_rate"] = market_fee
-                result["note"] = (
-                    "get_market_fee_rate returned a value but its internal fallback "
-                    "also returns 0.072 — cannot distinguish real response from default. "
-                    "Status set to unproven_market_fee."
-                )
-                await log_module.log("fee_market_discovery_attempt", {
-                    "token_id": token_id,
-                    "market_fee_rate": market_fee,
-                    "fee_source": self.fee_source,
-                    "fee_status": self.fee_status,
-                    "note": result["note"],
-                })
-            else:
-                result["note"] = "market_fee_rate returned 0 or negative"
-                await log_module.log("fee_market_discovery_attempt", {
-                    "token_id": token_id,
-                    "market_fee_rate": market_fee,
-                    "fee_source": self.fee_source,
-                    "fee_status": self.fee_status,
-                    "note": result["note"],
-                })
+            mkt = await get_market_fee_rate(token_id)
         except Exception as e:
-            result["note"] = f"market_discovery fetch failed: {e}"
+            # get_market_fee_rate kendi içinde exception yakalar ama
+            # import veya beklenmedik hata olabilir
+            self._market_fee_status = "import_or_unexpected_error"
             await log_module.log("fee_market_discovery_failed", {
                 "token_id": token_id,
                 "error": str(e),
-                "fee_source": self.fee_source,
-                "fee_status": self.fee_status,
-                "note": "Kept existing fee_source. Market path not proven.",
+                "effective_fee_source": self.fee_source,
+                "market_fee_status": self._market_fee_status,
             })
-        return result
+            return {
+                "attempted": True, "verified_remote": False,
+                "market_fee_rate": None,
+                "market_fee_status": self._market_fee_status,
+                "note": f"Unexpected error: {e}. Effective fee_source unchanged.",
+            }
+
+        verified = mkt["verified_remote"]
+        self._market_fee_status = mkt["status"]
+
+        if verified:
+            # CLOB gerçekten cevap verdi ve fee_rate alanı vardı → güvenilir
+            self.fee_rate = mkt["fee_rate"]
+            self.fee_source = "market_discovery"
+            self.fee_status = "market_verified"
+            self._market_fee_ok = True
+        else:
+            # CLOB cevap vermedi veya fee_rate alanı yoktu → effective source değişmez
+            # fee_source config/fallback olarak kalır — market_discovery iddia edilmez
+            self._market_fee_ok = False
+
+        await log_module.log("fee_market_discovery_attempt", {
+            "token_id": token_id,
+            "verified_remote": verified,
+            "market_fee_rate": mkt["fee_rate"],
+            "market_fee_status": mkt["status"],
+            "effective_fee_source": self.fee_source,
+            "effective_fee_status": self.fee_status,
+            "effective_fee_rate": self.fee_rate,
+            "note": mkt["note"],
+        })
+
+        return {
+            "attempted": True,
+            "verified_remote": verified,
+            "market_fee_rate": mkt["fee_rate"] if verified else None,
+            "market_fee_status": mkt["status"],
+            "note": mkt["note"],
+        }
 
     def open_position(
         self,
@@ -357,6 +367,7 @@ class PaperTrader:
                 "execution_lane": self.execution_lane,
                 "market_fee_attempted": self._market_fee_attempted,
                 "market_fee_ok": self._market_fee_ok,
+                "market_fee_status": self._market_fee_status,
             }
         total_gross = sum(pos.gross_pnl for pos in resolved)
         total_fee = sum(pos.fee_total for pos in resolved)

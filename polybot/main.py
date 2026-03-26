@@ -176,10 +176,11 @@ class PolyBot:
         # Market discovery'den fee rate çekmeyi dene (once per window)
         if not self.paper_trader._market_fee_attempted:
             fee_result = await self.paper_trader.try_update_fee_from_market(market["token_up"])
-            p(f"[window] market_fee_attempt: ok={fee_result['ok']} "
-              f"fee_source={self.paper_trader.fee_source} "
-              f"fee_status={self.paper_trader.fee_status} "
-              f"note={fee_result['note'][:80]}")
+            p(f"[window] market_fee_attempt: verified={fee_result['verified_remote']} "
+              f"market_status={fee_result['market_fee_status']} "
+              f"effective_source={self.paper_trader.fee_source} "
+              f"effective_status={self.paper_trader.fee_status} "
+              f"fee_rate={self.paper_trader.fee_rate}")
 
         # Pencere state'ini callback için ayarla
         self._window_token_up = market["token_up"]
@@ -340,7 +341,8 @@ class PolyBot:
               f"fee_status={stats.get('fee_status', 'unknown')} "
               f"fallback_fee={stats.get('fallback_fee_usage_count', 0)} "
               f"lane={stats.get('execution_lane', 'unknown')} "
-              f"market_fee_tried={stats.get('market_fee_attempted', False)}")
+              f"market_fee_tried={stats.get('market_fee_attempted', False)} "
+              f"market_fee_status={stats.get('market_fee_status', 'not_attempted')}")
             log_module.log_sync("bot_stop", {
                 "net_pnl": net_pnl,
                 **summary,

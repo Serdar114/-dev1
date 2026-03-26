@@ -191,8 +191,20 @@ async def get_orderbook_midpoint(token_id: str, clob_base: str = CLOB_BASE) -> f
     return None
 
 
-async def get_market_fee_rate(token_id: str, clob_base: str = CLOB_BASE) -> float:
-    """Market-specific fee rate'i CLOB'dan çek. Bulunamazsa 0.072 döndür."""
+async def get_market_fee_rate(token_id: str, clob_base: str = CLOB_BASE) -> dict:
+    """
+    Market-specific fee rate'i CLOB'dan çek.
+    Structured sonuç döndürür — caller gerçek cevap ile fallback'i ayırabilir.
+
+    Döndürür:
+        {
+            "fee_rate": float,           # fiilen kullanılacak değer
+            "verified_remote": bool,     # True = CLOB 200 döndü ve fee_rate alanı vardı
+            "status": str,               # "verified" | "endpoint_no_fee_field" | "http_error" | "fetch_failed"
+            "note": str,                 # insan-okunur açıklama
+        }
+    """
+    fallback = {"fee_rate": 0.072, "verified_remote": False, "status": "fetch_failed", "note": ""}
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(
@@ -202,7 +214,27 @@ async def get_market_fee_rate(token_id: str, clob_base: str = CLOB_BASE) -> floa
             ) as r:
                 if r.status == 200:
                     data = await r.json()
-                    return float(data.get("fee_rate", 0.072))
-        except Exception:
-            pass
-    return 0.072
+                    if "fee_rate" in data:
+                        return {
+                            "fee_rate": float(data["fee_rate"]),
+                            "verified_remote": True,
+                            "status": "verified",
+                            "note": f"CLOB returned fee_rate={data['fee_rate']} for token {token_id[:16]}",
+                        }
+                    else:
+                        return {
+                            "fee_rate": 0.072,
+                            "verified_remote": False,
+                            "status": "endpoint_no_fee_field",
+                            "note": f"CLOB 200 but response has no fee_rate field. keys={list(data.keys())}",
+                        }
+                else:
+                    fallback["status"] = "http_error"
+                    fallback["note"] = f"CLOB returned HTTP {r.status}"
+                    await log_module.log("fee_rate_http_error", {
+                        "token_id": token_id, "status": r.status,
+                    })
+        except Exception as e:
+            fallback["status"] = "fetch_failed"
+            fallback["note"] = f"CLOB unreachable: {e}"
+    return fallback
