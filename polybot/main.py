@@ -241,7 +241,7 @@ class PolyBot:
             await self.paper_trader.resolve_pending(wait_secs=wait)
             await self.risk_manager.log_state()
             unresolved = self.paper_trader.unresolved_positions()
-            p(f"[resolve] tamamlandı — total_pnl={self.paper_trader.total_pnl():.4f} USDC "
+            p(f"[resolve] tamamlandı — net_pnl={self.paper_trader.total_pnl():.4f} USDC "
               f"unresolved={len(unresolved)}")
         else:
             p("[window] bu pencerede açık pozisyon yok")
@@ -308,17 +308,20 @@ class PolyBot:
             await self.feed.stop()
             await self.pm_feed.stop()
             summary = self.risk_manager.summary()
-            total_pnl = round(self.paper_trader.total_pnl(), 4)
+            net_pnl = round(self.paper_trader.total_pnl(), 4)
             stats = self.paper_trader.summary_stats()
-            p(f"[run] bot_stop total_pnl={total_pnl} bankroll={summary.get('bankroll')} "
+            p(f"[run] bot_stop net_pnl={net_pnl} bankroll={summary.get('bankroll')} "
               f"unresolved={stats.get('unresolved_count', 0)}")
-            p(f"[RAPOR] trades={stats['trades']} total_pnl={stats['total_pnl']} "
+            p(f"[RAPOR] trades={stats['trades']} "
+              f"gross={stats.get('total_gross_pnl', 0.0)} "
+              f"fee={stats.get('total_fee_paid', 0.0)} "
+              f"net={stats.get('total_net_pnl', 0.0)} "
               f"avg_edge={stats['avg_net_edge']} "
               f"win_up={stats['win_up']} win_down={stats['win_down']} "
               f"unresolved={stats.get('unresolved_count', 0)} "
               f"max_retry={stats.get('max_resolution_retry_count', 0)}")
             log_module.log_sync("bot_stop", {
-                "total_pnl": total_pnl,
+                "net_pnl": net_pnl,
                 **summary,
                 **stats,
             })
