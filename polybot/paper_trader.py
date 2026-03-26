@@ -60,8 +60,10 @@ class PaperPosition:
     resolution_match: str = ""           # "match" | "mismatch" | "unknown"
     chainlink_status: str = ""           # "fetched" | "placeholder" | "error"
     # fee source visibility
-    fee_source: str = ""           # "config" | "fallback" | "market_discovery" | "unknown"
-    fee_status: str = ""           # "configured" | "fallback_used" | "unproven"
+    fee_source: str = ""           # "market_discovery" | "config" | "fallback" | "unknown"
+    fee_status: str = ""           # "market_verified" | "configured" | "fallback_used" | "unproven_market_fee"
+    # execution lane
+    execution_lane: str = ""       # "taker_paper" | "maker_paper" | "unknown"
     # unresolved lifecycle tracking
     resolution_retry_count: int = 0
     first_resolution_failure_ts: float = 0.0
@@ -75,7 +77,6 @@ class PaperTrader:
 
         # Fee source detection — config'de açıkça var mı, yoksa fallback mı?
         fee_rate_configured = "fee_rate" in config
-        fee_exponent_configured = "fee_exponent" in config
 
         self.fee_rate: float = config.get("fee_rate", 0.072)
         self.fee_exponent: float = config.get("fee_exponent", 1.0)
@@ -87,9 +88,72 @@ class PaperTrader:
             self.fee_source: str = "fallback"
             self.fee_status: str = "fallback_used"
 
+        # Market discovery fee attempt tracking
+        self._market_fee_attempted: bool = False
+        self._market_fee_ok: bool = False
+
+        # Execution lane — paper mode always simulates taker fills at ask, 100% fill
+        self.execution_lane: str = "taker_paper"
+
         self._positions: list[PaperPosition] = []
         self._counter: int = 0
         self.risk_manager = risk_manager
+
+    async def try_update_fee_from_market(self, token_id: str) -> dict:
+        """
+        Market discovery'den fee rate çekmeyi dene.
+        Başarılı → fee_source/fee_status güncelle.
+        Başarısız → mevcut kaynağı koru, dürüst status üret.
+        Döndürür: {"attempted": bool, "ok": bool, "market_fee_rate": float|None, "note": str}
+        """
+        from market_discovery import get_market_fee_rate
+        self._market_fee_attempted = True
+        result = {"attempted": True, "ok": False, "market_fee_rate": None, "note": ""}
+        try:
+            market_fee = await get_market_fee_rate(token_id)
+            # get_market_fee_rate returns 0.072 on failure — no way to distinguish
+            # from real 0.072. But we check if it actually reached the endpoint.
+            # The function returns 0.072 as default, so we can't fully verify.
+            # We trust the call succeeded if no exception was raised,
+            # but mark status as unproven since we can't confirm the endpoint responded.
+            if market_fee > 0:
+                self.fee_rate = market_fee
+                self.fee_source = "market_discovery"
+                self.fee_status = "unproven_market_fee"
+                self._market_fee_ok = True
+                result["ok"] = True
+                result["market_fee_rate"] = market_fee
+                result["note"] = (
+                    "get_market_fee_rate returned a value but its internal fallback "
+                    "also returns 0.072 — cannot distinguish real response from default. "
+                    "Status set to unproven_market_fee."
+                )
+                await log_module.log("fee_market_discovery_attempt", {
+                    "token_id": token_id,
+                    "market_fee_rate": market_fee,
+                    "fee_source": self.fee_source,
+                    "fee_status": self.fee_status,
+                    "note": result["note"],
+                })
+            else:
+                result["note"] = "market_fee_rate returned 0 or negative"
+                await log_module.log("fee_market_discovery_attempt", {
+                    "token_id": token_id,
+                    "market_fee_rate": market_fee,
+                    "fee_source": self.fee_source,
+                    "fee_status": self.fee_status,
+                    "note": result["note"],
+                })
+        except Exception as e:
+            result["note"] = f"market_discovery fetch failed: {e}"
+            await log_module.log("fee_market_discovery_failed", {
+                "token_id": token_id,
+                "error": str(e),
+                "fee_source": self.fee_source,
+                "fee_status": self.fee_status,
+                "note": "Kept existing fee_source. Market path not proven.",
+            })
+        return result
 
     def open_position(
         self,
@@ -128,6 +192,7 @@ class PaperTrader:
             fee_exponent=self.fee_exponent,
             fee_source=self.fee_source,
             fee_status=self.fee_status,
+            execution_lane=self.execution_lane,
         )
         self._positions.append(pos)
 
@@ -237,6 +302,7 @@ class PaperTrader:
                     "fee_exponent": pos.fee_exponent,
                     "fee_source": pos.fee_source,
                     "fee_status": pos.fee_status,
+                    "execution_lane": pos.execution_lane,
                     "gross_pnl": pos.gross_pnl,
                     "net_pnl": pos.net_pnl,
                     "winner_source": pos.winner_source,
@@ -288,6 +354,9 @@ class PaperTrader:
                 "fee_source": self.fee_source,
                 "fee_status": self.fee_status,
                 "fallback_fee_usage_count": fallback_count,
+                "execution_lane": self.execution_lane,
+                "market_fee_attempted": self._market_fee_attempted,
+                "market_fee_ok": self._market_fee_ok,
             }
         total_gross = sum(pos.gross_pnl for pos in resolved)
         total_fee = sum(pos.fee_total for pos in resolved)
@@ -311,5 +380,8 @@ class PaperTrader:
             "fee_source": self.fee_source,
             "fee_status": self.fee_status,
             "fallback_fee_usage_count": fallback_count,
+            "execution_lane": self.execution_lane,
+            "market_fee_attempted": self._market_fee_attempted,
+            "market_fee_ok": self._market_fee_ok,
             "dual_fill_rate": "100%",  # paper modda her zaman %100
         }
