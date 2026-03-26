@@ -39,6 +39,7 @@ def p(msg: str) -> None:
     print(msg, flush=True)
 
 import logger as log_module
+import truth_logger
 from binance_feed import BinanceFeed
 from polymarket_feed import PolymarketFeed
 from market_discovery import discover_market
@@ -226,7 +227,7 @@ class PolyBot:
                 self._running = False
                 break
 
-            # Her 30s'de bir durum satırı
+            # Her 30s'de bir durum satırı + truth observation
             if last_status_secs - secs_to_res >= 30:
                 bu = self.pm_feed.get_book(market["token_up"])
                 bd = self.pm_feed.get_book(market["token_down"])
@@ -236,6 +237,22 @@ class PolyBot:
                       f"net_edge={round(1-pair_sum,4):.4f} "
                       f"spread_up={bu.spread_pct:.1f}% spread_down={bd.spread_pct:.1f}% "
                       f"signal_sent={self._signal_sent}")
+                    await truth_logger.observe("quote_snapshot", {
+                        "market_slug": market.get("slug", ""),
+                        "interval": self.interval,
+                        "execution_lane": self.paper_trader.execution_lane,
+                        "secs_to_res": secs_to_res,
+                        "pair_sum": pair_sum,
+                        "up_bid": bu.bid,
+                        "up_ask": bu.ask,
+                        "down_bid": bd.bid,
+                        "down_ask": bd.ask,
+                        "spread_up": round(bu.spread_pct, 2),
+                        "spread_down": round(bd.spread_pct, 2),
+                        "btc_mid_binance": self.feed.mid,
+                        "fee_source": self.paper_trader.fee_source,
+                        "fee_status": self.paper_trader.fee_status,
+                    })
                 else:
                     p(f"[window] secs={secs_to_res} orderbook=? signal_sent={self._signal_sent}")
                 last_status_secs = secs_to_res

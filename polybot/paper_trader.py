@@ -22,6 +22,7 @@ import aiohttp
 import time
 from dataclasses import dataclass
 import logger as log_module
+import truth_logger
 from resolution_truth import resolve_truth
 from fee_engine import compute_fee
 
@@ -206,6 +207,24 @@ class PaperTrader:
         )
         self._positions.append(pos)
 
+        # Truth observation — trade_opened
+        truth_logger.observe_sync("trade_opened", {
+            "trade_id": pos.trade_id,
+            "interval": pos.interval,
+            "window_ts": pos.window_ts,
+            "execution_lane": pos.execution_lane,
+            "pair_sum": pos.pair_sum,
+            "up_ask": pos.up_ask,
+            "down_ask": pos.down_ask,
+            "net_edge": pos.net_edge,
+            "shares": pos.shares,
+            "btc_open": pos.btc_open,
+            "fee_total": pos.fee_total,
+            "fee_rate": pos.fee_rate,
+            "fee_source": pos.fee_source,
+            "fee_status": pos.fee_status,
+        })
+
         if self.risk_manager:
             self.risk_manager.on_trade_opened()
 
@@ -256,7 +275,7 @@ class PaperTrader:
 
                     secs_since_first = round(now - pos.first_resolution_failure_ts, 1)
 
-                    await log_module.log("trade_resolution_blocked", {
+                    blocked_data = {
                         "trade_id": pos.trade_id,
                         "timestamp": now,
                         "window": pos.window_ts,
@@ -271,6 +290,14 @@ class PaperTrader:
                         "secs_since_first_failure": secs_since_first,
                         "note": "Truth layer could not determine winner. "
                                 "Trade NOT finalized. No PnL assigned.",
+                    }
+                    await log_module.log("trade_resolution_blocked", blocked_data)
+                    await truth_logger.observe("trade_resolution_blocked", {
+                        **blocked_data,
+                        "execution_lane": pos.execution_lane,
+                        "fee_source": pos.fee_source,
+                        "fee_status": pos.fee_status,
+                        "pair_sum": pos.pair_sum,
                     })
                     continue
 
@@ -292,7 +319,7 @@ class PaperTrader:
                 if self.risk_manager:
                     self.risk_manager.on_trade_result(net_pnl)
 
-                await log_module.log("trade_resolved", {
+                resolved_data = {
                     "trade_id": pos.trade_id,
                     "timestamp": time.time(),
                     "window": pos.window_ts,
@@ -321,7 +348,9 @@ class PaperTrader:
                     "resolution_truth_status": pos.resolution_truth_status,
                     "resolution_match": pos.resolution_match,
                     "chainlink_status": pos.chainlink_status,
-                })
+                }
+                await log_module.log("trade_resolved", resolved_data)
+                await truth_logger.observe("trade_resolved", resolved_data)
                 resolved.append(pos)
 
             except Exception as e:
