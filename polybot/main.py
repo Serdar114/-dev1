@@ -139,10 +139,10 @@ class PolyBot:
         }
         if book_up:
             market_ctx["up_bid"] = book_up.bid
-            market_ctx["spread_up"] = round(book_up.spread_pct, 2)
+            market_ctx["spread_up_pct"] = round(book_up.spread_pct, 2)
         if book_down:
             market_ctx["down_bid"] = book_down.bid
-            market_ctx["spread_down"] = round(book_down.spread_pct, 2)
+            market_ctx["spread_down_pct"] = round(book_down.spread_pct, 2)
 
         pos = self.paper_trader.open_position(
             up_ask=signal.up_ask,
@@ -263,8 +263,8 @@ class PolyBot:
                         "up_ask": bu.ask,
                         "down_bid": bd.bid,
                         "down_ask": bd.ask,
-                        "spread_up": round(bu.spread_pct, 2),
-                        "spread_down": round(bd.spread_pct, 2),
+                        "spread_up_pct": round(bu.spread_pct, 2),
+                        "spread_down_pct": round(bd.spread_pct, 2),
                         "btc_mid_binance": self.feed.mid,
                         "fee_source": self.paper_trader.fee_source,
                         "fee_status": self.paper_trader.fee_status,

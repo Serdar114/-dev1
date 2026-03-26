@@ -98,8 +98,9 @@ def analyze(events: list[dict]) -> dict:
                     ("trade_opened", "trade_resolved", "trade_resolution_blocked")]
     trade_count = len(trade_events)
     context_fields = [
-        "market_slug", "btc_mid_binance", "up_bid", "down_bid",
-        "spread_up", "spread_down", "secs_to_res",
+        "market_slug", "btc_mid_binance",
+        "up_ask", "down_ask", "up_bid", "down_bid",
+        "spread_up_pct", "spread_down_pct", "secs_to_res",
     ]
     context_coverage = {}
     if trade_count > 0:

@@ -66,13 +66,15 @@ class PaperPosition:
     # execution lane
     execution_lane: str = ""       # "taker_paper" | "maker_paper" | "unknown"
     # market context at entry (enrichment)
+    # NOTE: up_ask/down_ask are required constructor args above — always present.
+    #       up_bid/down_bid come from orderbook snapshot at entry via market_context.
     market_slug: str = ""
     btc_mid_binance: float = 0.0   # Binance mid at entry time (0.0 = unavailable)
-    up_bid: float = 0.0
-    down_bid: float = 0.0
-    spread_up: float = 0.0        # spread_pct for UP token
-    spread_down: float = 0.0      # spread_pct for DOWN token
-    secs_to_res: int = 0          # seconds to resolution at entry
+    up_bid: float = 0.0            # best bid for UP token at entry
+    down_bid: float = 0.0          # best bid for DOWN token at entry
+    spread_up_pct: float = 0.0     # UP token spread as percentage: (ask-bid)/mid*100
+    spread_down_pct: float = 0.0   # DOWN token spread as percentage: (ask-bid)/mid*100
+    secs_to_res: int = 0           # seconds to resolution at entry
     # unresolved lifecycle tracking
     resolution_retry_count: int = 0
     first_resolution_failure_ts: float = 0.0
@@ -218,8 +220,8 @@ class PaperTrader:
             btc_mid_binance=ctx.get("btc_mid_binance", 0.0),
             up_bid=ctx.get("up_bid", 0.0),
             down_bid=ctx.get("down_bid", 0.0),
-            spread_up=ctx.get("spread_up", 0.0),
-            spread_down=ctx.get("spread_down", 0.0),
+            spread_up_pct=ctx.get("spread_up_pct", 0.0),
+            spread_down_pct=ctx.get("spread_down_pct", 0.0),
             secs_to_res=ctx.get("secs_to_res", 0),
         )
         self._positions.append(pos)
@@ -236,8 +238,8 @@ class PaperTrader:
             "up_ask": pos.up_ask,
             "down_bid": pos.down_bid,
             "down_ask": pos.down_ask,
-            "spread_up": pos.spread_up,
-            "spread_down": pos.spread_down,
+            "spread_up_pct": pos.spread_up_pct,
+            "spread_down_pct": pos.spread_down_pct,
             "net_edge": pos.net_edge,
             "shares": pos.shares,
             "btc_open": pos.btc_open,
