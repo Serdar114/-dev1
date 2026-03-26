@@ -65,6 +65,14 @@ class PaperPosition:
     fee_status: str = ""           # "market_verified" | "configured" | "fallback_used" | "unproven_market_fee"
     # execution lane
     execution_lane: str = ""       # "taker_paper" | "maker_paper" | "unknown"
+    # market context at entry (enrichment)
+    market_slug: str = ""
+    btc_mid_binance: float = 0.0   # Binance mid at entry time (0.0 = unavailable)
+    up_bid: float = 0.0
+    down_bid: float = 0.0
+    spread_up: float = 0.0        # spread_pct for UP token
+    spread_down: float = 0.0      # spread_pct for DOWN token
+    secs_to_res: int = 0          # seconds to resolution at entry
     # unresolved lifecycle tracking
     resolution_retry_count: int = 0
     first_resolution_failure_ts: float = 0.0
@@ -174,11 +182,13 @@ class PaperTrader:
         btc_open: float,
         window_ts: int,
         interval: str = "5m",
+        market_context: dict | None = None,
     ) -> PaperPosition:
         """Dual entry simüle et — her iki taraf ask'tan fill edildi kabul edilir."""
         self._counter += 1
         pair_sum = round(up_ask + down_ask, 4)
         net_edge = round(1.0 - pair_sum, 4)
+        ctx = market_context or {}
 
         # Fee hesapla — entry anında, config'den okunan parametrelerle
         fee_up = compute_fee(shares, up_ask, self.fee_rate, self.fee_exponent)
@@ -204,21 +214,35 @@ class PaperTrader:
             fee_source=self.fee_source,
             fee_status=self.fee_status,
             execution_lane=self.execution_lane,
+            market_slug=ctx.get("market_slug", ""),
+            btc_mid_binance=ctx.get("btc_mid_binance", 0.0),
+            up_bid=ctx.get("up_bid", 0.0),
+            down_bid=ctx.get("down_bid", 0.0),
+            spread_up=ctx.get("spread_up", 0.0),
+            spread_down=ctx.get("spread_down", 0.0),
+            secs_to_res=ctx.get("secs_to_res", 0),
         )
         self._positions.append(pos)
 
-        # Truth observation — trade_opened
+        # Truth observation — trade_opened (with market context)
         truth_logger.observe_sync("trade_opened", {
             "trade_id": pos.trade_id,
+            "market_slug": pos.market_slug,
             "interval": pos.interval,
             "window_ts": pos.window_ts,
             "execution_lane": pos.execution_lane,
             "pair_sum": pos.pair_sum,
+            "up_bid": pos.up_bid,
             "up_ask": pos.up_ask,
+            "down_bid": pos.down_bid,
             "down_ask": pos.down_ask,
+            "spread_up": pos.spread_up,
+            "spread_down": pos.spread_down,
             "net_edge": pos.net_edge,
             "shares": pos.shares,
             "btc_open": pos.btc_open,
+            "btc_mid_binance": pos.btc_mid_binance,
+            "secs_to_res": pos.secs_to_res,
             "fee_total": pos.fee_total,
             "fee_rate": pos.fee_rate,
             "fee_source": pos.fee_source,
@@ -321,15 +345,22 @@ class PaperTrader:
 
                 resolved_data = {
                     "trade_id": pos.trade_id,
+                    "market_slug": pos.market_slug,
                     "timestamp": time.time(),
                     "window": pos.window_ts,
                     "interval": pos.interval,
+                    "up_bid": pos.up_bid,
                     "up_ask": pos.up_ask,
+                    "down_bid": pos.down_bid,
                     "down_ask": pos.down_ask,
+                    "spread_up": pos.spread_up,
+                    "spread_down": pos.spread_down,
                     "pair_sum": pos.pair_sum,
                     "net_edge": pos.net_edge,
                     "shares": pos.shares,
                     "btc_open": pos.btc_open,
+                    "btc_mid_binance": pos.btc_mid_binance,
+                    "secs_to_res": pos.secs_to_res,
                     "btc_close": pos.btc_close,
                     "result": pos.result,
                     "fee_up": pos.fee_up,

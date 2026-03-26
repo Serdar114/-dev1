@@ -83,6 +83,7 @@ class PolyBot:
         self._window_token_up: str = ""
         self._window_token_down: str = ""
         self._window_ts: int = 0
+        self._window_slug: str = ""
         self._signal_sent = False
         self._last_eval_sec: int = 0  # tick throttle: aynı saniyede max 1 değerlendirme
 
@@ -130,6 +131,19 @@ class PolyBot:
         shares = self.config.get("shares_per_side", 5)
         btc_open = self.feed.open_price or btc_mid
 
+        # Market context at entry — enrich trade with orderbook + price state
+        market_ctx = {
+            "market_slug": self._window_slug,
+            "btc_mid_binance": btc_mid,
+            "secs_to_res": secs_to_res,
+        }
+        if book_up:
+            market_ctx["up_bid"] = book_up.bid
+            market_ctx["spread_up"] = round(book_up.spread_pct, 2)
+        if book_down:
+            market_ctx["down_bid"] = book_down.bid
+            market_ctx["spread_down"] = round(book_down.spread_pct, 2)
+
         pos = self.paper_trader.open_position(
             up_ask=signal.up_ask,
             down_ask=signal.down_ask,
@@ -137,6 +151,7 @@ class PolyBot:
             btc_open=btc_open,
             window_ts=self._window_ts,
             interval=self.interval,
+            market_context=market_ctx,
         )
         self._signal_sent = True
         p(f"[DUAL] {pos.trade_id} up_ask={signal.up_ask:.4f} down_ask={signal.down_ask:.4f} "
@@ -187,6 +202,7 @@ class PolyBot:
         self._window_token_up = market["token_up"]
         self._window_token_down = market["token_down"]
         self._window_ts = market["window_ts"]
+        self._window_slug = market.get("slug", "")
         self._signal_sent = False
 
         # Polymarket feed → bu pencereye subscribe ol

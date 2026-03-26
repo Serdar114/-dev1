@@ -93,6 +93,25 @@ def analyze(events: list[dict]) -> dict:
     if timestamps:
         time_range = {"first": min(timestamps), "last": max(timestamps)}
 
+    # Context coverage — trade events only
+    trade_events = [e for e in events if e.get("event") in
+                    ("trade_opened", "trade_resolved", "trade_resolution_blocked")]
+    trade_count = len(trade_events)
+    context_fields = [
+        "market_slug", "btc_mid_binance", "up_bid", "down_bid",
+        "spread_up", "spread_down", "secs_to_res",
+    ]
+    context_coverage = {}
+    if trade_count > 0:
+        for field in context_fields:
+            present = sum(1 for e in trade_events
+                         if e.get(field) and e[field] != 0 and e[field] != 0.0)
+            context_coverage[field] = {
+                "present": present,
+                "total": trade_count,
+                "pct": round(present / trade_count * 100, 1),
+            }
+
     return {
         "total_events": total,
         "time_range": time_range,
@@ -105,6 +124,7 @@ def analyze(events: list[dict]) -> dict:
         "fee_status_distribution": dict(fee_status_dist.most_common()),
         "execution_lane_distribution": dict(lane_dist.most_common()),
         "pair_sum_stats": pair_sum_stats if pair_sum_stats else "no pair_sum observations",
+        "context_coverage": context_coverage if context_coverage else "no trade events",
     }
 
 
@@ -174,6 +194,14 @@ def print_report(summary: dict) -> None:
         print(f"  avg:   {ps['avg']}")
     else:
         print(f"  {ps}")
+
+    print(f"\n--- Trade Context Coverage ---")
+    cc = summary.get("context_coverage", {})
+    if isinstance(cc, dict) and cc:
+        for field, info in cc.items():
+            print(f"  {field}: {info['present']}/{info['total']} ({info['pct']}%)")
+    else:
+        print(f"  {cc}")
 
     print("\n" + "=" * 60)
 
