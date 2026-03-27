@@ -1,0 +1,66 @@
+{
+  "credentials": {
+    "_note": "Paper modda kullanılmaz. Live açmadan önce doldurun.",
+    "private_key":    "0x",
+    "wallet_address": "",
+    "api_key":        "",
+    "api_secret":     "",
+    "api_passphrase": ""
+  },
+  "network": {
+    "clob_url":       "https://clob.polymarket.com",
+    "gamma_url":      "https://gamma-api.polymarket.com",
+    "chain_id":       137,
+    "binance_symbol": "BTCUSDT"
+  },
+  "mode": {
+    "_note": "paper_only=true zorunlu. live_enabled hiçbir zaman true yapılmaz hazır oluncaya kadar.",
+    "paper_only":      true,
+    "live_enabled":    false,
+    "enable_15m":      false,
+    "market_duration": "5m"
+  },
+  "risk": {
+    "_note": "Sabit stake, drawdown ve kayıp-streak pause kuralları.",
+    "bankroll_usd":          30.0,
+    "stake_usd":             5.0,
+    "max_open_positions":    2,
+    "drawdown_pause_pct":    25.0,
+    "loss_streak_count":     2,
+    "loss_streak_window_s":  300
+  },
+  "entry": {
+    "_note": "Maker-only. Taker entry kapalı. Savunmacı fiyat bantları.",
+    "mode":               "maker_only",
+    "normal_band_min":    0.55,
+    "normal_band_max":    0.72,
+    "high_conv_band_min": 0.65,
+    "high_conv_band_max": 0.80,
+    "maker_window_max_s": 45,
+    "maker_window_min_s": 10,
+    "min_edge_pct":       8.0,
+    "min_liquidity_usd":  50.0,
+    "scan_interval_s":    10,
+    "cooldown_s":         60
+  },
+  "exit": {
+    "_note": "TP1/TP2 kâr al. Hard stop. Signal flip. Maker-first exit sim.",
+    "tp1_delta":           0.06,
+    "tp2_delta":           0.10,
+    "hard_stop_delta":     0.04,
+    "signal_flip_exit":    true,
+    "maker_exit_timeout_s": 3
+  },
+  "ofi": {
+    "_note": "OFI/TFI parametreleri. Tüm modüller bu bloktan okur.",
+    "snapshot_interval_s": 1.0,
+    "lookback_bars":       30,
+    "ratio_threshold":     1.5,
+    "z_threshold":         1.5,
+    "tfi_confirmation":    true,
+    "depth_levels":        10
+  },
+  "stale_data_limit_ms": 5000,
+  "memory_file":         "trades_v21.jsonl",
+  "log_file":            "bot_log_v21.txt"
+}
