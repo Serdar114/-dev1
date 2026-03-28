@@ -19,13 +19,27 @@ BUG FIX — clobTokenIds:
 
 import json
 import time
+import socket
 import asyncio
 import aiohttp
+import aiohttp.resolver
 import logger as log_module
 
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 CLOB_BASE = "https://clob.polymarket.com"
+
+
+def _make_connector() -> aiohttp.TCPConnector:
+    """
+    Force IPv4 + threaded DNS resolver (uses system getaddrinfo, same as curl).
+    Fixes: aiohttp async resolver (aiodns/c-ares) can't reach DNS servers
+    in some environments (containers, WSL, restricted resolv.conf).
+    """
+    return aiohttp.TCPConnector(
+        family=socket.AF_INET,
+        resolver=aiohttp.resolver.ThreadedResolver(),
+    )
 
 MARKET_INTERVALS = {
     "5m": 300,
@@ -70,13 +84,40 @@ def _parse_token_ids(raw: str | list) -> list[str]:
 
 
 async def _fetch_gamma(session: aiohttp.ClientSession, url: str, params: dict) -> list[dict]:
+    req_url = f"{url}?{'&'.join(f'{k}={v}' for k,v in params.items())}"
     try:
         async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=8)) as r:
+            raw_text = await r.text()
+            print(f"[DISC_NET] gamma GET {req_url} → status={r.status} "
+                  f"len={len(raw_text)} body={raw_text[:200]}", flush=True)
             if r.status == 200:
-                return await r.json()
-            await log_module.log("gamma_http_error", {"url": url, "status": r.status})
+                try:
+                    return json.loads(raw_text)
+                except json.JSONDecodeError as je:
+                    print(f"[DISC_NET] gamma JSON parse error: {je}", flush=True)
+                    return []
+            await log_module.log("gamma_http_error", {"url": req_url, "status": r.status, "body": raw_text[:200]})
     except Exception as e:
-        await log_module.log("gamma_fetch_error", {"url": url, "error": str(e)})
+        print(f"[DISC_NET] gamma aiohttp FAILED: {req_url} → {e}", flush=True)
+        await log_module.log("gamma_fetch_error", {"url": req_url, "error": str(e)})
+    return []
+
+
+def _fetch_gamma_sync(url: str, params: dict) -> list[dict]:
+    """
+    Synchronous fallback for Gamma API using requests (system DNS, same as curl).
+    Only used when aiohttp fails for FB1 direct slug lookup.
+    """
+    import requests
+    req_url = f"{url}?{'&'.join(f'{k}={v}' for k,v in params.items())}"
+    try:
+        r = requests.get(url, params=params, timeout=8)
+        print(f"[DISC_NET] gamma SYNC GET {req_url} → status={r.status_code} "
+              f"len={len(r.text)} body={r.text[:200]}", flush=True)
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        print(f"[DISC_NET] gamma SYNC FAILED: {req_url} → {e}", flush=True)
     return []
 
 
@@ -106,7 +147,8 @@ async def discover_market(
         "interval": interval, "computed_slug": slug,
     })
 
-    async with aiohttp.ClientSession() as session:
+    connector = _make_connector()
+    async with aiohttp.ClientSession(connector=connector) as session:
         # --- Fallback 1: Direkt slug lookup ---
         markets = await _fetch_gamma(session, f"{gamma_base}/markets", {"slug": slug})
         print(f"[DISC_DEBUG] FB1 slug={slug} → type={type(markets).__name__} "
@@ -126,6 +168,19 @@ async def discover_market(
                   f"truthy={bool(markets)}", flush=True)
             if markets:
                 slug = prev_slug
+
+        # --- Fallback 1b: sync requests fallback if aiohttp failed for both slugs ---
+        if not markets:
+            print(f"[DISC_DEBUG] FB1b: aiohttp failed for both slugs, trying sync requests...", flush=True)
+            markets = _fetch_gamma_sync(f"{gamma_base}/markets", {"slug": slug})
+            if not markets:
+                prev_ts = current_ts - MARKET_INTERVALS[interval]
+                prev_slug = _slug(interval, prev_ts)
+                markets = _fetch_gamma_sync(f"{gamma_base}/markets", {"slug": prev_slug})
+                if markets:
+                    slug = prev_slug
+            print(f"[DISC_DEBUG] FB1b sync result: len={len(markets) if isinstance(markets, list) else 'N/A'} "
+                  f"truthy={bool(markets)}", flush=True)
 
         # --- Fallback 2: Tag/keyword filtresi ---
         if not markets:
@@ -185,8 +240,12 @@ async def discover_market(
                         print(f"[DISC_DEBUG] FB3 CLOB non-200: status={r.status} "
                               f"body={body_preview[:200]}", flush=True)
             except Exception as e:
-                print(f"[DISC_DEBUG] FB3 CLOB exception: {e}", flush=True)
-                await log_module.log("clob_fallback_error", {"error": str(e)})
+                is_dns = "DNS" in str(e) or "resolve" in str(e).lower() or "getaddrinfo" in str(e).lower()
+                print(f"[DISC_DEBUG] FB3 CLOB exception: {e} (dns_related={is_dns})", flush=True)
+                await log_module.log("clob_fallback_error", {
+                    "error": str(e), "dns_related": is_dns,
+                    "note": "CLOB DNS still failing even with ThreadedResolver+IPv4" if is_dns else "",
+                })
 
         if not markets:
             print(f"[DISC_DEBUG] ALL FALLBACKS FAILED — no market found", flush=True)
@@ -249,7 +308,7 @@ async def discover_market(
 
 async def get_orderbook_midpoint(token_id: str, clob_base: str = CLOB_BASE) -> float | None:
     """CLOB'dan token midpoint fiyatını çek."""
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(connector=_make_connector()) as session:
         try:
             async with session.get(
                 f"{clob_base}/midpoint",
@@ -279,7 +338,7 @@ async def get_market_fee_rate(token_id: str, clob_base: str = CLOB_BASE) -> dict
         }
     """
     fallback = {"fee_rate": 0.072, "verified_remote": False, "status": "fetch_failed", "note": ""}
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(connector=_make_connector()) as session:
         try:
             async with session.get(
                 f"{clob_base}/fee-rate",
