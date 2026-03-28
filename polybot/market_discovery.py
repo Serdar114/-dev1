@@ -88,7 +88,7 @@ async def _fetch_gamma(session: aiohttp.ClientSession, url: str, params: dict) -
     try:
         async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=8)) as r:
             raw_text = await r.text()
-            print(f"[DISC_NET] gamma GET {req_url} → status={r.status} "
+            print(f"[DISC_NET] gamma GET {req_url} -> status={r.status} "
                   f"len={len(raw_text)} body={raw_text[:200]}", flush=True)
             if r.status == 200:
                 try:
@@ -98,7 +98,7 @@ async def _fetch_gamma(session: aiohttp.ClientSession, url: str, params: dict) -
                     return []
             await log_module.log("gamma_http_error", {"url": req_url, "status": r.status, "body": raw_text[:200]})
     except Exception as e:
-        print(f"[DISC_NET] gamma aiohttp FAILED: {req_url} → {e}", flush=True)
+        print(f"[DISC_NET] gamma aiohttp FAILED: {req_url} -> {e}", flush=True)
         await log_module.log("gamma_fetch_error", {"url": req_url, "error": str(e)})
     return []
 
@@ -112,12 +112,12 @@ def _fetch_gamma_sync(url: str, params: dict) -> list[dict]:
     req_url = f"{url}?{'&'.join(f'{k}={v}' for k,v in params.items())}"
     try:
         r = requests.get(url, params=params, timeout=8)
-        print(f"[DISC_NET] gamma SYNC GET {req_url} → status={r.status_code} "
+        print(f"[DISC_NET] gamma SYNC GET {req_url} -> status={r.status_code} "
               f"len={len(r.text)} body={r.text[:200]}", flush=True)
         if r.status_code == 200:
             return r.json()
     except Exception as e:
-        print(f"[DISC_NET] gamma SYNC FAILED: {req_url} → {e}", flush=True)
+        print(f"[DISC_NET] gamma SYNC FAILED: {req_url} -> {e}", flush=True)
     return []
 
 
@@ -151,7 +151,7 @@ async def discover_market(
     async with aiohttp.ClientSession(connector=connector) as session:
         # --- Fallback 1: Direkt slug lookup ---
         markets = await _fetch_gamma(session, f"{gamma_base}/markets", {"slug": slug})
-        print(f"[DISC_DEBUG] FB1 slug={slug} → type={type(markets).__name__} "
+        print(f"[DISC_DEBUG] FB1 slug={slug} -> type={type(markets).__name__} "
               f"len={len(markets) if isinstance(markets, list) else 'N/A'} "
               f"truthy={bool(markets)}", flush=True)
         if markets and isinstance(markets, list) and len(markets) > 0:
@@ -161,9 +161,9 @@ async def discover_market(
             # Bir önceki pencereyi de dene (yeni pencere henüz oluşmamış olabilir)
             prev_ts = current_ts - MARKET_INTERVALS[interval]
             prev_slug = _slug(interval, prev_ts)
-            print(f"[DISC_DEBUG] FB1 miss → trying prev_slug={prev_slug}", flush=True)
+            print(f"[DISC_DEBUG] FB1 miss -> trying prev_slug={prev_slug}", flush=True)
             markets = await _fetch_gamma(session, f"{gamma_base}/markets", {"slug": prev_slug})
-            print(f"[DISC_DEBUG] FB1-prev → type={type(markets).__name__} "
+            print(f"[DISC_DEBUG] FB1-prev -> type={type(markets).__name__} "
                   f"len={len(markets) if isinstance(markets, list) else 'N/A'} "
                   f"truthy={bool(markets)}", flush=True)
             if markets:
@@ -248,7 +248,7 @@ async def discover_market(
                 })
 
         if not markets:
-            print(f"[DISC_DEBUG] ALL FALLBACKS FAILED — no market found", flush=True)
+            print(f"[DISC_DEBUG] ALL FALLBACKS FAILED -- no market found", flush=True)
             await log_module.log("market_not_found", {
                 "slug": slug, "interval": interval,
                 "now_ts": now_ts, "current_window_ts": current_ts,
@@ -274,7 +274,7 @@ async def discover_market(
         print(f"[DISC_DEBUG] token_ids count={len(token_ids)} "
               f"ids={[t[:16]+'...' for t in token_ids[:4]]}", flush=True)
         if len(token_ids) < 2:
-            print(f"[DISC_DEBUG] token_count < 2 — FAIL", flush=True)
+            print(f"[DISC_DEBUG] token_count < 2 -- FAIL", flush=True)
             await log_module.log("token_count_error", {"token_ids": token_ids})
             return None
 
