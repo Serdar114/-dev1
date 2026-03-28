@@ -17,7 +17,9 @@ UNPROVEN:
 """
 
 import time
+import socket
 import aiohttp
+import aiohttp.resolver
 import logger as log_module
 from dataclasses import dataclass
 
@@ -74,7 +76,11 @@ async def _fetch_btc_close_binance() -> tuple[float, bool]:
     Fetch başarısızsa (0.0, False) döner — sahte fallback KULLANILMAZ.
     """
     try:
-        async with aiohttp.ClientSession() as session:
+        connector = aiohttp.TCPConnector(
+            family=socket.AF_INET,
+            resolver=aiohttp.resolver.ThreadedResolver(),
+        )
+        async with aiohttp.ClientSession(connector=connector) as session:
             async with session.get(
                 BINANCE_REST_URL,
                 timeout=aiohttp.ClientTimeout(total=5),

@@ -17,8 +17,10 @@ Sakladığı veri (per token_id):
 import asyncio
 import json
 import time
+import socket
 import websockets
 import aiohttp
+import aiohttp.resolver
 import logger as log_module
 from dataclasses import dataclass
 
@@ -188,7 +190,11 @@ class PolymarketFeed:
                 if should_poll:
                     poll_count += 1
                     print(f"[PM_DEBUG] HTTP fallback poll #{poll_count} (ws_connected={self._ws_connected})", flush=True)
-                    async with aiohttp.ClientSession() as session:
+                    connector = aiohttp.TCPConnector(
+                        family=socket.AF_INET,
+                        resolver=aiohttp.resolver.ThreadedResolver(),
+                    )
+                    async with aiohttp.ClientSession(connector=connector) as session:
                         for token_id in self._subscribed_ids:
                             url = f"{self.clob_base}/book"
                             try:
