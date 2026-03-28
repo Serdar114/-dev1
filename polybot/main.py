@@ -77,6 +77,9 @@ class PolyBot:
         self.risk_manager = RiskManager(config)
         self.paper_trader = PaperTrader(config, risk_manager=self.risk_manager)
 
+        self.strategy: str = config.get("strategy", "dual_side_capture")
+        self.forced_side: str = config.get("forced_side", "")
+
         self._running = False
         # Tick-driven state (pencere süresince geçerli)
         self._window_active = False
@@ -90,7 +93,7 @@ class PolyBot:
     async def _on_btc_tick(self, btc_mid: float) -> None:
         """
         Binance bookTicker tick callback — her tick'te çağrılır.
-        Dual side capture: BTC yönü değil, pair_sum kontrol edilir.
+        Routes to dual_side_capture or single_side_taker based on config.
         """
         if not self._window_active or self._signal_sent:
             return
@@ -107,16 +110,21 @@ class PolyBot:
         book_up = self.pm_feed.get_book(self._window_token_up)
         book_down = self.pm_feed.get_book(self._window_token_down)
 
-        signal = self.signal_engine.evaluate(
-            book_up=book_up,
-            book_down=book_down,
-            secs_to_res=secs_to_res,
-        )
+        # Strategy dispatch
+        if self.strategy == "single_side_taker":
+            signal = self.signal_engine.evaluate_single(
+                book_up=book_up, book_down=book_down, secs_to_res=secs_to_res,
+            )
+        else:
+            signal = self.signal_engine.evaluate(
+                book_up=book_up, book_down=book_down, secs_to_res=secs_to_res,
+            )
 
         # Sadece entry window'da ve anlamlı sinyallerde logla
         if signal.action != "skip" or signal.reason not in ("outside_entry_window", "no_orderbook"):
-            p(f"[tick] secs={secs_to_res} pair_sum={signal.pair_sum:.4f} "
-              f"net_edge={signal.net_edge:.4f} action={signal.action} reason={signal.reason}")
+            p(f"[tick] secs={secs_to_res} action={signal.action} "
+              f"side={signal.side} entry_price={signal.entry_price:.4f} "
+              f"pair_sum={signal.pair_sum:.4f} reason={signal.reason}")
             await self.signal_engine.log_signal(signal)
 
         if signal.action == "skip":
@@ -131,11 +139,13 @@ class PolyBot:
         shares = self.config.get("shares_per_side", 5)
         btc_open = self.feed.open_price or btc_mid
 
-        # Market context at entry — enrich trade with orderbook + price state
+        # Market context at entry
         market_ctx = {
             "market_slug": self._window_slug,
             "btc_mid_binance": btc_mid,
             "secs_to_res": secs_to_res,
+            "up_ask": signal.up_ask,
+            "down_ask": signal.down_ask,
         }
         if book_up:
             market_ctx["up_bid"] = book_up.bid
@@ -144,34 +154,63 @@ class PolyBot:
             market_ctx["down_bid"] = book_down.bid
             market_ctx["spread_down_pct"] = round(book_down.spread_pct, 2)
 
-        pos = self.paper_trader.open_position(
-            up_ask=signal.up_ask,
-            down_ask=signal.down_ask,
-            shares=shares,
-            btc_open=btc_open,
-            window_ts=self._window_ts,
-            interval=self.interval,
-            market_context=market_ctx,
-        )
-        self._signal_sent = True
-        p(f"[DUAL] {pos.trade_id} up_ask={signal.up_ask:.4f} down_ask={signal.down_ask:.4f} "
-          f"pair_sum={signal.pair_sum:.4f} net_edge={signal.net_edge:.4f} shares={shares}")
-        await log_module.log("trade_opened", {
-            "trade_id": pos.trade_id,
-            "mode": self.mode,
-            "strategy": "dual_side_capture",
-            "up_ask": signal.up_ask,
-            "down_ask": signal.down_ask,
-            "pair_sum": signal.pair_sum,
-            "net_edge": signal.net_edge,
-            "shares": shares,
-            "btc_open": btc_open,
-            "secs_to_res": secs_to_res,
-            "fee_source": self.paper_trader.fee_source,
-            "fee_status": self.paper_trader.fee_status,
-            "execution_lane": self.paper_trader.execution_lane,
-            **self.risk_manager.summary(),
-        })
+        # Open position — dual or single
+        if signal.action.startswith("single_entry_"):
+            pos = self.paper_trader.open_single_position(
+                side=signal.side,
+                entry_price=signal.entry_price,
+                shares=shares,
+                btc_open=btc_open,
+                window_ts=self._window_ts,
+                interval=self.interval,
+                market_context=market_ctx,
+            )
+            self._signal_sent = True
+            p(f"[SINGLE] {pos.trade_id} side={signal.side} "
+              f"entry_price={signal.entry_price:.4f} shares={shares}")
+            await log_module.log("trade_opened", {
+                "trade_id": pos.trade_id,
+                "mode": self.mode,
+                "strategy": "single_side_taker",
+                "side": signal.side,
+                "entry_price": signal.entry_price,
+                "shares": shares,
+                "btc_open": btc_open,
+                "secs_to_res": secs_to_res,
+                "fee_source": self.paper_trader.fee_source,
+                "fee_status": self.paper_trader.fee_status,
+                "execution_lane": self.paper_trader.execution_lane,
+                **self.risk_manager.summary(),
+            })
+        else:
+            pos = self.paper_trader.open_position(
+                up_ask=signal.up_ask,
+                down_ask=signal.down_ask,
+                shares=shares,
+                btc_open=btc_open,
+                window_ts=self._window_ts,
+                interval=self.interval,
+                market_context=market_ctx,
+            )
+            self._signal_sent = True
+            p(f"[DUAL] {pos.trade_id} up_ask={signal.up_ask:.4f} down_ask={signal.down_ask:.4f} "
+              f"pair_sum={signal.pair_sum:.4f} net_edge={signal.net_edge:.4f} shares={shares}")
+            await log_module.log("trade_opened", {
+                "trade_id": pos.trade_id,
+                "mode": self.mode,
+                "strategy": "dual_side_capture",
+                "up_ask": signal.up_ask,
+                "down_ask": signal.down_ask,
+                "pair_sum": signal.pair_sum,
+                "net_edge": signal.net_edge,
+                "shares": shares,
+                "btc_open": btc_open,
+                "secs_to_res": secs_to_res,
+                "fee_source": self.paper_trader.fee_source,
+                "fee_status": self.paper_trader.fee_status,
+                "execution_lane": self.paper_trader.execution_lane,
+                **self.risk_manager.summary(),
+            })
 
     async def _run_window(self) -> None:
         """Tek bir 5m pencereyi işle — tick-driven, polling yok."""

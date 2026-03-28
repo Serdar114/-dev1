@@ -1,25 +1,15 @@
 """
-Signal Engine — Dual Side Capture stratejisi.
+Signal Engine — Dual Side Capture + Single Side Taker stratejileri.
 
-Mantık (delta/direction YOK):
+Dual (default):
   pair_sum = up_ask + down_ask
-  net_edge = 1.0 - pair_sum   (fee = 0, maker/post-only order)
+  net_edge = 1.0 - pair_sum
+  pair_sum < target_sum_max → DUAL_ENTRY
 
-  pair_sum < target_sum_max (0.95) → DUAL_ENTRY
-  pair_sum >= target_sum_max       → skip "pair_sum_too_high"
-
-Neden pair_sum < 1.0 kârlı:
-  Her pencerede ya UP ya DOWN kazanır → payout = 1.0
-  Maliyet = up_ask + down_ask = pair_sum
-  Kâr = 1.0 - pair_sum (fee yok — post-only maker)
-
-Koşullar (sırayla):
-  1. Entry window   → outside_entry_window
-  2. Orderbook mevcut → no_orderbook
-  3. Spread dar     → spread_too_wide
-  4. Depth yeterli  → depth_low
-  5. pair_sum < 0.95 → pair_sum_too_high
-  6. net_edge > 0   → no_edge  (güvenlik — pair_sum < 0.95 ise zaten > 0)
+Single side (strategy=single_side_taker, forced_side=up|down):
+  Forced side'ın ask fiyatı < max_entry_price → SINGLE_ENTRY_UP|DOWN
+  Yön kararı dışarıdan verilir (config forced_side).
+  PnL: win → shares×(1-ask)-fee, lose → -(shares×ask+fee)
 """
 
 from dataclasses import dataclass
@@ -29,15 +19,17 @@ import logger as log_module
 
 @dataclass
 class Signal:
-    action: str       # "dual_entry" | "skip"
+    action: str       # "dual_entry" | "single_entry_up" | "single_entry_down" | "skip"
     up_ask: float
     down_ask: float
-    pair_sum: float   # up_ask + down_ask
-    net_edge: float   # 1.0 - pair_sum (beklenen kâr / share)
+    pair_sum: float   # up_ask + down_ask (0 for single-side)
+    net_edge: float   # 1.0 - pair_sum (0 for single-side)
     spread_up: float
     spread_down: float
     secs_to_res: int
     reason: str
+    side: str = ""            # "" for dual, "up"|"down" for single
+    entry_price: float = 0.0  # ask price of the chosen side (single-side only)
 
 
 class SignalEngine:
@@ -47,6 +39,10 @@ class SignalEngine:
         self.min_depth: float = config.get("min_orderbook_depth", 50.0)
         self.entry_window_start: int = config.get("entry_window_start_ste", 240)
         self.entry_window_end: int = config.get("entry_window_end_ste", 10)
+        # Single-side config
+        self.strategy: str = config.get("strategy", "dual_side_capture")
+        self.forced_side: str = config.get("forced_side", "")  # "up" | "down"
+        self.max_entry_price: float = config.get("max_entry_price", 0.60)
 
     def _skip(self, reason: str, secs_to_res: int,
               up_ask: float = 0.0, down_ask: float = 0.0) -> Signal:
@@ -137,6 +133,83 @@ class SignalEngine:
             secs_to_res=secs_to_res, reason="ok",
         )
 
+    def evaluate_single(
+        self,
+        book_up: BookSnapshot | None,
+        book_down: BookSnapshot | None,
+        secs_to_res: int,
+    ) -> Signal:
+        """
+        Single-side taker: forced_side'ın ask'ını değerlendir.
+        Yön kararı config'den gelir — bu fonksiyon sadece giriş koşullarını kontrol eder.
+        """
+        side = self.forced_side
+        if side not in ("up", "down"):
+            return self._skip("invalid_forced_side", secs_to_res)
+
+        # 1. Entry window
+        if secs_to_res > self.entry_window_start or secs_to_res < self.entry_window_end:
+            return self._skip("outside_entry_window", secs_to_res)
+
+        # 2. Orderbook for forced side
+        book = book_up if side == "up" else book_down
+        if book is None:
+            return self._skip("no_orderbook", secs_to_res)
+
+        ask = book.ask
+        spread = book.spread_pct
+        depth = book.ask_size
+
+        # Populate both ask fields for logging (0 if other side missing)
+        up_ask = book_up.ask if book_up else 0.0
+        down_ask = book_down.ask if book_down else 0.0
+
+        # 3. Spread
+        if spread > self.max_spread_pct:
+            return Signal(
+                action="skip", up_ask=up_ask, down_ask=down_ask,
+                pair_sum=0.0, net_edge=0.0,
+                spread_up=book_up.spread_pct if book_up else 0.0,
+                spread_down=book_down.spread_pct if book_down else 0.0,
+                secs_to_res=secs_to_res,
+                reason=f"spread_too_wide({side}={spread:.1f}%>{self.max_spread_pct}%)",
+                side=side, entry_price=ask,
+            )
+
+        # 4. Depth
+        if depth < self.min_depth:
+            return Signal(
+                action="skip", up_ask=up_ask, down_ask=down_ask,
+                pair_sum=0.0, net_edge=0.0,
+                spread_up=book_up.spread_pct if book_up else 0.0,
+                spread_down=book_down.spread_pct if book_down else 0.0,
+                secs_to_res=secs_to_res,
+                reason=f"depth_low({side}={depth:.0f}<{self.min_depth})",
+                side=side, entry_price=ask,
+            )
+
+        # 5. Entry price cap
+        if ask > self.max_entry_price:
+            return Signal(
+                action="skip", up_ask=up_ask, down_ask=down_ask,
+                pair_sum=0.0, net_edge=0.0,
+                spread_up=book_up.spread_pct if book_up else 0.0,
+                spread_down=book_down.spread_pct if book_down else 0.0,
+                secs_to_res=secs_to_res,
+                reason=f"price_too_high({side}_ask={ask:.4f}>{self.max_entry_price})",
+                side=side, entry_price=ask,
+            )
+
+        action = f"single_entry_{side}"
+        return Signal(
+            action=action, up_ask=up_ask, down_ask=down_ask,
+            pair_sum=0.0, net_edge=0.0,
+            spread_up=book_up.spread_pct if book_up else 0.0,
+            spread_down=book_down.spread_pct if book_down else 0.0,
+            secs_to_res=secs_to_res, reason="ok",
+            side=side, entry_price=ask,
+        )
+
     async def log_signal(self, signal: Signal) -> None:
         await log_module.log("signal", {
             "action": signal.action,
@@ -148,4 +221,6 @@ class SignalEngine:
             "spread_down": signal.spread_down,
             "secs_to_res": signal.secs_to_res,
             "reason": signal.reason,
+            "side": signal.side,
+            "entry_price": signal.entry_price,
         })

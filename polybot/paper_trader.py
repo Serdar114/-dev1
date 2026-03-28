@@ -75,6 +75,9 @@ class PaperPosition:
     spread_up_pct: float = 0.0     # UP token spread as percentage: (ask-bid)/mid*100
     spread_down_pct: float = 0.0   # DOWN token spread as percentage: (ask-bid)/mid*100
     secs_to_res: int = 0           # seconds to resolution at entry
+    # single-side fields (empty/0 for dual)
+    side: str = ""                 # "" = dual, "up" | "down" = single-side
+    entry_price: float = 0.0      # ask price of chosen side (single-side only)
     # unresolved lifecycle tracking
     resolution_retry_count: int = 0
     first_resolution_failure_ts: float = 0.0
@@ -256,6 +259,77 @@ class PaperTrader:
 
         return pos
 
+    def open_single_position(
+        self,
+        side: str,
+        entry_price: float,
+        shares: int,
+        btc_open: float,
+        window_ts: int,
+        interval: str = "5m",
+        market_context: dict | None = None,
+    ) -> PaperPosition:
+        """Single-side entry — one side at ask, taker fill."""
+        self._counter += 1
+        ctx = market_context or {}
+
+        fee_entry = compute_fee(shares, entry_price, self.fee_rate, self.fee_exponent)
+
+        pos = PaperPosition(
+            trade_id=f"single-{side}-{int(time.time())}-{self._counter}",
+            up_ask=ctx.get("up_ask", entry_price if side == "up" else 0.0),
+            down_ask=ctx.get("down_ask", entry_price if side == "down" else 0.0),
+            pair_sum=0.0,
+            net_edge=0.0,
+            shares=shares,
+            btc_open=btc_open,
+            opened_at=time.time(),
+            window_ts=window_ts,
+            interval=interval,
+            fee_up=fee_entry if side == "up" else 0.0,
+            fee_down=fee_entry if side == "down" else 0.0,
+            fee_total=fee_entry,
+            fee_rate=self.fee_rate,
+            fee_exponent=self.fee_exponent,
+            fee_source=self.fee_source,
+            fee_status=self.fee_status,
+            execution_lane=self.execution_lane,
+            side=side,
+            entry_price=entry_price,
+            market_slug=ctx.get("market_slug", ""),
+            btc_mid_binance=ctx.get("btc_mid_binance", 0.0),
+            up_bid=ctx.get("up_bid", 0.0),
+            down_bid=ctx.get("down_bid", 0.0),
+            spread_up_pct=ctx.get("spread_up_pct", 0.0),
+            spread_down_pct=ctx.get("spread_down_pct", 0.0),
+            secs_to_res=ctx.get("secs_to_res", 0),
+        )
+        self._positions.append(pos)
+
+        truth_logger.observe_sync("trade_opened", {
+            "trade_id": pos.trade_id,
+            "strategy": "single_side_taker",
+            "side": side,
+            "entry_price": entry_price,
+            "market_slug": pos.market_slug,
+            "interval": pos.interval,
+            "window_ts": pos.window_ts,
+            "execution_lane": pos.execution_lane,
+            "shares": pos.shares,
+            "btc_open": pos.btc_open,
+            "btc_mid_binance": pos.btc_mid_binance,
+            "secs_to_res": pos.secs_to_res,
+            "fee_total": pos.fee_total,
+            "fee_rate": pos.fee_rate,
+            "fee_source": pos.fee_source,
+            "fee_status": pos.fee_status,
+        })
+
+        if self.risk_manager:
+            self.risk_manager.on_trade_opened()
+
+        return pos
+
     async def resolve_pending(self, wait_secs: int | None = None) -> list[PaperPosition]:
         """Bekleyen pozisyonları resolve et — resolution_truth layer üzerinden."""
         pending = [pos for pos in self._positions if not pos.resolved]
@@ -331,9 +405,20 @@ class PaperTrader:
                 winning_side = truth.winner_binance
                 result = f"win_{winning_side}"
 
-                # PnL: fee-aware
-                gross_pnl = round(pos.shares * pos.net_edge, 4)
-                net_pnl = round(gross_pnl - pos.fee_total, 4)
+                # PnL: fee-aware — branch on dual vs single
+                if pos.side:
+                    # Single-side PnL
+                    if winning_side == pos.side:
+                        # Win: payout=shares, cost=shares*entry_price
+                        gross_pnl = round(pos.shares * (1.0 - pos.entry_price), 4)
+                    else:
+                        # Lose: payout=0, cost=shares*entry_price
+                        gross_pnl = round(-(pos.shares * pos.entry_price), 4)
+                    net_pnl = round(gross_pnl - pos.fee_total, 4)
+                else:
+                    # Dual-side PnL (unchanged)
+                    gross_pnl = round(pos.shares * pos.net_edge, 4)
+                    net_pnl = round(gross_pnl - pos.fee_total, 4)
 
                 pos.resolved = True
                 pos.btc_close = truth.btc_close_binance
