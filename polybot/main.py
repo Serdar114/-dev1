@@ -112,8 +112,10 @@ class PolyBot:
 
         # Strategy dispatch
         if self.strategy == "single_side_taker":
+            btc_open = self.feed.open_price or 0.0
             signal = self.signal_engine.evaluate_single(
                 book_up=book_up, book_down=book_down, secs_to_res=secs_to_res,
+                btc_mid=btc_mid, btc_open=btc_open,
             )
         else:
             signal = self.signal_engine.evaluate(

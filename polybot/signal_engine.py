@@ -41,8 +41,10 @@ class SignalEngine:
         self.entry_window_end: int = config.get("entry_window_end_ste", 10)
         # Single-side config
         self.strategy: str = config.get("strategy", "dual_side_capture")
-        self.forced_side: str = config.get("forced_side", "")  # "up" | "down"
+        self.forced_side: str = config.get("forced_side", "")  # "up" | "down" | ""
         self.max_entry_price: float = config.get("max_entry_price", 0.60)
+        self.signal_mode: str = config.get("signal_mode", "forced")  # "forced" | "btc_open_delta"
+        self.min_move_bps: int = config.get("min_move_bps", 10)
 
     def _skip(self, reason: str, secs_to_res: int,
               up_ask: float = 0.0, down_ask: float = 0.0) -> Signal:
@@ -138,12 +140,30 @@ class SignalEngine:
         book_up: BookSnapshot | None,
         book_down: BookSnapshot | None,
         secs_to_res: int,
+        btc_mid: float = 0.0,
+        btc_open: float = 0.0,
     ) -> Signal:
         """
-        Single-side taker: forced_side'ın ask'ını değerlendir.
-        Yön kararı config'den gelir — bu fonksiyon sadece giriş koşullarını kontrol eder.
+        Single-side taker signal evaluation.
+        Side selection:
+          - forced_side set -> use it (original behavior)
+          - forced_side empty + signal_mode=="btc_open_delta" -> derive from BTC price delta
+          - otherwise -> skip
         """
         side = self.forced_side
+
+        # Dynamic side selection when forced_side is not set
+        if not side and self.signal_mode == "btc_open_delta":
+            if btc_open <= 0 or btc_mid <= 0:
+                return self._skip("no_btc_prices", secs_to_res)
+            threshold = btc_open * (self.min_move_bps / 10000)
+            if btc_mid >= btc_open + threshold:
+                side = "up"
+            elif btc_mid <= btc_open - threshold:
+                side = "down"
+            else:
+                return self._skip("no_signal", secs_to_res)
+
         if side not in ("up", "down"):
             return self._skip("invalid_forced_side", secs_to_res)
 
