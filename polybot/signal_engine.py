@@ -226,12 +226,18 @@ class SignalEngine:
             )
 
         action = f"single_entry_{side}"
+        if btc_open > 0 and btc_mid > 0:
+            delta_bps = round((btc_mid - btc_open) / btc_open * 10000, 1)
+            reason = (f"ok(open={btc_open:.2f},mid={btc_mid:.2f},"
+                      f"delta_bps={delta_bps},min={self.min_move_bps})")
+        else:
+            reason = "ok"
         return Signal(
             action=action, up_ask=up_ask, down_ask=down_ask,
             pair_sum=0.0, net_edge=0.0,
             spread_up=book_up.spread_pct if book_up else 0.0,
             spread_down=book_down.spread_pct if book_down else 0.0,
-            secs_to_res=secs_to_res, reason="ok",
+            secs_to_res=secs_to_res, reason=reason,
             side=side, entry_price=ask,
         )
 
