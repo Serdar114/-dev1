@@ -162,7 +162,12 @@ class SignalEngine:
             elif btc_mid <= btc_open - threshold:
                 side = "down"
             else:
-                return self._skip("no_signal", secs_to_res)
+                delta_bps = round((btc_mid - btc_open) / btc_open * 10000, 1)
+                return self._skip(
+                    f"no_signal(open={btc_open:.2f},mid={btc_mid:.2f},"
+                    f"delta_bps={delta_bps},min={self.min_move_bps})",
+                    secs_to_res,
+                )
 
         if side not in ("up", "down"):
             return self._skip("invalid_forced_side", secs_to_res)
