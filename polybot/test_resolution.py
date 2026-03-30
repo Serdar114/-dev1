@@ -4,7 +4,11 @@ test_resolution.py — Smoke test for resolution_truth.py
 Tests:
   1. ABI parsing correctness with mock data
   2. _determine_winner logic
-  3. Live RPC fallback (may fail in sandboxed environments)
+  3. RPC fallback list structure
+  4. _encode_get_round_data + _parse_round_response helpers
+  5. Live resolve smoke test (may fail in sandboxed environments)
+  6. Historical window 1774900500 (known mismatch candidate)
+  7. Historical window 1774901700 (known mismatch candidate)
 """
 
 import asyncio
@@ -57,7 +61,7 @@ def test_determine_winner():
 
     assert _determine_winner(87000.0, 87100.0) == "up"
     assert _determine_winner(87000.0, 86900.0) == "down"
-    assert _determine_winner(87000.0, 87000.0) == "up"  # tie → up
+    assert _determine_winner(87000.0, 87000.0) == "up"  # tie -> up
     print("  [PASS] _determine_winner: up/down/tie all correct")
 
 
@@ -73,20 +77,54 @@ def test_rpc_fallback_list():
     print(f"  [PASS] POLYGON_RPC_URLS: {POLYGON_RPC_URLS}")
 
 
-async def test_live_resolve():
-    """Live smoke test — may fail in sandboxed environments."""
+def test_helpers():
+    """Verify _encode_get_round_data and _parse_round_response."""
+    from resolution_truth import _encode_get_round_data, _parse_round_response
+
+    # encode
+    data = _encode_get_round_data(12345)
+    assert data.startswith("0x9a6fc8f5"), f"Bad selector: {data[:10]}"
+    assert len(data) == 10 + 64, f"Bad length: {len(data)}"
+    decoded_id = int(data[10:], 16)
+    assert decoded_id == 12345, f"Bad round id: {decoded_id}"
+    print("  [PASS] _encode_get_round_data(12345) correct")
+
+    # parse
+    def enc256(v):
+        return format(v, "064x")
+    def enc_int256(v):
+        if v < 0:
+            v = (1 << 256) + v
+        return format(v, "064x")
+
+    mock = "0x" + (
+        enc256(999)               # roundId
+        + enc_int256(8750000000000)  # answer: 87500.00 with 8 dec
+        + enc256(1774900000)      # startedAt
+        + enc256(1774900100)      # updatedAt
+        + enc256(999)             # answeredInRound
+    )
+    parsed = _parse_round_response(mock)
+    assert parsed is not None
+    rid, price, updated_at = parsed
+    assert rid == 999, f"Bad roundId: {rid}"
+    assert price == 87500.0, f"Bad price: {price}"
+    assert updated_at == 1774900100, f"Bad updatedAt: {updated_at}"
+    print(f"  [PASS] _parse_round_response: rid={rid} price={price} updatedAt={updated_at}")
+
+    # short response
+    assert _parse_round_response("0xdeadbeef") is None
+    print("  [PASS] _parse_round_response: short response -> None")
+
+
+async def _resolve_window(window_ts: int, btc_open: float, label: str):
+    """Helper to resolve a single window and print results."""
     from resolution_truth import resolve_truth
 
-    now = int(time.time())
-    past_window = ((now - 600) // 300) * 300
-    btc_open = 87000.0
-    print(f"  window_ts={past_window} (closed ~{now - past_window - 300}s ago)")
-    print(f"  btc_open={btc_open} (arbitrary reference)")
-
+    print(f"  window_ts={window_ts} btc_open={btc_open} ({label})")
     result = await resolve_truth(
-        window_ts=past_window, interval="5m", btc_open=btc_open
+        window_ts=window_ts, interval="5m", btc_open=btc_open,
     )
-
     print(f"  btc_close_binance={result.btc_close_binance}")
     print(f"  binance_fetch_ok={result.binance_fetch_ok}")
     print(f"  winner_binance={result.winner_binance}")
@@ -97,38 +135,65 @@ async def test_live_resolve():
     print(f"  resolution_truth_status={result.resolution_truth_status}")
     print(f"  winner_source={result.winner_source}")
 
-    # Structural assertions — always valid regardless of network
+    # Structural assertions
     assert result.interval == "5m"
-    assert result.window_ts == past_window
+    assert result.window_ts == window_ts
     assert result.winner_binance in ("up", "down", "unknown")
     assert result.winner_chainlink in ("up", "down", "unknown")
     assert result.resolution_truth_status in (
         "dual_verified", "dual_mismatch", "binance_only", "unresolved_fetch_error",
     )
 
-    if result.binance_fetch_ok and result.chainlink_status.startswith("fetched"):
-        print("  [PASS] LIVE: dual resolution succeeded")
-    elif result.binance_fetch_ok:
-        print(f"  [PASS] LIVE: binance_only (chainlink: {result.chainlink_status})")
+    if result.chainlink_status.startswith("fetched"):
+        print(f"  [PASS] chainlink fetched (historical round)")
+    elif "all_rpc_failed" in result.chainlink_status:
+        print(f"  [PASS] all RPCs failed (sandbox expected)")
     else:
-        print(f"  [PASS] LIVE: both fetches failed (sandbox expected)")
+        print(f"  [PASS] chainlink_status={result.chainlink_status}")
+    return result
+
+
+async def test_live_resolve():
+    """Live smoke test with recent window."""
+    now = int(time.time())
+    past_window = ((now - 600) // 300) * 300
+    await _resolve_window(past_window, 87000.0, "recent window")
+
+
+async def test_window_1774900500():
+    """Known mismatch candidate: window_ts=1774900500."""
+    await _resolve_window(1774900500, 87000.0, "known mismatch window #1")
+
+
+async def test_window_1774901700():
+    """Known mismatch candidate: window_ts=1774901700."""
+    await _resolve_window(1774901700, 87000.0, "known mismatch window #2")
 
 
 def main():
     print("=== test_resolution.py ===")
     print()
 
-    print("[1/4] ABI parsing test...")
+    print("[1/7] ABI parsing test...")
     test_abi_parsing()
 
-    print("[2/4] _determine_winner test...")
+    print("[2/7] _determine_winner test...")
     test_determine_winner()
 
-    print("[3/4] RPC fallback list test...")
+    print("[3/7] RPC fallback list test...")
     test_rpc_fallback_list()
 
-    print("[4/4] Live resolve smoke test...")
+    print("[4/7] Helper functions test...")
+    test_helpers()
+
+    print("[5/7] Live resolve smoke test...")
     asyncio.run(test_live_resolve())
+
+    print("[6/7] Historical window 1774900500...")
+    asyncio.run(test_window_1774900500())
+
+    print("[7/7] Historical window 1774901700...")
+    asyncio.run(test_window_1774901700())
 
     print()
     print("=== ALL TESTS PASSED ===")
