@@ -3,14 +3,15 @@ Resolution Truth — Resolve anında winner belirlemek için truth layer.
 
 Katmanlar:
   1. Binance REST: btc_close çeker, btc_open ile karşılaştırır → winner_binance
-  2. Chainlink:    PLACEHOLDER — henüz gerçek fetch yok
+  2. Chainlink:    Polygon RPC eth_call → latestRoundData() on BTC/USD feed
   3. Karşılaştırma: iki kaynak uyuşuyor mu? → resolution_match
 
 Polymarket BTC 5m/15m marketleri Chainlink ile resolve oluyor.
 Binance close yalnızca proxy/sinyal — canonical truth değil.
 
 UNPROVEN:
-  - Chainlink fetch henüz implemente değil (placeholder).
+  - latestRoundData() returns current round, not historical — acceptable
+    when called ~130s after window close, but not for replaying old windows.
   - Chainlink'in tam resolution timestamp'i ile Binance REST çağrı anı
     arasındaki sapma ölçülmemiş.
   - Token UP/DOWN index sırası (market_discovery) doğrulanmamış.
@@ -25,6 +26,13 @@ from dataclasses import dataclass
 
 
 BINANCE_REST_URL = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+
+# Chainlink BTC/USD AggregatorV3 on Polygon mainnet
+CHAINLINK_BTC_USD_POLYGON = "0xc907E116054Ad103354f2D350FD2514433D57F6f"
+POLYGON_RPC_URL = "https://polygon-rpc.com"
+CHAINLINK_DECIMALS = 8
+# Max seconds between chainlink updatedAt and round_end to be "fresh"
+CHAINLINK_STALENESS_LIMIT = 600
 
 
 @dataclass
@@ -105,30 +113,105 @@ async def _fetch_btc_close_binance() -> tuple[float, bool]:
 async def _fetch_btc_close_chainlink(
     window_ts: int,
     interval: str,
+    btc_open: float,
 ) -> tuple[float, str, str]:
     """
-    Chainlink resolution fetch — PLACEHOLDER.
+    Chainlink BTC/USD Price Feed on Polygon via raw JSON-RPC eth_call.
 
-    Gerçek implementasyon için gerekli:
-      - Chainlink Price Feed contract adresi (Polygon)
-      - Web3 provider (Polygon RPC)
-      - getRoundData() veya latestRoundData() çağrısı
-      - Polymarket'in kullandığı exact resolution logic (hangi round, hangi timestamp)
+    Calls latestRoundData() on AggregatorV3Interface at CHAINLINK_BTC_USD_POLYGON.
+    Response ABI: (uint80 roundId, int256 answer, uint256 startedAt,
+                   uint256 updatedAt, uint80 answeredInRound)
 
     Returns: (price, winner, status)
-      price = 0.0  → henüz fetch edilmedi
-      winner = "unknown"
-      status = "placeholder"
+      status: "fetched" | "fetched_stale" | "http_error" | "rpc_error" |
+              "short_response" | "invalid_price" | "fetch_error"
     """
-    # PLACEHOLDER — gerçek Chainlink fetch buraya gelecek
-    await log_module.log("resolution_chainlink_placeholder", {
-        "window_ts": window_ts,
-        "interval": interval,
-        "note": "UNPROVEN: Chainlink fetch not implemented. "
-                "This is a placeholder skeleton. "
-                "Real implementation requires Polygon Web3 + Chainlink AggregatorV3 contract.",
-    })
-    return 0.0, "unknown", "placeholder"
+    round_end = window_ts + (300 if interval == "5m" else 900)
+
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "eth_call",
+        "params": [
+            {
+                "to": CHAINLINK_BTC_USD_POLYGON,
+                "data": "0xfeaf968c",  # latestRoundData()
+            },
+            "latest",
+        ],
+        "id": 1,
+    }
+
+    try:
+        connector = aiohttp.TCPConnector(
+            family=socket.AF_INET,
+            resolver=aiohttp.resolver.ThreadedResolver(),
+        )
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async with session.post(
+                POLYGON_RPC_URL,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as r:
+                if r.status != 200:
+                    body = await r.text()
+                    await log_module.log("resolution_chainlink_http_error", {
+                        "status": r.status, "body": body[:200],
+                    })
+                    return 0.0, "unknown", f"http_error_{r.status}"
+
+                data = await r.json()
+
+                if "error" in data:
+                    await log_module.log("resolution_chainlink_rpc_error", {
+                        "error": data["error"],
+                    })
+                    return 0.0, "unknown", "rpc_error"
+
+                result_hex = data.get("result", "0x")
+                # 5 ABI slots × 64 hex chars + "0x" prefix = 322 chars minimum
+                if len(result_hex) < 322:
+                    await log_module.log("resolution_chainlink_short_response", {
+                        "result_len": len(result_hex),
+                    })
+                    return 0.0, "unknown", "short_response"
+
+                hex_data = result_hex[2:]
+                # Slot 1 (offset 64-128): answer (int256), 8 decimals
+                answer_raw = int(hex_data[64:128], 16)
+                if answer_raw >= 2**255:
+                    answer_raw -= 2**256
+                price = round(answer_raw / (10 ** CHAINLINK_DECIMALS), 2)
+
+                # Slot 3 (offset 192-256): updatedAt (uint256)
+                updated_at = int(hex_data[192:256], 16)
+
+                staleness = abs(updated_at - round_end)
+
+                if price <= 0:
+                    await log_module.log("resolution_chainlink_invalid_price", {
+                        "raw_answer": answer_raw, "updated_at": updated_at,
+                    })
+                    return 0.0, "unknown", "invalid_price"
+
+                winner = _determine_winner(btc_open, price)
+                status = "fetched" if staleness <= CHAINLINK_STALENESS_LIMIT else "fetched_stale"
+
+                await log_module.log("resolution_chainlink_fetched", {
+                    "price": price,
+                    "updated_at": updated_at,
+                    "round_end_ts": round_end,
+                    "staleness_secs": staleness,
+                    "status": status,
+                    "winner": winner,
+                })
+
+                return price, winner, status
+
+    except Exception as e:
+        await log_module.log("resolution_chainlink_fetch_error", {
+            "error": str(e), "window_ts": window_ts,
+        })
+        return 0.0, "unknown", "fetch_error"
 
 
 async def resolve_truth(
@@ -160,9 +243,9 @@ async def resolve_truth(
             "note": "Binance close fetch failed. No fallback used. Winner = unknown.",
         })
 
-    # --- Layer 2: Chainlink (PLACEHOLDER) ---
+    # --- Layer 2: Chainlink (Polygon RPC) ---
     btc_close_chainlink, winner_chainlink, chainlink_status = (
-        await _fetch_btc_close_chainlink(window_ts, interval)
+        await _fetch_btc_close_chainlink(window_ts, interval, btc_open)
     )
 
     # --- Karşılaştırma ---
@@ -171,7 +254,7 @@ async def resolve_truth(
         resolution_match = "unknown"
         winner_source = "none"
         resolution_truth_status = "unresolved_fetch_error"
-    elif chainlink_status == "fetched" and winner_chainlink != "unknown":
+    elif chainlink_status in ("fetched", "fetched_stale") and winner_chainlink != "unknown":
         # İki kaynak da var → karşılaştır
         winner_source = "binance"
         if winner_binance == winner_chainlink:
