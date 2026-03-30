@@ -161,13 +161,13 @@ async def test_live_resolve():
 
 
 async def test_window_1774900500():
-    """Known mismatch candidate: window_ts=1774900500."""
-    await _resolve_window(1774900500, 87000.0, "known mismatch window #1")
+    """Known mismatch candidate: window_ts=1774900500, real btc_open=66549.535."""
+    await _resolve_window(1774900500, 66549.535, "known mismatch window #1")
 
 
 async def test_window_1774901700():
-    """Known mismatch candidate: window_ts=1774901700."""
-    await _resolve_window(1774901700, 87000.0, "known mismatch window #2")
+    """Known mismatch candidate: window_ts=1774901700, real btc_open=66614.935."""
+    await _resolve_window(1774901700, 66614.935, "known mismatch window #2")
 
 
 def main():

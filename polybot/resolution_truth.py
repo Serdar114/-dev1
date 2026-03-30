@@ -22,6 +22,7 @@ UNPROVEN:
 """
 
 import time
+import asyncio
 import socket
 import aiohttp
 import aiohttp.resolver
@@ -245,22 +246,81 @@ async def _fetch_btc_close_chainlink(
                             ],
                             "id": step + 1,
                         }
-                        async with session.post(
-                            rpc_url, json=get_payload, timeout=timeout,
-                        ) as r2:
-                            if r2.status != 200:
-                                last_error = f"walkback_http_{r2.status}"
+
+                        # Fetch with 429 retry (max 3 attempts: 1s, 2s, 3s)
+                        step_ok = False
+                        resp_json = None
+                        for attempt in range(3):
+                            try:
+                                async with session.post(
+                                    rpc_url, json=get_payload, timeout=timeout,
+                                ) as r2:
+                                    if r2.status == 429:
+                                        wait_s = (attempt + 1) * 1.0
+                                        await log_module.log(
+                                            "resolution_chainlink_walkback_429", {
+                                                "rpc_url": rpc_url,
+                                                "walk_id": walk_id,
+                                                "walk_step": step,
+                                                "attempt": attempt + 1,
+                                                "backoff_secs": wait_s,
+                                            },
+                                        )
+                                        await asyncio.sleep(wait_s)
+                                        continue
+                                    if r2.status != 200:
+                                        last_error = f"walkback_http_{r2.status}"
+                                        await log_module.log(
+                                            "resolution_chainlink_walkback_http", {
+                                                "rpc_url": rpc_url,
+                                                "walk_id": walk_id,
+                                                "walk_step": step,
+                                                "status": r2.status,
+                                            },
+                                        )
+                                        break
+                                    resp_json = await r2.json()
+                                    step_ok = True
+                                    break
+                            except Exception as step_exc:
+                                last_error = f"walkback_exc: {str(step_exc)[:80]}"
                                 break
-                            data2 = await r2.json()
-                            if "error" in data2:
-                                last_error = "walkback_rpc_error"
-                                break
-                            parsed2 = _parse_round_response(
-                                data2.get("result", "0x")
+
+                        if not step_ok or resp_json is None:
+                            # This round's fetch failed — skip, keep walking
+                            walk_id -= 1
+                            continue
+
+                        if "error" in resp_json:
+                            last_error = "walkback_rpc_error"
+                            await log_module.log(
+                                "resolution_chainlink_walkback_rpc_error", {
+                                    "rpc_url": rpc_url,
+                                    "walk_id": walk_id,
+                                    "walk_step": step,
+                                    "error": resp_json["error"],
+                                },
                             )
-                            if not parsed2:
-                                last_error = "walkback_parse_fail"
-                                break
+                            walk_id -= 1
+                            continue
+
+                        parsed2 = _parse_round_response(
+                            resp_json.get("result", "0x")
+                        )
+                        if not parsed2:
+                            last_error = "walkback_parse_fail"
+                            await log_module.log(
+                                "resolution_chainlink_walkback_parse_fail", {
+                                    "rpc_url": rpc_url,
+                                    "walk_id": walk_id,
+                                    "walk_step": step,
+                                    "result_len": len(
+                                        resp_json.get("result", "0x")
+                                    ),
+                                },
+                            )
+                            walk_id -= 1
+                            continue
 
                         rid, rprice, rupdated = parsed2
                         if rupdated <= round_end:
@@ -283,6 +343,8 @@ async def _fetch_btc_close_chainlink(
                             "latest_round_id": latest_round_id,
                             "latest_updated_at": latest_updated_at,
                             "round_end_ts": round_end,
+                            "steps_attempted": step,
+                            "last_walk_id": walk_id,
                             "last_error": last_error,
                             "window_ts": window_ts,
                         })
