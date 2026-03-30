@@ -29,7 +29,11 @@ BINANCE_REST_URL = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
 
 # Chainlink BTC/USD AggregatorV3 on Polygon mainnet
 CHAINLINK_BTC_USD_POLYGON = "0xc907E116054Ad103354f2D350FD2514433D57F6f"
-POLYGON_RPC_URL = "https://polygon-rpc.com"
+POLYGON_RPC_URLS = [
+    "https://polygon.drpc.org",
+    "https://polygon.publicnode.com",
+    "https://1rpc.io/matic",
+]
 CHAINLINK_DECIMALS = 8
 # Max seconds between chainlink updatedAt and round_end to be "fresh"
 CHAINLINK_STALENESS_LIMIT = 600
@@ -141,77 +145,103 @@ async def _fetch_btc_close_chainlink(
         "id": 1,
     }
 
-    try:
-        connector = aiohttp.TCPConnector(
-            family=socket.AF_INET,
-            resolver=aiohttp.resolver.ThreadedResolver(),
-        )
-        async with aiohttp.ClientSession(connector=connector) as session:
-            async with session.post(
-                POLYGON_RPC_URL,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=8),
-            ) as r:
-                if r.status != 200:
-                    body = await r.text()
-                    await log_module.log("resolution_chainlink_http_error", {
-                        "status": r.status, "body": body[:200],
+    last_error = ""
+    last_rpc = ""
+
+    for rpc_url in POLYGON_RPC_URLS:
+        last_rpc = rpc_url
+        try:
+            connector = aiohttp.TCPConnector(
+                family=socket.AF_INET,
+                resolver=aiohttp.resolver.ThreadedResolver(),
+            )
+            async with aiohttp.ClientSession(connector=connector) as session:
+                async with session.post(
+                    rpc_url,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=8),
+                ) as r:
+                    if r.status != 200:
+                        body = await r.text()
+                        last_error = f"http_{r.status}"
+                        await log_module.log("resolution_chainlink_http_error", {
+                            "rpc_url": rpc_url, "status": r.status,
+                            "body": body[:200],
+                        })
+                        continue
+
+                    data = await r.json()
+
+                    if "error" in data:
+                        last_error = "rpc_error"
+                        await log_module.log("resolution_chainlink_rpc_error", {
+                            "rpc_url": rpc_url, "error": data["error"],
+                        })
+                        continue
+
+                    result_hex = data.get("result", "0x")
+                    # 5 ABI slots × 64 hex chars + "0x" prefix = 322 chars minimum
+                    if len(result_hex) < 322:
+                        last_error = "short_response"
+                        await log_module.log("resolution_chainlink_short_response", {
+                            "rpc_url": rpc_url, "result_len": len(result_hex),
+                        })
+                        continue
+
+                    hex_data = result_hex[2:]
+                    # Slot 1 (offset 64-128): answer (int256), 8 decimals
+                    answer_raw = int(hex_data[64:128], 16)
+                    if answer_raw >= 2**255:
+                        answer_raw -= 2**256
+                    price = round(answer_raw / (10 ** CHAINLINK_DECIMALS), 2)
+
+                    # Slot 3 (offset 192-256): updatedAt (uint256)
+                    updated_at = int(hex_data[192:256], 16)
+
+                    staleness = abs(updated_at - round_end)
+
+                    if price <= 0:
+                        last_error = "invalid_price"
+                        await log_module.log("resolution_chainlink_invalid_price", {
+                            "rpc_url": rpc_url,
+                            "raw_answer": answer_raw, "updated_at": updated_at,
+                        })
+                        continue
+
+                    winner = _determine_winner(btc_open, price)
+                    status = "fetched" if staleness <= CHAINLINK_STALENESS_LIMIT else "fetched_stale"
+
+                    await log_module.log("resolution_chainlink_fetched", {
+                        "rpc_url": rpc_url,
+                        "price": price,
+                        "updated_at": updated_at,
+                        "round_end_ts": round_end,
+                        "staleness_secs": staleness,
+                        "status": status,
+                        "winner": winner,
                     })
-                    return 0.0, "unknown", f"http_error_{r.status}"
 
-                data = await r.json()
+                    return price, winner, status
 
-                if "error" in data:
-                    await log_module.log("resolution_chainlink_rpc_error", {
-                        "error": data["error"],
-                    })
-                    return 0.0, "unknown", "rpc_error"
+        except Exception as e:
+            last_error = str(e)[:120]
+            await log_module.log("resolution_chainlink_rpc_fail", {
+                "rpc_url": rpc_url, "error": last_error, "window_ts": window_ts,
+            })
+            continue
 
-                result_hex = data.get("result", "0x")
-                # 5 ABI slots × 64 hex chars + "0x" prefix = 322 chars minimum
-                if len(result_hex) < 322:
-                    await log_module.log("resolution_chainlink_short_response", {
-                        "result_len": len(result_hex),
-                    })
-                    return 0.0, "unknown", "short_response"
-
-                hex_data = result_hex[2:]
-                # Slot 1 (offset 64-128): answer (int256), 8 decimals
-                answer_raw = int(hex_data[64:128], 16)
-                if answer_raw >= 2**255:
-                    answer_raw -= 2**256
-                price = round(answer_raw / (10 ** CHAINLINK_DECIMALS), 2)
-
-                # Slot 3 (offset 192-256): updatedAt (uint256)
-                updated_at = int(hex_data[192:256], 16)
-
-                staleness = abs(updated_at - round_end)
-
-                if price <= 0:
-                    await log_module.log("resolution_chainlink_invalid_price", {
-                        "raw_answer": answer_raw, "updated_at": updated_at,
-                    })
-                    return 0.0, "unknown", "invalid_price"
-
-                winner = _determine_winner(btc_open, price)
-                status = "fetched" if staleness <= CHAINLINK_STALENESS_LIMIT else "fetched_stale"
-
-                await log_module.log("resolution_chainlink_fetched", {
-                    "price": price,
-                    "updated_at": updated_at,
-                    "round_end_ts": round_end,
-                    "staleness_secs": staleness,
-                    "status": status,
-                    "winner": winner,
-                })
-
-                return price, winner, status
-
-    except Exception as e:
-        await log_module.log("resolution_chainlink_fetch_error", {
-            "error": str(e), "window_ts": window_ts,
-        })
-        return 0.0, "unknown", "fetch_error"
+    # All RPCs failed
+    from urllib.parse import urlparse
+    last_host = urlparse(last_rpc).hostname or last_rpc
+    status = f"all_rpc_failed({last_host}:{last_error})"
+    await log_module.log("resolution_chainlink_all_failed", {
+        "rpc_count": len(POLYGON_RPC_URLS),
+        "last_rpc": last_rpc,
+        "last_error": last_error,
+        "status": status,
+        "window_ts": window_ts,
+    })
+    return 0.0, "unknown", status
 
 
 async def resolve_truth(
