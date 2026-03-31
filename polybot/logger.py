@@ -11,6 +11,16 @@ LOG_DIR.mkdir(exist_ok=True)
 
 _lock = asyncio.Lock()
 
+# Session-level context stamped into every log entry (run_id, pid).
+# Set once at startup via set_session_ctx(); never mutated after that.
+_session_ctx: dict = {}
+
+
+def set_session_ctx(ctx: dict) -> None:
+    """Inject run_id and pid (or any session constant) into every log entry."""
+    global _session_ctx
+    _session_ctx = dict(ctx)
+
 
 def _log_path() -> Path:
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -22,6 +32,7 @@ async def log(event: str, data: dict) -> None:
     entry = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "event": event,
+        **_session_ctx,
         **data,
     }
     line = json.dumps(entry, default=str) + "\n"
@@ -35,6 +46,7 @@ def log_sync(event: str, data: dict) -> None:
     entry = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "event": event,
+        **_session_ctx,
         **data,
     }
     line = json.dumps(entry, default=str) + "\n"

@@ -29,7 +29,9 @@ if sys.platform == "win32":
         pass  # Python 3.16+ kaldırıldıysa sessizce geç
 
 import json
+import os
 import time
+import uuid
 import argparse
 from pathlib import Path
 
@@ -67,6 +69,10 @@ class PolyBot:
         self.config = config
         self.interval: str = config.get("market_type", "5m")
         self.mode: str = config.get("mode", "paper")
+
+        # Session identity — stamped in every log entry via set_session_ctx()
+        self.run_id: str = str(uuid.uuid4())
+        self._pid: int = os.getpid()
 
         self.feed = BinanceFeed(
             ws_url=config.get("binance_ws", "wss://stream.binance.com:9443/ws/btcusdt@bookTicker"),
@@ -122,10 +128,13 @@ class PolyBot:
         if signal.action == "skip":
             return
 
-        # Trade aç
+        # Risk check — if blocked, lock this window: no further open attempt.
+        # Setting _signal_sent=True here prevents contradictory blocked→opened
+        # outcome from a later tick in the same window.
         can_trade, trade_reason = self.risk_manager.can_trade()
         if not can_trade:
             p(f"[tick] trade_blocked: {trade_reason}")
+            self._signal_sent = True  # window decision: blocked — no further eval
             return
 
         shares = self.config.get("shares_per_side", 5)
@@ -156,8 +165,11 @@ class PolyBot:
         self._signal_sent = True
         p(f"[DUAL] {pos.trade_id} up_ask={signal.up_ask:.4f} down_ask={signal.down_ask:.4f} "
           f"pair_sum={signal.pair_sum:.4f} net_edge={signal.net_edge:.4f} shares={shares}")
+
+        # Canonical trade_opened write — single writer, run_id+pid present via session_ctx
         await log_module.log("trade_opened", {
             "trade_id": pos.trade_id,
+            "window_ts": self._window_ts,
             "mode": self.mode,
             "strategy": "dual_side_capture",
             "up_ask": signal.up_ask,
@@ -169,6 +181,13 @@ class PolyBot:
             "secs_to_res": secs_to_res,
             "fee_source": self.paper_trader.fee_source,
             "fee_status": self.paper_trader.fee_status,
+            "fee_rate": self.paper_trader.fee_rate,
+            "fee_exponent": self.paper_trader.fee_exponent,
+            "fee_exponent_source": self.paper_trader.fee_exponent_source,
+            "tick_size": self.paper_trader.tick_size,
+            "tick_size_source": self.paper_trader.tick_size_source,
+            "min_order_size": self.paper_trader.min_order_size,
+            "min_order_size_source": self.paper_trader.min_order_size_source,
             "execution_lane": self.paper_trader.execution_lane,
             **self.risk_manager.summary(),
         })
@@ -293,15 +312,24 @@ class PolyBot:
 
     async def run(self, run_once: bool = False) -> None:
         self._running = True
-        p(f"[run] bot_start mode={self.mode} interval={self.interval}")
+
+        # Inject run_id + pid into every log entry for this session
+        log_module.set_session_ctx({"run_id": self.run_id, "pid": self._pid})
+
+        p(f"[run] bot_start mode={self.mode} interval={self.interval} run_id={self.run_id} pid={self._pid}")
         log_module.log_sync("bot_start", {
             "mode": self.mode,
             "market_type": self.interval,
             "bankroll": self.config.get("bankroll", 30.0),
             "fee_rate": self.paper_trader.fee_rate,
-            "fee_exponent": self.paper_trader.fee_exponent,
             "fee_source": self.paper_trader.fee_source,
             "fee_status": self.paper_trader.fee_status,
+            "fee_exponent": self.paper_trader.fee_exponent,
+            "fee_exponent_source": self.paper_trader.fee_exponent_source,
+            "tick_size": self.paper_trader.tick_size,
+            "tick_size_source": self.paper_trader.tick_size_source,
+            "min_order_size": self.paper_trader.min_order_size,
+            "min_order_size_source": self.paper_trader.min_order_size_source,
             "execution_lane": self.paper_trader.execution_lane,
         })
 

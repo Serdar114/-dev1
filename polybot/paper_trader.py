@@ -15,6 +15,12 @@ Trade akışı:
   6. JSONL: fee_up, fee_down, fee_total, gross_pnl, net_pnl alanları dahil
 
 fee_rate ve fee_exponent config'den okunur — hardcode yok.
+
+Integrity invariants (enforced here):
+  - max 1 open_position() per window_ts (_opened_window_ts guard)
+  - max 1 trade_resolved per trade_id (_resolved_ids guard)
+  - Single canonical writer for lifecycle events: log_module only.
+    truth_logger is NOT used here for trade_opened/trade_resolved.
 """
 
 import asyncio
@@ -22,7 +28,6 @@ import aiohttp
 import time
 from dataclasses import dataclass
 import logger as log_module
-import truth_logger
 from resolution_truth import resolve_truth
 from fee_engine import compute_fee
 
@@ -86,18 +91,26 @@ class PaperTrader:
         self.resolve_confirm_secs: int = config.get("resolve_confirm_secs", 130)
         self.shares_per_side: int = config.get("shares_per_side", 5)
 
-        # Fee source detection — config'de açıkça var mı, yoksa fallback mı?
+        # --- fee_rate: config-explicit or fallback (labeled) ---
         fee_rate_configured = "fee_rate" in config
-
         self.fee_rate: float = config.get("fee_rate", 0.072)
-        self.fee_exponent: float = config.get("fee_exponent", 1.0)
+        self.fee_source: str = "config" if fee_rate_configured else "fallback"
+        self.fee_status: str = "configured" if fee_rate_configured else "fallback_used"
 
-        if fee_rate_configured:
-            self.fee_source: str = "config"
-            self.fee_status: str = "configured"
-        else:
-            self.fee_source: str = "fallback"
-            self.fee_status: str = "fallback_used"
+        # --- fee_exponent: config-explicit or fallback (labeled) ---
+        fee_exp_configured = "fee_exponent" in config
+        self.fee_exponent: float = config.get("fee_exponent", 1.0)
+        self.fee_exponent_source: str = "config" if fee_exp_configured else "fallback"
+
+        # --- tick_size: config-explicit or fallback (labeled) ---
+        tick_size_configured = "tick_size" in config
+        self.tick_size: float = config.get("tick_size", 0.01)
+        self.tick_size_source: str = "config" if tick_size_configured else "fallback"
+
+        # --- min_order_size: config-explicit or fallback (labeled) ---
+        min_order_configured = "min_order_size" in config
+        self.min_order_size: float = config.get("min_order_size", 1.0)
+        self.min_order_size_source: str = "config" if min_order_configured else "fallback"
 
         # Market discovery fee attempt tracking
         self._market_fee_attempted: bool = False
@@ -110,6 +123,12 @@ class PaperTrader:
         self._positions: list[PaperPosition] = []
         self._counter: int = 0
         self.risk_manager = risk_manager
+
+        # Integrity guards
+        # max 1 open_position per window_ts — prevents same-window double-open
+        self._opened_window_ts: set[int] = set()
+        # max 1 trade_resolved per trade_id — prevents retry-loop double-resolve
+        self._resolved_ids: set[str] = set()
 
     async def try_update_fee_from_market(self, token_id: str) -> dict:
         """
@@ -186,7 +205,24 @@ class PaperTrader:
         interval: str = "5m",
         market_context: dict | None = None,
     ) -> PaperPosition:
-        """Dual entry simüle et — her iki taraf ask'tan fill edildi kabul edilir."""
+        """Dual entry simüle et — her iki taraf ask'tan fill edildi kabul edilir.
+
+        Integrity: max 1 call per window_ts. If called a second time for the same
+        window_ts, logs an integrity_violation and raises RuntimeError — the caller
+        (_signal_sent guard in main.py) should have prevented this.
+        """
+        if window_ts in self._opened_window_ts:
+            # Belt-and-suspenders: _signal_sent in main.py must have failed.
+            log_module.log_sync("integrity_violation", {
+                "violation": "duplicate_open_position",
+                "window_ts": window_ts,
+                "counter": self._counter,
+            })
+            raise RuntimeError(
+                f"open_position called twice for window_ts={window_ts}. "
+                "Integrity violation — check _signal_sent guard in main.py."
+            )
+
         self._counter += 1
         pair_sum = round(up_ask + down_ask, 4)
         net_edge = round(1.0 - pair_sum, 4)
@@ -225,31 +261,10 @@ class PaperTrader:
             secs_to_res=ctx.get("secs_to_res", 0),
         )
         self._positions.append(pos)
+        self._opened_window_ts.add(window_ts)
 
-        # Truth observation — trade_opened (with market context)
-        truth_logger.observe_sync("trade_opened", {
-            "trade_id": pos.trade_id,
-            "market_slug": pos.market_slug,
-            "interval": pos.interval,
-            "window_ts": pos.window_ts,
-            "execution_lane": pos.execution_lane,
-            "pair_sum": pos.pair_sum,
-            "up_bid": pos.up_bid,
-            "up_ask": pos.up_ask,
-            "down_bid": pos.down_bid,
-            "down_ask": pos.down_ask,
-            "spread_up_pct": pos.spread_up_pct,
-            "spread_down_pct": pos.spread_down_pct,
-            "net_edge": pos.net_edge,
-            "shares": pos.shares,
-            "btc_open": pos.btc_open,
-            "btc_mid_binance": pos.btc_mid_binance,
-            "secs_to_res": pos.secs_to_res,
-            "fee_total": pos.fee_total,
-            "fee_rate": pos.fee_rate,
-            "fee_source": pos.fee_source,
-            "fee_status": pos.fee_status,
-        })
+        # Canonical trade_opened write is in main.py (log_module.log).
+        # truth_logger is NOT used here — single writer per event type.
 
         if self.risk_manager:
             self.risk_manager.on_trade_opened()
@@ -257,7 +272,11 @@ class PaperTrader:
         return pos
 
     async def resolve_pending(self, wait_secs: int | None = None) -> list[PaperPosition]:
-        """Bekleyen pozisyonları resolve et — resolution_truth layer üzerinden."""
+        """Bekleyen pozisyonları resolve et — resolution_truth layer üzerinden.
+
+        Integrity: max 1 resolution per trade_id (_resolved_ids guard).
+        Canonical trade_resolved write is log_module only — truth_logger not used here.
+        """
         pending = [pos for pos in self._positions if not pos.resolved]
         if not pending:
             return []
@@ -269,6 +288,15 @@ class PaperTrader:
 
         resolved = []
         for pos in pending:
+            # Guard: skip if already resolved in a previous resolve_pending() call
+            if pos.trade_id in self._resolved_ids:
+                await log_module.log("integrity_violation", {
+                    "violation": "duplicate_resolve_attempt",
+                    "trade_id": pos.trade_id,
+                    "window_ts": pos.window_ts,
+                })
+                continue
+
             try:
                 # Resolution truth layer — Binance + Chainlink (placeholder)
                 truth = await resolve_truth(
@@ -317,14 +345,8 @@ class PaperTrader:
                         "note": "Truth layer could not determine winner. "
                                 "Trade NOT finalized. No PnL assigned.",
                     }
+                    # Single canonical writer: log_module only.
                     await log_module.log("trade_resolution_blocked", blocked_data)
-                    await truth_logger.observe("trade_resolution_blocked", {
-                        **blocked_data,
-                        "execution_lane": pos.execution_lane,
-                        "fee_source": pos.fee_source,
-                        "fee_status": pos.fee_status,
-                        "pair_sum": pos.pair_sum,
-                    })
                     continue
 
                 # Valid winner var — trade'i finalize et
@@ -382,8 +404,10 @@ class PaperTrader:
                     "resolution_match": pos.resolution_match,
                     "chainlink_status": pos.chainlink_status,
                 }
+                # Single canonical writer: log_module only.
                 await log_module.log("trade_resolved", resolved_data)
-                await truth_logger.observe("trade_resolved", resolved_data)
+                # Mark resolved — guard prevents any future duplicate
+                self._resolved_ids.add(pos.trade_id)
                 resolved.append(pos)
 
             except Exception as e:
