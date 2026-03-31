@@ -89,6 +89,11 @@ class PolyBot:
         self._window_slug: str = ""
         self._signal_sent = False
         self._last_eval_sec: int = 0  # tick throttle: aynı saniyede max 1 değerlendirme
+        # First-cross one-shot state (btc_open_delta mode only, reset each window)
+        self._first_cross_detected: bool = False
+        self._window_skip_locked: bool = False
+        self._window_skip_locked_reason: str = ""
+        self._skip_lock_logged: bool = False
 
     async def _on_btc_tick(self, btc_mid: float) -> None:
         """
@@ -96,6 +101,19 @@ class PolyBot:
         Routes to dual_side_capture or single_side_taker based on config.
         """
         if not self._window_active or self._signal_sent:
+            return
+
+        # First-cross one-shot guard: once the first cross failed PM gates,
+        # permanently skip this window — do NOT chase later ticks.
+        if (self.strategy == "single_side_taker"
+                and self.signal_engine.signal_mode == "btc_open_delta"
+                and self._window_skip_locked):
+            if not self._skip_lock_logged:
+                self._skip_lock_logged = True
+                await log_module.log("skip_locked_reason", {
+                    "window_ts": self._window_ts,
+                    "locked_reason": self._window_skip_locked_reason,
+                })
             return
 
         # Tick throttle — aynı saniyede max 1 değerlendirme
@@ -130,7 +148,66 @@ class PolyBot:
             await self.signal_engine.log_signal(signal)
 
         if signal.action == "skip":
+            # First-cross gate failure: lock this window for btc_open_delta mode.
+            # spread_too_wide / depth_low / price_too_high only reach here AFTER
+            # threshold has already crossed inside evaluate_single(), so any of
+            # these three reasons is evidence of a first-cross gate failure.
+            if (self.strategy == "single_side_taker"
+                    and self.signal_engine.signal_mode == "btc_open_delta"
+                    and not self._first_cross_detected):
+                r = signal.reason
+                if (r.startswith("spread_too_wide")
+                        or r.startswith("depth_low")
+                        or r.startswith("price_too_high")):
+                    btc_open_fc = self.feed.open_price or 0.0
+                    delta_bps_fc = (
+                        round((btc_mid - btc_open_fc) / btc_open_fc * 10000, 1)
+                        if btc_open_fc > 0 else 0.0
+                    )
+                    self._first_cross_detected = True
+                    self._window_skip_locked = True
+                    self._window_skip_locked_reason = r
+                    self._skip_lock_logged = False
+                    await log_module.log("first_cross_detected", {
+                        "window_ts": self._window_ts,
+                        "first_cross_side": signal.side,
+                        "first_cross_delta_bps": delta_bps_fc,
+                        "first_cross_secs_to_res": secs_to_res,
+                        "first_cross_ask": signal.entry_price,
+                        "first_cross_gate_result": "fail",
+                        "gate_reason": r,
+                    })
+                    await log_module.log("window_decision", {
+                        "window_ts": self._window_ts,
+                        "decision": "skip_locked",
+                        "gate_reason": r,
+                        "secs_to_res": secs_to_res,
+                    })
             return
+
+        # First-cross gate pass: log before opening the trade.
+        if (self.strategy == "single_side_taker"
+                and self.signal_engine.signal_mode == "btc_open_delta"
+                and not self._first_cross_detected):
+            btc_open_fc = self.feed.open_price or 0.0
+            delta_bps_fc = (
+                round((btc_mid - btc_open_fc) / btc_open_fc * 10000, 1)
+                if btc_open_fc > 0 else 0.0
+            )
+            self._first_cross_detected = True
+            await log_module.log("first_cross_detected", {
+                "window_ts": self._window_ts,
+                "first_cross_side": signal.side,
+                "first_cross_delta_bps": delta_bps_fc,
+                "first_cross_secs_to_res": secs_to_res,
+                "first_cross_ask": signal.entry_price,
+                "first_cross_gate_result": "pass",
+            })
+            await log_module.log("window_decision", {
+                "window_ts": self._window_ts,
+                "decision": "open",
+                "secs_to_res": secs_to_res,
+            })
 
         # Trade aç
         can_trade, trade_reason = self.risk_manager.can_trade()
@@ -245,6 +322,10 @@ class PolyBot:
         self._window_ts = market["window_ts"]
         self._window_slug = market.get("slug", "")
         self._signal_sent = False
+        self._first_cross_detected = False
+        self._window_skip_locked = False
+        self._window_skip_locked_reason = ""
+        self._skip_lock_logged = False
 
         # Polymarket feed → bu pencereye subscribe ol
         p(f"[window] Polymarket WS subscribe: up={market['token_up'][:16]}... down={market['token_down'][:16]}...")
