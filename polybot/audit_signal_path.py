@@ -1,5 +1,5 @@
 """
-audit_signal_path.py — Signal path forensic audit for btc_open_delta single-side lane.
+audit_signal_path.py -- Signal path forensic audit for btc_open_delta single-side lane.
 
 Question:
   Where does the current btc_open_delta signal fail most often:
@@ -11,12 +11,12 @@ Does NOT: run the bot, open trades, touch resolution_truth.py,
 
 Event taxonomy (from signal_engine.evaluate_single + main.py log filter):
   - main.py SUPPRESSES "outside_entry_window" and "no_orderbook" from log
-    → every signal event in the log is inside or approaching the entry window
-  - "no_signal(open=X,mid=Y,delta_bps=Z,min=M)" → delta did NOT cross threshold
-  - "price_too_high(...)"  → delta CROSSED, PM price gate blocked entry
-  - "depth_low(...)"       → delta CROSSED, PM depth gate blocked entry
-  - "spread_too_wide(...)" → delta CROSSED, PM spread gate blocked entry
-  - "ok(open=X,...)"       → delta CROSSED, all gates passed, entry signal fired
+    -> every signal event in the log is inside or approaching the entry window
+  - "no_signal(open=X,mid=Y,delta_bps=Z,min=M)" -> delta did NOT cross threshold
+  - "price_too_high(...)"  -> delta CROSSED, PM price gate blocked entry
+  - "depth_low(...)"       -> delta CROSSED, PM depth gate blocked entry
+  - "spread_too_wide(...)" -> delta CROSSED, PM spread gate blocked entry
+  - "ok(open=X,...)"       -> delta CROSSED, all gates passed, entry signal fired
 
 Window reconstruction:
   window_ts = floor((event_unix + secs_to_res - 300) / 300) * 300
@@ -109,7 +109,7 @@ def _parse_bps(reason: str) -> float | None:
 def main():
     sep = "=" * 108
     print(sep)
-    print("SIGNAL FORENSIC AUDIT — btc_open_delta single-side signal path")
+    print("SIGNAL FORENSIC AUDIT -- btc_open_delta single-side signal path")
     print(sep)
 
     # ---- Load ---------------------------------------------------------------
@@ -145,7 +145,7 @@ def main():
     # ---- Filter to btc_open_delta signal events only -------------------------
     # Identifier: reason contains "delta_bps=" (present in no_signal and ok reasons)
     # OR reason is a gate-block class (price_too_high / depth_low / spread_too_wide)
-    #   → these only appear AFTER threshold crossed in evaluate_single()
+    #   -> these only appear AFTER threshold crossed in evaluate_single()
     # Exclude dual_entry signals (action == "dual_entry")
     delta_sig_evts = [
         e for e in signal_evts
@@ -164,10 +164,22 @@ def main():
         e for e in trade_open_evts
         if e.get("strategy") == "single_side_taker"
     ]
-    ss_trade_res = [
-        e for e in trade_res_evts
-        if e.get("side") or e.get("strategy") == "single_side_taker"
-    ]
+
+    # Attribute resolved events via trade_id join (primary), then window match
+    # (fallback).  paper_trader.resolved_data carries neither "strategy" nor
+    # "side", so filtering on those fields always returns zero rows.
+    ss_trade_ids = {t["trade_id"] for t in ss_trade_opens if t.get("trade_id")}
+    ss_open_wts  = {int(t["window_ts"]) for t in ss_trade_opens
+                    if t.get("window_ts") is not None}
+
+    def _is_ss_resolved(e: dict) -> bool:
+        tid = e.get("trade_id", "")
+        if tid and tid in ss_trade_ids:
+            return True
+        wts = e.get("window") or e.get("window_ts")
+        return bool(wts and int(wts) in ss_open_wts)
+
+    ss_trade_res = [e for e in trade_res_evts if _is_ss_resolved(e)]
 
     print(f"  btc_open_delta signal events : {len(delta_sig_evts)}")
     print(f"  single_side_taker trade_opened: {len(ss_trade_opens)}")
@@ -198,7 +210,7 @@ def main():
             window_sigs[int(wts)] = []
 
     # ---- Build lookups -------------------------------------------------------
-    # trade_opened: window_ts → event (polybot and truth logs both have window_ts)
+    # trade_opened: window_ts -> event (polybot and truth logs both have window_ts)
     trade_open_by_wts: dict[int, dict] = {}
     for t in ss_trade_opens:
         wts = t.get("window_ts")
@@ -212,7 +224,7 @@ def main():
         if wts:
             trade_res_by_wts[int(wts)] = r
 
-    # resolution_truth: window_ts → event
+    # resolution_truth: window_ts -> event
     res_truth_by_wts: dict[int, dict] = {}
     for r in res_truth_evts:
         wts = r.get("window_ts")
@@ -334,7 +346,7 @@ def main():
     n_s_wide    = sum(1 for w in window_rows if w["n_spread"] > 0)
     n_risk_blk  = sum(1 for w in window_rows if w["outcome"] == "signal_ok_risk_blocked")
 
-    # Hit rates — require valid winner
+    # Hit rates -- require valid winner
     cross_w_winner = [w for w in window_rows
                       if w["fc_side"] and w["winner_bnb"] in ("up", "down")]
     fc_hit = (sum(1 for w in cross_w_winner if w["winner_bnb"] == w["fc_side"])
@@ -361,9 +373,9 @@ def main():
     print(f"  gate_blocked_count             = {n_gate}")
     print(f"  signal_ok_risk_blocked         = {n_risk_blk}")
     print(f"  opened_trade_count             = {n_opened}")
-    print(f"  blocked_price_count            = {n_p_high}  (windows with ≥1 price_too_high tick)")
-    print(f"  blocked_depth_count            = {n_d_low}  (windows with ≥1 depth_low tick)")
-    print(f"  blocked_spread_count           = {n_s_wide}  (windows with ≥1 spread_too_wide tick)")
+    print(f"  blocked_price_count            = {n_p_high}  (windows with >=1 price_too_high tick)")
+    print(f"  blocked_depth_count            = {n_d_low}  (windows with >=1 depth_low tick)")
+    print(f"  blocked_spread_count           = {n_s_wide}  (windows with >=1 spread_too_wide tick)")
     print()
     print(f"  first_cross_binance_hit_rate   = {fmthr(fc_hit, len(cross_w_winner))}")
     print(f"  opened_trade_binance_hit_rate  = {fmthr(tr_hit, len(trade_w_winner))}")
@@ -372,8 +384,8 @@ def main():
 
     # ---- Per-window table ----------------------------------------------------
     if window_rows:
-        hdr = (f"{'wts':>12}  {'ns_tk':>5}  {'maxΔbps':>7}  "
-               f"{'fc_s':>5}  {'side':>4}  {'fc_ask':>6}  {'fc_Δbps':>7}  "
+        hdr = (f"{'wts':>12}  {'ns_tk':>5}  {'max_bps':>7}  "
+               f"{'fc_s':>5}  {'side':>4}  {'fc_ask':>6}  {'fc_dbps':>7}  "
                f"{'p>hi':>4}  {'d<lo':>4}  {'spr':>3}  "
                f"{'trd':>3}  {'w_bnb':>5}  {'w_cl':>5}  {'outcome':>26}")
         print("-" * 108)
@@ -381,13 +393,13 @@ def main():
         print("-" * 108)
         for w in window_rows:
             def _fmt(v, fmt):
-                return format(v, fmt) if v is not None else "—"
+                return format(v, fmt) if v is not None else "-"
             print(
                 f"{w['wts']:>12}  "
                 f"{w['no_sig_ticks']:>5}  "
                 f"{_fmt(w['max_bps'], '7.1f'):>7}  "
                 f"{_fmt(w['fc_secs'], '5d'):>5}  "
-                f"{w['fc_side'] or '—':>4}  "
+                f"{w['fc_side'] or '-':>4}  "
                 f"{w['fc_ask']:>6.3f}  "
                 f"{_fmt(w['fc_bps'], '7.1f'):>7}  "
                 f"{w['n_price']:>4}  "
@@ -413,12 +425,12 @@ def main():
 
     examples: list[tuple[str, dict]] = []
     for w in good[:2]:
-        examples.append(("GOOD — trade opened, winner matched", w))
+        examples.append(("GOOD -- trade opened, winner matched", w))
     for w in bad[:2]:
-        examples.append(("BAD — trade opened, wrong side", w))
+        examples.append(("BAD -- trade opened, wrong side", w))
     for w in (gate_ok or gate_any)[:1]:
-        label = ("BLOCKED-CORRECT — gate blocked after correct-side cross"
-                 if gate_ok else "BLOCKED — gate blocked after threshold cross")
+        label = ("BLOCKED-CORRECT -- gate blocked after correct-side cross"
+                 if gate_ok else "BLOCKED -- gate blocked after threshold cross")
         examples.append((label, w))
 
     # Pad with any remaining windows if categories were sparse
@@ -431,7 +443,7 @@ def main():
             used.add(id(w))
 
     if not examples:
-        print("  No example windows available — insufficient log data.")
+        print("  No example windows available -- insufficient log data.")
     else:
         for i, (label, w) in enumerate(examples[:5], 1):
             pnl_str = f"  net_pnl={w['net_pnl']:.4f}" if w["net_pnl"] is not None else ""
@@ -461,33 +473,33 @@ def main():
     print()
     if total == 0:
         verdict = "insufficient_evidence"
-        text = ("No windows found in logs — "
+        text = ("No windows found in logs -- "
                 "cannot determine dominant failure mode.")
     elif n_cross == 0:
         verdict = "threshold_weakness"
-        text = (f"Dominant failure: THRESHOLD WEAKNESS — "
+        text = (f"Dominant failure: THRESHOLD WEAKNESS -- "
                 f"0/{total} windows crossed min_move_bps threshold; "
                 f"signal never triggered.")
     elif n_gate > n_opened and n_gate > n_no_cross:
         verdict = "PM_gating_delay"
-        text = (f"Dominant failure: PM GATING DELAY / REPRICING — "
+        text = (f"Dominant failure: PM GATING DELAY / REPRICING -- "
                 f"{n_gate} windows crossed threshold but were gate-blocked "
                 f"(price_too_high:{n_p_high} depth_low:{n_d_low} spread_wide:{n_s_wide}) "
                 f"vs {n_opened} trades opened; PM ask had already moved past gates "
                 f"by the time the signal fired.")
     elif n_no_cross > n_cross:
         verdict = "threshold_weakness"
-        text = (f"Dominant failure: THRESHOLD WEAKNESS — "
+        text = (f"Dominant failure: THRESHOLD WEAKNESS -- "
                 f"{n_no_cross}/{total} windows never crossed threshold "
                 f"vs {n_cross} that did; signal too sparse to be a real lane.")
     elif n_opened > 0 and tr_hit is not None and tr_hit < 0.45:
         verdict = "post_entry_reversal"
-        text = (f"Dominant failure: POST-ENTRY REVERSAL — "
+        text = (f"Dominant failure: POST-ENTRY REVERSAL -- "
                 f"{n_opened} trades opened, Binance hit rate = {tr_hit:.1%}; "
                 f"threshold crossing is not predictive of direction.")
     else:
         verdict = "insufficient_evidence"
-        text = (f"INSUFFICIENT EVIDENCE — {total} windows, "
+        text = (f"INSUFFICIENT EVIDENCE -- {total} windows, "
                 f"{n_cross} crossed threshold, {n_opened} trades opened; "
                 f"sample too small to isolate the dominant failure mode.")
 
@@ -499,7 +511,7 @@ def main():
     print("  - Whether gate blocks are sticky within a window or oscillate "
           "(delta stays above threshold but price stays above cap)")
     print("  - Post-entry reversal rate at filled price vs at-signal price "
-          "(delta crosses → PM matches → BTC reverses before resolution)")
+          "(delta crosses -> PM matches -> BTC reverses before resolution)")
     print("  - Whether Chainlink winner diverges from Binance winner specifically "
           "on losing trades (settlement contamination of signal verdict)")
     print()
@@ -534,7 +546,7 @@ def _no_logs_report():
     print("  Run multiple times (one per 5m window) to accumulate 10+ windows.")
     print()
     _print_verdict("insufficient_evidence",
-                   "No local log data — run at least 10 btc_open_delta sessions "
+                   "No local log data -- run at least 10 btc_open_delta sessions "
                    "to produce a statistically meaningful signal path verdict.")
     print(sep)
     print("SEND BACK: patch diff + exact command run + full terminal output + key logs")
@@ -543,7 +555,7 @@ def _no_logs_report():
 def _no_delta_sessions_report():
     sep = "=" * 108
     _print_verdict("insufficient_evidence",
-                   "Logs exist but no btc_open_delta (single_side_taker) sessions recorded — "
+                   "Logs exist but no btc_open_delta (single_side_taker) sessions recorded -- "
                    "re-run with config_5m_single_side_delta_diag.json.")
     print(sep)
     print("SEND BACK: patch diff + exact command run + full terminal output + key logs")
