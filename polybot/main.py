@@ -94,6 +94,12 @@ class PolyBot:
         self._window_skip_locked: bool = False
         self._window_skip_locked_reason: str = ""
         self._skip_lock_logged: bool = False
+        # Atomicity guards: serialise concurrent ticks; sets make log emission
+        # idempotent even if two ticks reach the decision point simultaneously.
+        self._decision_lock: asyncio.Lock = asyncio.Lock()
+        self._logged_first_cross_wts: set = set()       # wts -> first_cross_detected logged
+        self._logged_window_decision_wts: set = set()   # wts -> window_decision logged
+        self._opened_trade_ids: set = set()             # trade_id -> trade_opened logged
 
     async def _on_btc_tick(self, btc_mid: float) -> None:
         """
@@ -122,174 +128,197 @@ class PolyBot:
             return
         self._last_eval_sec = current_sec
 
-        divisor = 300 if self.interval == "5m" else 900
-        secs_to_res = self._window_ts + divisor - int(time.time())
+        async with self._decision_lock:
+            # Re-check guards inside the lock: another tick may have mutated these
+            # between the outer fast-path guards above and acquiring the lock.
+            if not self._window_active or self._signal_sent:
+                return
+            if (self.strategy == "single_side_taker"
+                    and self.signal_engine.signal_mode == "btc_open_delta"
+                    and self._window_skip_locked):
+                return
+            wts = self._window_ts
 
-        book_up = self.pm_feed.get_book(self._window_token_up)
-        book_down = self.pm_feed.get_book(self._window_token_down)
+            divisor = 300 if self.interval == "5m" else 900
+            secs_to_res = wts + divisor - int(time.time())
 
-        # Strategy dispatch
-        if self.strategy == "single_side_taker":
-            btc_open = self.feed.open_price or 0.0
-            signal = self.signal_engine.evaluate_single(
-                book_up=book_up, book_down=book_down, secs_to_res=secs_to_res,
-                btc_mid=btc_mid, btc_open=btc_open,
-            )
-        else:
-            signal = self.signal_engine.evaluate(
-                book_up=book_up, book_down=book_down, secs_to_res=secs_to_res,
-            )
+            book_up = self.pm_feed.get_book(self._window_token_up)
+            book_down = self.pm_feed.get_book(self._window_token_down)
 
-        # Sadece entry window'da ve anlamlı sinyallerde logla
-        if signal.action != "skip" or signal.reason not in ("outside_entry_window", "no_orderbook"):
-            p(f"[tick] secs={secs_to_res} action={signal.action} "
-              f"side={signal.side} entry_price={signal.entry_price:.4f} "
-              f"pair_sum={signal.pair_sum:.4f} reason={signal.reason}")
-            await self.signal_engine.log_signal(signal)
+            # Strategy dispatch
+            if self.strategy == "single_side_taker":
+                btc_open = self.feed.open_price or 0.0
+                signal = self.signal_engine.evaluate_single(
+                    book_up=book_up, book_down=book_down, secs_to_res=secs_to_res,
+                    btc_mid=btc_mid, btc_open=btc_open,
+                )
+            else:
+                signal = self.signal_engine.evaluate(
+                    book_up=book_up, book_down=book_down, secs_to_res=secs_to_res,
+                )
 
-        if signal.action == "skip":
-            # First-cross gate failure: lock this window for btc_open_delta mode.
-            # spread_too_wide / depth_low / price_too_high only reach here AFTER
-            # threshold has already crossed inside evaluate_single(), so any of
-            # these three reasons is evidence of a first-cross gate failure.
+            # Sadece entry window'da ve anlamlı sinyallerde logla
+            if signal.action != "skip" or signal.reason not in ("outside_entry_window", "no_orderbook"):
+                p(f"[tick] secs={secs_to_res} action={signal.action} "
+                  f"side={signal.side} entry_price={signal.entry_price:.4f} "
+                  f"pair_sum={signal.pair_sum:.4f} reason={signal.reason}")
+                await self.signal_engine.log_signal(signal)
+
+            if signal.action == "skip":
+                # First-cross gate failure: lock this window for btc_open_delta mode.
+                # spread_too_wide / depth_low / price_too_high only reach here AFTER
+                # threshold has already crossed inside evaluate_single(), so any of
+                # these three reasons is evidence of a first-cross gate failure.
+                if (self.strategy == "single_side_taker"
+                        and self.signal_engine.signal_mode == "btc_open_delta"
+                        and not self._first_cross_detected):
+                    r = signal.reason
+                    if (r.startswith("spread_too_wide")
+                            or r.startswith("depth_low")
+                            or r.startswith("price_too_high")):
+                        btc_open_fc = self.feed.open_price or 0.0
+                        delta_bps_fc = (
+                            round((btc_mid - btc_open_fc) / btc_open_fc * 10000, 1)
+                            if btc_open_fc > 0 else 0.0
+                        )
+                        self._first_cross_detected = True
+                        self._window_skip_locked = True
+                        self._window_skip_locked_reason = r
+                        self._skip_lock_logged = False
+                        if wts not in self._logged_first_cross_wts:
+                            self._logged_first_cross_wts.add(wts)
+                            await log_module.log("first_cross_detected", {
+                                "window_ts": wts,
+                                "first_cross_side": signal.side,
+                                "first_cross_delta_bps": delta_bps_fc,
+                                "first_cross_secs_to_res": secs_to_res,
+                                "first_cross_ask": signal.entry_price,
+                                "first_cross_gate_result": "fail",
+                                "gate_reason": r,
+                            })
+                        if wts not in self._logged_window_decision_wts:
+                            self._logged_window_decision_wts.add(wts)
+                            await log_module.log("window_decision", {
+                                "window_ts": wts,
+                                "decision": "skip_locked",
+                                "gate_reason": r,
+                                "secs_to_res": secs_to_res,
+                            })
+                return
+
+            # First-cross gate pass: log before opening the trade.
             if (self.strategy == "single_side_taker"
                     and self.signal_engine.signal_mode == "btc_open_delta"
                     and not self._first_cross_detected):
-                r = signal.reason
-                if (r.startswith("spread_too_wide")
-                        or r.startswith("depth_low")
-                        or r.startswith("price_too_high")):
-                    btc_open_fc = self.feed.open_price or 0.0
-                    delta_bps_fc = (
-                        round((btc_mid - btc_open_fc) / btc_open_fc * 10000, 1)
-                        if btc_open_fc > 0 else 0.0
-                    )
-                    self._first_cross_detected = True
-                    self._window_skip_locked = True
-                    self._window_skip_locked_reason = r
-                    self._skip_lock_logged = False
+                btc_open_fc = self.feed.open_price or 0.0
+                delta_bps_fc = (
+                    round((btc_mid - btc_open_fc) / btc_open_fc * 10000, 1)
+                    if btc_open_fc > 0 else 0.0
+                )
+                self._first_cross_detected = True
+                if wts not in self._logged_first_cross_wts:
+                    self._logged_first_cross_wts.add(wts)
                     await log_module.log("first_cross_detected", {
-                        "window_ts": self._window_ts,
+                        "window_ts": wts,
                         "first_cross_side": signal.side,
                         "first_cross_delta_bps": delta_bps_fc,
                         "first_cross_secs_to_res": secs_to_res,
                         "first_cross_ask": signal.entry_price,
-                        "first_cross_gate_result": "fail",
-                        "gate_reason": r,
+                        "first_cross_gate_result": "pass",
                     })
+                if wts not in self._logged_window_decision_wts:
+                    self._logged_window_decision_wts.add(wts)
                     await log_module.log("window_decision", {
-                        "window_ts": self._window_ts,
-                        "decision": "skip_locked",
-                        "gate_reason": r,
+                        "window_ts": wts,
+                        "decision": "open",
                         "secs_to_res": secs_to_res,
                     })
-            return
 
-        # First-cross gate pass: log before opening the trade.
-        if (self.strategy == "single_side_taker"
-                and self.signal_engine.signal_mode == "btc_open_delta"
-                and not self._first_cross_detected):
-            btc_open_fc = self.feed.open_price or 0.0
-            delta_bps_fc = (
-                round((btc_mid - btc_open_fc) / btc_open_fc * 10000, 1)
-                if btc_open_fc > 0 else 0.0
-            )
-            self._first_cross_detected = True
-            await log_module.log("first_cross_detected", {
-                "window_ts": self._window_ts,
-                "first_cross_side": signal.side,
-                "first_cross_delta_bps": delta_bps_fc,
-                "first_cross_secs_to_res": secs_to_res,
-                "first_cross_ask": signal.entry_price,
-                "first_cross_gate_result": "pass",
-            })
-            await log_module.log("window_decision", {
-                "window_ts": self._window_ts,
-                "decision": "open",
+            # Trade aç
+            can_trade, trade_reason = self.risk_manager.can_trade()
+            if not can_trade:
+                p(f"[tick] trade_blocked: {trade_reason}")
+                return
+
+            shares = self.config.get("shares_per_side", 5)
+            btc_open = self.feed.open_price or btc_mid
+
+            # Market context at entry
+            market_ctx = {
+                "market_slug": self._window_slug,
+                "btc_mid_binance": btc_mid,
                 "secs_to_res": secs_to_res,
-            })
-
-        # Trade aç
-        can_trade, trade_reason = self.risk_manager.can_trade()
-        if not can_trade:
-            p(f"[tick] trade_blocked: {trade_reason}")
-            return
-
-        shares = self.config.get("shares_per_side", 5)
-        btc_open = self.feed.open_price or btc_mid
-
-        # Market context at entry
-        market_ctx = {
-            "market_slug": self._window_slug,
-            "btc_mid_binance": btc_mid,
-            "secs_to_res": secs_to_res,
-            "up_ask": signal.up_ask,
-            "down_ask": signal.down_ask,
-        }
-        if book_up:
-            market_ctx["up_bid"] = book_up.bid
-            market_ctx["spread_up_pct"] = round(book_up.spread_pct, 2)
-        if book_down:
-            market_ctx["down_bid"] = book_down.bid
-            market_ctx["spread_down_pct"] = round(book_down.spread_pct, 2)
-
-        # Open position — dual or single
-        if signal.action.startswith("single_entry_"):
-            pos = self.paper_trader.open_single_position(
-                side=signal.side,
-                entry_price=signal.entry_price,
-                shares=shares,
-                btc_open=btc_open,
-                window_ts=self._window_ts,
-                interval=self.interval,
-                market_context=market_ctx,
-            )
-            self._signal_sent = True
-            p(f"[SINGLE] {pos.trade_id} side={signal.side} "
-              f"entry_price={signal.entry_price:.4f} shares={shares}")
-            await log_module.log("trade_opened", {
-                "trade_id": pos.trade_id,
-                "mode": self.mode,
-                "strategy": "single_side_taker",
-                "side": signal.side,
-                "entry_price": signal.entry_price,
-                "shares": shares,
-                "btc_open": btc_open,
-                "secs_to_res": secs_to_res,
-                "fee_source": self.paper_trader.fee_source,
-                "fee_status": self.paper_trader.fee_status,
-                "execution_lane": self.paper_trader.execution_lane,
-                **self.risk_manager.summary(),
-            })
-        else:
-            pos = self.paper_trader.open_position(
-                up_ask=signal.up_ask,
-                down_ask=signal.down_ask,
-                shares=shares,
-                btc_open=btc_open,
-                window_ts=self._window_ts,
-                interval=self.interval,
-                market_context=market_ctx,
-            )
-            self._signal_sent = True
-            p(f"[DUAL] {pos.trade_id} up_ask={signal.up_ask:.4f} down_ask={signal.down_ask:.4f} "
-              f"pair_sum={signal.pair_sum:.4f} net_edge={signal.net_edge:.4f} shares={shares}")
-            await log_module.log("trade_opened", {
-                "trade_id": pos.trade_id,
-                "mode": self.mode,
-                "strategy": "dual_side_capture",
                 "up_ask": signal.up_ask,
                 "down_ask": signal.down_ask,
-                "pair_sum": signal.pair_sum,
-                "net_edge": signal.net_edge,
-                "shares": shares,
-                "btc_open": btc_open,
-                "secs_to_res": secs_to_res,
-                "fee_source": self.paper_trader.fee_source,
-                "fee_status": self.paper_trader.fee_status,
-                "execution_lane": self.paper_trader.execution_lane,
-                **self.risk_manager.summary(),
-            })
+            }
+            if book_up:
+                market_ctx["up_bid"] = book_up.bid
+                market_ctx["spread_up_pct"] = round(book_up.spread_pct, 2)
+            if book_down:
+                market_ctx["down_bid"] = book_down.bid
+                market_ctx["spread_down_pct"] = round(book_down.spread_pct, 2)
+
+            # Open position — dual or single
+            if signal.action.startswith("single_entry_"):
+                pos = self.paper_trader.open_single_position(
+                    side=signal.side,
+                    entry_price=signal.entry_price,
+                    shares=shares,
+                    btc_open=btc_open,
+                    window_ts=self._window_ts,
+                    interval=self.interval,
+                    market_context=market_ctx,
+                )
+                self._signal_sent = True
+                p(f"[SINGLE] {pos.trade_id} side={signal.side} "
+                  f"entry_price={signal.entry_price:.4f} shares={shares}")
+                if pos.trade_id not in self._opened_trade_ids:
+                    self._opened_trade_ids.add(pos.trade_id)
+                    await log_module.log("trade_opened", {
+                        "trade_id": pos.trade_id,
+                        "mode": self.mode,
+                        "strategy": "single_side_taker",
+                        "side": signal.side,
+                        "entry_price": signal.entry_price,
+                        "shares": shares,
+                        "btc_open": btc_open,
+                        "secs_to_res": secs_to_res,
+                        "fee_source": self.paper_trader.fee_source,
+                        "fee_status": self.paper_trader.fee_status,
+                        "execution_lane": self.paper_trader.execution_lane,
+                        **self.risk_manager.summary(),
+                    })
+            else:
+                pos = self.paper_trader.open_position(
+                    up_ask=signal.up_ask,
+                    down_ask=signal.down_ask,
+                    shares=shares,
+                    btc_open=btc_open,
+                    window_ts=self._window_ts,
+                    interval=self.interval,
+                    market_context=market_ctx,
+                )
+                self._signal_sent = True
+                p(f"[DUAL] {pos.trade_id} up_ask={signal.up_ask:.4f} down_ask={signal.down_ask:.4f} "
+                  f"pair_sum={signal.pair_sum:.4f} net_edge={signal.net_edge:.4f} shares={shares}")
+                if pos.trade_id not in self._opened_trade_ids:
+                    self._opened_trade_ids.add(pos.trade_id)
+                    await log_module.log("trade_opened", {
+                        "trade_id": pos.trade_id,
+                        "mode": self.mode,
+                        "strategy": "dual_side_capture",
+                        "up_ask": signal.up_ask,
+                        "down_ask": signal.down_ask,
+                        "pair_sum": signal.pair_sum,
+                        "net_edge": signal.net_edge,
+                        "shares": shares,
+                        "btc_open": btc_open,
+                        "secs_to_res": secs_to_res,
+                        "fee_source": self.paper_trader.fee_source,
+                        "fee_status": self.paper_trader.fee_status,
+                        "execution_lane": self.paper_trader.execution_lane,
+                        **self.risk_manager.summary(),
+                    })
 
     async def _run_window(self) -> None:
         """Tek bir 5m pencereyi işle — tick-driven, polling yok."""
