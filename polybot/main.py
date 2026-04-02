@@ -5,9 +5,9 @@ Entry point. Async event loop:
   1. Config yükle
   2. Binance WebSocket başlat (open price capture)
   3. Her 5m pencere başında:
-     a. Market discovery (Gamma API + clobTokenIds fix)
-     b. CLOB midpoint fiyatlarını çek
-     c. Entry window'da signal_engine'i çalıştır
+     a. Market discovery
+     b. CLOB orderbook
+     c. Entry window'da signal_engine'i çalıştır (dual veya single)
      d. Risk kontrolü → pozisyon aç
   4. Pencere kapanınca resolve_pending()
   5. Risk state log → kill kontrolü
@@ -15,18 +15,17 @@ Entry point. Async event loop:
 Kullanım:
   python main.py
   python main.py --config path/to/config.json
-  python main.py --once   # sadece mevcut pencereyi işle, çık
+  python main.py --once
 """
 
 import sys
 import asyncio
 
-# Windows: ProactorEventLoop (DNS + WebSocket için gerekli, 3.14'te deprecated)
 if sys.platform == "win32":
     try:
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     except AttributeError:
-        pass  # Python 3.16+ kaldırıldıysa sessizce geç
+        pass
 
 import json
 import os
@@ -37,7 +36,6 @@ from pathlib import Path
 
 
 def p(msg: str) -> None:
-    """Anında stdout'a yaz (Windows'ta flush önemli)."""
     print(msg, flush=True)
 
 import logger as log_module
@@ -69,6 +67,7 @@ class PolyBot:
         self.config = config
         self.interval: str = config.get("market_type", "5m")
         self.mode: str = config.get("mode", "paper")
+        self.strategy: str = config.get("strategy", "dual_side_capture")
 
         # Session identity — stamped in every log entry via set_session_ctx()
         self.run_id: str = str(uuid.uuid4())
@@ -84,24 +83,41 @@ class PolyBot:
         self.paper_trader = PaperTrader(config, risk_manager=self.risk_manager)
 
         self._running = False
-        # Tick-driven state (pencere süresince geçerli)
+
+        # Tick-driven state (reset at start of each _run_window)
         self._window_active = False
         self._window_token_up: str = ""
         self._window_token_down: str = ""
         self._window_ts: int = 0
         self._window_slug: str = ""
         self._signal_sent = False
-        self._last_eval_sec: int = 0  # tick throttle: aynı saniyede max 1 değerlendirme
+        self._last_eval_sec: int = 0
+
+        # Once-per-window event guards — prevent duplicate lifecycle log entries.
+        # All reset at the start of each _run_window().
+        self._first_cross_emitted: bool = False      # first_cross_detected
+        self._window_decision_emitted: bool = False  # window_decision
+        self._window_gate_reason_emitted: bool = False  # gate_reason
+        self._last_gate_reason: str = ""             # tracks most recent substantive skip
+
+    def _reset_window_state(self) -> None:
+        """Reset all per-window state. Called at the top of _run_window()."""
+        self._signal_sent = False
+        self._last_eval_sec = 0
+        self._first_cross_emitted = False
+        self._window_decision_emitted = False
+        self._window_gate_reason_emitted = False
+        self._last_gate_reason = ""
 
     async def _on_btc_tick(self, btc_mid: float) -> None:
         """
-        Binance bookTicker tick callback — her tick'te çağrılır.
-        Dual side capture: BTC yönü değil, pair_sum kontrol edilir.
+        Binance bookTicker tick callback.
+        Routes to dual_side_capture or single_side_taker based on config.
         """
         if not self._window_active or self._signal_sent:
             return
 
-        # Tick throttle — aynı saniyede max 1 değerlendirme
+        # Tick throttle — max 1 evaluation per second
         current_sec = int(time.time())
         if current_sec == self._last_eval_sec:
             return
@@ -113,38 +129,97 @@ class PolyBot:
         book_up = self.pm_feed.get_book(self._window_token_up)
         book_down = self.pm_feed.get_book(self._window_token_down)
 
-        signal = self.signal_engine.evaluate(
-            book_up=book_up,
-            book_down=book_down,
-            secs_to_res=secs_to_res,
-        )
+        # ── Strategy dispatch ──────────────────────────────────────────────────
+        if self.strategy == "single_side_taker":
+            btc_open_val = self.feed.open_price or btc_mid
+            signal = self.signal_engine.evaluate_single(
+                book_up=book_up,
+                book_down=book_down,
+                secs_to_res=secs_to_res,
+                btc_mid=btc_mid,
+                btc_open=btc_open_val,
+            )
+        else:
+            signal = self.signal_engine.evaluate(
+                book_up=book_up,
+                book_down=book_down,
+                secs_to_res=secs_to_res,
+            )
 
-        # Sadece entry window'da ve anlamlı sinyallerde logla
+        # ── Signal logging (non-trivial events only) ───────────────────────────
         if signal.action != "skip" or signal.reason not in ("outside_entry_window", "no_orderbook"):
-            p(f"[tick] secs={secs_to_res} pair_sum={signal.pair_sum:.4f} "
-              f"net_edge={signal.net_edge:.4f} action={signal.action} reason={signal.reason}")
+            p(f"[tick] secs={secs_to_res} action={signal.action} side={signal.side!r} "
+              f"entry={signal.entry_price:.4f} pair_sum={signal.pair_sum:.4f} "
+              f"delta_bps={signal.delta_bps:.1f} reason={signal.reason}")
             await self.signal_engine.log_signal(signal)
+
+        # ── Once-per-window: first_cross_detected ─────────────────────────────
+        # Emitted the first time we are inside the entry evaluation zone
+        # (any reason other than "outside_entry_window").
+        if signal.reason != "outside_entry_window" and not self._first_cross_emitted:
+            await log_module.log("first_cross_detected", {
+                "window_ts": self._window_ts,
+                "secs_to_res": secs_to_res,
+                "strategy": self.strategy,
+                "action": signal.action,
+                "reason": signal.reason,
+            })
+            self._first_cross_emitted = True
+
+        # ── Once-per-window: gate_reason ──────────────────────────────────────
+        # Emitted the first time a substantive gate rejects the signal
+        # (inside entry window, not just "no_orderbook").
+        if (signal.action == "skip"
+                and signal.reason not in ("outside_entry_window", "no_orderbook")
+                and not self._window_gate_reason_emitted):
+            await log_module.log("gate_reason", {
+                "window_ts": self._window_ts,
+                "reason": signal.reason,
+                "secs_to_res": secs_to_res,
+                "strategy": self.strategy,
+                "up_ask": signal.up_ask,
+                "down_ask": signal.down_ask,
+                "spread_up": signal.spread_up,
+                "spread_down": signal.spread_down,
+                "delta_bps": signal.delta_bps,
+            })
+            self._window_gate_reason_emitted = True
+
+        # Track most recent substantive skip for end-of-window window_decision
+        if signal.action == "skip" and signal.reason not in ("outside_entry_window", "no_orderbook"):
+            self._last_gate_reason = signal.reason
 
         if signal.action == "skip":
             return
 
-        # Risk check — if blocked, lock this window: no further open attempt.
-        # Setting _signal_sent=True here prevents contradictory blocked→opened
-        # outcome from a later tick in the same window.
+        # ── Risk check — lock window if blocked ───────────────────────────────
+        # Setting _signal_sent=True prevents contradictory blocked→opened outcome.
         can_trade, trade_reason = self.risk_manager.can_trade()
         if not can_trade:
             p(f"[tick] trade_blocked: {trade_reason}")
-            self._signal_sent = True  # window decision: blocked — no further eval
+            self._signal_sent = True  # window locked — no further open attempt
+            if not self._window_decision_emitted:
+                await log_module.log("window_decision", {
+                    "window_ts": self._window_ts,
+                    "decision": "blocked",
+                    "reason": trade_reason,
+                    "strategy": self.strategy,
+                    "side": signal.side,
+                    "secs_to_res": secs_to_res,
+                })
+                self._window_decision_emitted = True
             return
 
+        # ── Open position ──────────────────────────────────────────────────────
         shares = self.config.get("shares_per_side", 5)
-        btc_open = self.feed.open_price or btc_mid
+        btc_open_val = self.feed.open_price or btc_mid
 
-        # Market context at entry — enrich trade with orderbook + price state
         market_ctx = {
             "market_slug": self._window_slug,
             "btc_mid_binance": btc_mid,
             "secs_to_res": secs_to_res,
+            "up_ask": signal.up_ask,
+            "down_ask": signal.down_ask,
         }
         if book_up:
             market_ctx["up_bid"] = book_up.bid
@@ -153,47 +228,105 @@ class PolyBot:
             market_ctx["down_bid"] = book_down.bid
             market_ctx["spread_down_pct"] = round(book_down.spread_pct, 2)
 
-        pos = self.paper_trader.open_position(
-            up_ask=signal.up_ask,
-            down_ask=signal.down_ask,
-            shares=shares,
-            btc_open=btc_open,
-            window_ts=self._window_ts,
-            interval=self.interval,
-            market_context=market_ctx,
-        )
-        self._signal_sent = True
-        p(f"[DUAL] {pos.trade_id} up_ask={signal.up_ask:.4f} down_ask={signal.down_ask:.4f} "
-          f"pair_sum={signal.pair_sum:.4f} net_edge={signal.net_edge:.4f} shares={shares}")
+        if signal.action == "single_entry":
+            pos = self.paper_trader.open_single_position(
+                side=signal.side,
+                entry_price=signal.entry_price,
+                shares=shares,
+                btc_open=btc_open_val,
+                window_ts=self._window_ts,
+                interval=self.interval,
+                market_context=market_ctx,
+            )
+        else:  # dual_entry
+            pos = self.paper_trader.open_position(
+                up_ask=signal.up_ask,
+                down_ask=signal.down_ask,
+                shares=shares,
+                btc_open=btc_open_val,
+                window_ts=self._window_ts,
+                interval=self.interval,
+                market_context=market_ctx,
+            )
 
-        # Canonical trade_opened write — single writer, run_id+pid present via session_ctx
-        await log_module.log("trade_opened", {
-            "trade_id": pos.trade_id,
-            "window_ts": self._window_ts,
-            "mode": self.mode,
-            "strategy": "dual_side_capture",
-            "up_ask": signal.up_ask,
-            "down_ask": signal.down_ask,
-            "pair_sum": signal.pair_sum,
-            "net_edge": signal.net_edge,
-            "shares": shares,
-            "btc_open": btc_open,
-            "secs_to_res": secs_to_res,
-            "fee_source": self.paper_trader.fee_source,
-            "fee_status": self.paper_trader.fee_status,
-            "fee_rate": self.paper_trader.fee_rate,
-            "fee_exponent": self.paper_trader.fee_exponent,
-            "fee_exponent_source": self.paper_trader.fee_exponent_source,
-            "tick_size": self.paper_trader.tick_size,
-            "tick_size_source": self.paper_trader.tick_size_source,
-            "min_order_size": self.paper_trader.min_order_size,
-            "min_order_size_source": self.paper_trader.min_order_size_source,
-            "execution_lane": self.paper_trader.execution_lane,
-            **self.risk_manager.summary(),
-        })
+        self._signal_sent = True
+
+        # ── Once-per-window: window_decision (opened) ─────────────────────────
+        if not self._window_decision_emitted:
+            await log_module.log("window_decision", {
+                "window_ts": self._window_ts,
+                "decision": "opened",
+                "trade_id": pos.trade_id,
+                "strategy": self.strategy,
+                "side": signal.side,
+                "entry_price": signal.entry_price,
+                "delta_bps": signal.delta_bps,
+                "secs_to_res": secs_to_res,
+            })
+            self._window_decision_emitted = True
+
+        # ── Canonical trade_opened write (single writer) ───────────────────────
+        if signal.action == "single_entry":
+            p(f"[SINGLE] {pos.trade_id} side={signal.side} "
+              f"entry={signal.entry_price:.4f} delta={signal.delta_bps:.1f}bps shares={shares}")
+            await log_module.log("trade_opened", {
+                "trade_id": pos.trade_id,
+                "window_ts": self._window_ts,
+                "mode": self.mode,
+                "strategy": "single_side_taker",
+                "side": signal.side,
+                "entry_price": signal.entry_price,
+                "delta_bps": signal.delta_bps,
+                "up_ask": signal.up_ask,
+                "down_ask": signal.down_ask,
+                "spread_up": signal.spread_up,
+                "spread_down": signal.spread_down,
+                "shares": shares,
+                "btc_open": btc_open_val,
+                "btc_mid": btc_mid,
+                "secs_to_res": secs_to_res,
+                "fee_source": self.paper_trader.fee_source,
+                "fee_status": self.paper_trader.fee_status,
+                "fee_rate": self.paper_trader.fee_rate,
+                "fee_exponent": self.paper_trader.fee_exponent,
+                "fee_exponent_source": self.paper_trader.fee_exponent_source,
+                "tick_size": self.paper_trader.tick_size,
+                "tick_size_source": self.paper_trader.tick_size_source,
+                "min_order_size": self.paper_trader.min_order_size,
+                "min_order_size_source": self.paper_trader.min_order_size_source,
+                "execution_lane": self.paper_trader.execution_lane,
+                **self.risk_manager.summary(),
+            })
+        else:
+            p(f"[DUAL] {pos.trade_id} up_ask={signal.up_ask:.4f} down_ask={signal.down_ask:.4f} "
+              f"pair_sum={signal.pair_sum:.4f} net_edge={signal.net_edge:.4f} shares={shares}")
+            await log_module.log("trade_opened", {
+                "trade_id": pos.trade_id,
+                "window_ts": self._window_ts,
+                "mode": self.mode,
+                "strategy": "dual_side_capture",
+                "up_ask": signal.up_ask,
+                "down_ask": signal.down_ask,
+                "pair_sum": signal.pair_sum,
+                "net_edge": signal.net_edge,
+                "shares": shares,
+                "btc_open": btc_open_val,
+                "secs_to_res": secs_to_res,
+                "fee_source": self.paper_trader.fee_source,
+                "fee_status": self.paper_trader.fee_status,
+                "fee_rate": self.paper_trader.fee_rate,
+                "fee_exponent": self.paper_trader.fee_exponent,
+                "fee_exponent_source": self.paper_trader.fee_exponent_source,
+                "tick_size": self.paper_trader.tick_size,
+                "tick_size_source": self.paper_trader.tick_size_source,
+                "min_order_size": self.paper_trader.min_order_size,
+                "min_order_size_source": self.paper_trader.min_order_size_source,
+                "execution_lane": self.paper_trader.execution_lane,
+                **self.risk_manager.summary(),
+            })
 
     async def _run_window(self) -> None:
-        """Tek bir 5m pencereyi işle — tick-driven, polling yok."""
+        """Process one 5m window — tick-driven, no polling."""
         p("[window] market discovery başlıyor...")
         market = await discover_market(
             interval=self.interval,
@@ -208,32 +341,32 @@ class PolyBot:
 
         p(f"[window] market bulundu: {market['slug']} secs_to_res={market['secs_to_resolution']}")
 
-        # Market discovery'den fee rate çekmeyi dene (once per window)
+        # Market discovery fee attempt (once per window)
         if not self.paper_trader._market_fee_attempted:
             fee_result = await self.paper_trader.try_update_fee_from_market(market["token_up"])
             p(f"[window] market_fee_attempt: verified={fee_result['verified_remote']} "
-              f"market_status={fee_result['market_fee_status']} "
               f"effective_source={self.paper_trader.fee_source} "
-              f"effective_status={self.paper_trader.fee_status} "
               f"fee_rate={self.paper_trader.fee_rate}")
 
-        # Pencere state'ini callback için ayarla
+        # Set window state for tick callbacks
         self._window_token_up = market["token_up"]
         self._window_token_down = market["token_down"]
         self._window_ts = market["window_ts"]
         self._window_slug = market.get("slug", "")
-        self._signal_sent = False
 
-        # Polymarket feed → bu pencereye subscribe ol
-        p(f"[window] Polymarket WS subscribe: up={market['token_up'][:16]}... down={market['token_down'][:16]}...")
+        # Reset all per-window guards
+        self._reset_window_state()
+
+        # Subscribe Polymarket feed
+        p(f"[window] PM subscribe: up={market['token_up'][:16]}... down={market['token_down'][:16]}...")
         await self.pm_feed.resubscribe([market["token_up"], market["token_down"]])
 
-        # Orderbook ilk snapshot'ını bekle (max 12s — WS + HTTP fallback için yeterli süre)
+        # Wait for first orderbook snapshot
         book_up = await self.pm_feed.wait_for_book(market["token_up"], timeout=12.0)
         if book_up:
             p(f"[window] PM orderbook hazır: up bid={book_up.bid} ask={book_up.ask} spread={book_up.spread_pct:.1f}%")
         else:
-            p("[window] UYARI: 5s içinde PM orderbook gelmedi, devam ediliyor")
+            p("[window] UYARI: 12s içinde PM orderbook gelmedi, devam ediliyor")
 
         # Open price capture
         self.feed.mark_window_open()
@@ -243,14 +376,13 @@ class PolyBot:
             p(f"[window] open_price fallback: btc_open={self.feed.mid:.2f}")
             await log_module.log("open_price_fallback", {"btc_open": self.feed.mid})
 
-        # Pencere aktif — tick callback'ler artık sinyal değerlendirecek
+        # Window active — tick callbacks now evaluate signals
         self._window_active = True
-        p("[window] pencere aktif, Binance tick callback devreye girdi")
+        p(f"[window] pencere aktif strategy={self.strategy} window_ts={self._window_ts}")
 
         divisor = 300 if self.interval == "5m" else 900
         last_status_secs = 999
 
-        # Pencere kapanana kadar bekle (sadece durum logu, sinyal callback'te)
         while self._running:
             secs_to_res = self._window_ts + divisor - int(time.time())
 
@@ -262,14 +394,12 @@ class PolyBot:
                 self._running = False
                 break
 
-            # Her 30s'de bir durum satırı + truth observation
             if last_status_secs - secs_to_res >= 30:
                 bu = self.pm_feed.get_book(market["token_up"])
                 bd = self.pm_feed.get_book(market["token_down"])
                 if bu and bd:
                     pair_sum = round(bu.ask + bd.ask, 4)
                     p(f"[window] secs={secs_to_res} pair_sum={pair_sum:.4f} "
-                      f"net_edge={round(1-pair_sum,4):.4f} "
                       f"spread_up={bu.spread_pct:.1f}% spread_down={bd.spread_pct:.1f}% "
                       f"signal_sent={self._signal_sent}")
                     await truth_logger.observe("quote_snapshot", {
@@ -294,8 +424,20 @@ class PolyBot:
 
             await asyncio.sleep(1)
 
-        # Pencereyi kapat
+        # Window closed
         self._window_active = False
+
+        # ── Once-per-window: window_decision (no_signal / gate_fail) ──────────
+        # Emitted only if no trade was opened and no block was logged.
+        if not self._window_decision_emitted:
+            decision = "gate_fail" if self._last_gate_reason else "no_signal"
+            await log_module.log("window_decision", {
+                "window_ts": self._window_ts,
+                "decision": decision,
+                "reason": self._last_gate_reason or "no_entry_cross",
+                "strategy": self.strategy,
+            })
+            self._window_decision_emitted = True
 
         # Resolve
         open_pos = self.paper_trader.open_positions()
@@ -316,9 +458,11 @@ class PolyBot:
         # Inject run_id + pid into every log entry for this session
         log_module.set_session_ctx({"run_id": self.run_id, "pid": self._pid})
 
-        p(f"[run] bot_start mode={self.mode} interval={self.interval} run_id={self.run_id} pid={self._pid}")
+        p(f"[run] bot_start mode={self.mode} strategy={self.strategy} "
+          f"interval={self.interval} run_id={self.run_id} pid={self._pid}")
         log_module.log_sync("bot_start", {
             "mode": self.mode,
+            "strategy": self.strategy,
             "market_type": self.interval,
             "bankroll": self.config.get("bankroll", 30.0),
             "fee_rate": self.paper_trader.fee_rate,
@@ -331,9 +475,13 @@ class PolyBot:
             "min_order_size": self.paper_trader.min_order_size,
             "min_order_size_source": self.paper_trader.min_order_size_source,
             "execution_lane": self.paper_trader.execution_lane,
+            # single-side config snapshot
+            "signal_mode": self.config.get("signal_mode", ""),
+            "forced_side": self.config.get("forced_side", ""),
+            "min_move_bps": self.config.get("min_move_bps", ""),
+            "max_entry_price": self.config.get("max_entry_price", ""),
         })
 
-        # Binance feed başlat
         p("[run] Binance WebSocket feed başlatılıyor...")
         self.feed.subscribe(self._on_btc_tick)
         feed_task = self.feed.start()
@@ -344,7 +492,6 @@ class PolyBot:
         else:
             p("[run] UYARI: 8s içinde Binance tick gelmedi, devam ediliyor")
 
-        # Polymarket WS feed başlat
         p("[run] Polymarket CLOB WebSocket feed başlatılıyor...")
         pm_task = self.pm_feed.start()
 
@@ -359,10 +506,8 @@ class PolyBot:
                 })
 
                 if run_once:
-                    # --once: mevcut pencereyi hemen işle, bekletme
                     p("[run] --once modu: mevcut pencereyi hemen işliyorum")
                 else:
-                    # +2s: yeni pencere sınırını geç, eski pencereyi yakalamayalım
                     sleep_secs = max(0, secs_left + 2)
                     p(f"[run] {sleep_secs:.1f}s bekleniyor (yeni pencere +2s)")
                     await asyncio.sleep(sleep_secs)
@@ -397,13 +542,9 @@ class PolyBot:
               f"avg_edge={stats['avg_net_edge']} "
               f"win_up={stats['win_up']} win_down={stats['win_down']} "
               f"unresolved={stats.get('unresolved_count', 0)} "
-              f"max_retry={stats.get('max_resolution_retry_count', 0)} "
               f"fee_source={stats.get('fee_source', 'unknown')} "
               f"fee_status={stats.get('fee_status', 'unknown')} "
-              f"fallback_fee={stats.get('fallback_fee_usage_count', 0)} "
-              f"lane={stats.get('execution_lane', 'unknown')} "
-              f"market_fee_tried={stats.get('market_fee_attempted', False)} "
-              f"market_fee_status={stats.get('market_fee_status', 'not_attempted')}")
+              f"lane={stats.get('execution_lane', 'unknown')}")
             log_module.log_sync("bot_stop", {
                 "net_pnl": net_pnl,
                 **summary,
@@ -420,7 +561,8 @@ async def main() -> None:
     p(f"[2/5] config yükleniyor: {args.config}")
 
     config = load_config(args.config)
-    p(f"[3/5] config OK — mode={config.get('mode')} market={config.get('market_type')} bankroll={config.get('bankroll')}")
+    p(f"[3/5] config OK — mode={config.get('mode')} strategy={config.get('strategy')} "
+      f"market={config.get('market_type')} bankroll={config.get('bankroll')}")
 
     p("[4/5] PolyBot oluşturuluyor...")
     bot = PolyBot(config)

@@ -1,23 +1,23 @@
 """
-Paper Trader — Dual Side Capture simülasyonu.
+Paper Trader — Dual Side Capture + Single Side Taker simulation.
 
-Trade akışı:
+Trade akışı (dual):
   1. DUAL_ENTRY sinyali → open_position() → her iki taraf ask'tan girilir
-  2. Fee hesaplanır: fee_up + fee_down (fee_engine.compute_fee)
-  3. Pencere kapanır → resolve_pending()
-  4. Kazanan taraf belirlenir (logging için — gross PnL her iki durumda aynı):
-       UP wins: btc_close >= btc_open
-       DOWN wins: btc_close < btc_open
-       Tie: UP kazanır (sadece valid close ile)
-  5. PnL:
-       gross_pnl = shares * (1.0 - up_ask - down_ask)
-       net_pnl   = gross_pnl - fee_total
-  6. JSONL: fee_up, fee_down, fee_total, gross_pnl, net_pnl alanları dahil
+  2. Fee: fee_up + fee_down
+  3. Resolve: gross_pnl = shares * net_edge; net_pnl = gross_pnl - fee_total
+
+Trade akışı (single):
+  1. SINGLE_ENTRY sinyali → open_single_position() → bir taraf ask'tan girilir
+  2. Fee: fee_entry (one side only)
+  3. Resolve:
+       side wins  → gross_pnl = shares * (1.0 - entry_price)
+       side loses → gross_pnl = shares * (-entry_price)
+       net_pnl = gross_pnl - fee_total
 
 fee_rate ve fee_exponent config'den okunur — hardcode yok.
 
 Integrity invariants (enforced here):
-  - max 1 open_position() per window_ts (_opened_window_ts guard)
+  - max 1 open_position() OR open_single_position() per window_ts (_opened_window_ts guard)
   - max 1 trade_resolved per trade_id (_resolved_ids guard)
   - Single canonical writer for lifecycle events: log_module only.
     truth_logger is NOT used here for trade_opened/trade_resolved.
@@ -37,49 +37,50 @@ class PaperPosition:
     trade_id: str
     up_ask: float
     down_ask: float
-    pair_sum: float      # up_ask + down_ask
-    net_edge: float      # 1.0 - pair_sum (gross edge per share, fee-blind)
-    shares: int          # shares_per_side (her taraf için)
+    pair_sum: float      # up_ask + down_ask (dual); 0.0 for single
+    net_edge: float      # 1.0 - pair_sum (dual); 0.0 for single
+    shares: int
     btc_open: float
     opened_at: float
     window_ts: int
     interval: str = "5m"
+    # single-side fields (empty/0 for dual)
+    side: str = ""           # "" = dual; "up" | "down" = single
+    entry_price: float = 0.0 # ask of chosen side (single only)
     # fee fields (entry anında hesaplanır)
-    fee_up: float = 0.0         # compute_fee(shares, up_ask, ...)
-    fee_down: float = 0.0       # compute_fee(shares, down_ask, ...)
-    fee_total: float = 0.0      # fee_up + fee_down
-    fee_rate: float = 0.0       # config'den okunan fee rate
-    fee_exponent: float = 0.0   # config'den okunan fee exponent
+    fee_up: float = 0.0
+    fee_down: float = 0.0
+    fee_total: float = 0.0
+    fee_rate: float = 0.0
+    fee_exponent: float = 0.0
     # resolve sonrası
     resolved: bool = False
-    resolution_blocked: bool = False  # True = truth layer resolve edemedi
+    resolution_blocked: bool = False
     btc_close: float = 0.0
-    winning_side: str = ""   # "up" | "down" | ""
-    result: str = ""         # "win_up" | "win_down" | "unresolved"
-    gross_pnl: float = 0.0  # shares * net_edge (fee-blind)
-    net_pnl: float = 0.0    # gross_pnl - fee_total (fee-aware)
+    winning_side: str = ""
+    result: str = ""
+    gross_pnl: float = 0.0
+    net_pnl: float = 0.0
     # resolution truth fields
-    winner_source: str = ""              # "binance" | "none"
-    winner_binance: str = ""             # "up" | "down" | "unknown"
-    winner_chainlink: str = ""           # "up" | "down" | "unknown"
-    resolution_truth_status: str = ""    # "binance_only" | "dual_verified" | "dual_mismatch" | "unresolved_fetch_error"
-    resolution_match: str = ""           # "match" | "mismatch" | "unknown"
-    chainlink_status: str = ""           # "fetched" | "placeholder" | "error"
+    winner_source: str = ""
+    winner_binance: str = ""
+    winner_chainlink: str = ""
+    resolution_truth_status: str = ""
+    resolution_match: str = ""
+    chainlink_status: str = ""
     # fee source visibility
-    fee_source: str = ""           # "market_discovery" | "config" | "fallback" | "unknown"
-    fee_status: str = ""           # "market_verified" | "configured" | "fallback_used" | "unproven_market_fee"
+    fee_source: str = ""
+    fee_status: str = ""
     # execution lane
-    execution_lane: str = ""       # "taker_paper" | "maker_paper" | "unknown"
-    # market context at entry (enrichment)
-    # NOTE: up_ask/down_ask are required constructor args above — always present.
-    #       up_bid/down_bid come from orderbook snapshot at entry via market_context.
+    execution_lane: str = ""
+    # market context at entry
     market_slug: str = ""
-    btc_mid_binance: float = 0.0   # Binance mid at entry time (0.0 = unavailable)
-    up_bid: float = 0.0            # best bid for UP token at entry
-    down_bid: float = 0.0          # best bid for DOWN token at entry
-    spread_up_pct: float = 0.0     # UP token spread as percentage: (ask-bid)/mid*100
-    spread_down_pct: float = 0.0   # DOWN token spread as percentage: (ask-bid)/mid*100
-    secs_to_res: int = 0           # seconds to resolution at entry
+    btc_mid_binance: float = 0.0
+    up_bid: float = 0.0
+    down_bid: float = 0.0
+    spread_up_pct: float = 0.0
+    spread_down_pct: float = 0.0
+    secs_to_res: int = 0
     # unresolved lifecycle tracking
     resolution_retry_count: int = 0
     first_resolution_failure_ts: float = 0.0
@@ -125,9 +126,9 @@ class PaperTrader:
         self.risk_manager = risk_manager
 
         # Integrity guards
-        # max 1 open_position per window_ts — prevents same-window double-open
+        # max 1 open per window_ts (covers both dual and single)
         self._opened_window_ts: set[int] = set()
-        # max 1 trade_resolved per trade_id — prevents retry-loop double-resolve
+        # max 1 trade_resolved per trade_id
         self._resolved_ids: set[str] = set()
 
     async def try_update_fee_from_market(self, token_id: str) -> dict:
@@ -137,17 +138,12 @@ class PaperTrader:
         Epistemik kural:
           - verified_remote=True  → fee_source="market_discovery", fee_rate güncellenir
           - verified_remote=False → fee_source DEĞİŞMEZ (config/fallback kalır)
-          - Her iki durumda da deneme kaydedilir: market_fee_attempted, market_fee_status
-
-        Döndürür: {"attempted", "verified_remote", "market_fee_rate", "market_fee_status", "note"}
         """
         from market_discovery import get_market_fee_rate
         self._market_fee_attempted = True
         try:
             mkt = await get_market_fee_rate(token_id)
         except Exception as e:
-            # get_market_fee_rate kendi içinde exception yakalar ama
-            # import veya beklenmedik hata olabilir
             self._market_fee_status = "import_or_unexpected_error"
             await log_module.log("fee_market_discovery_failed", {
                 "token_id": token_id,
@@ -166,14 +162,11 @@ class PaperTrader:
         self._market_fee_status = mkt["status"]
 
         if verified:
-            # CLOB gerçekten cevap verdi ve fee_rate alanı vardı → güvenilir
             self.fee_rate = mkt["fee_rate"]
             self.fee_source = "market_discovery"
             self.fee_status = "market_verified"
             self._market_fee_ok = True
         else:
-            # CLOB cevap vermedi veya fee_rate alanı yoktu → effective source değişmez
-            # fee_source config/fallback olarak kalır — market_discovery iddia edilmez
             self._market_fee_ok = False
 
         await log_module.log("fee_market_discovery_attempt", {
@@ -205,14 +198,11 @@ class PaperTrader:
         interval: str = "5m",
         market_context: dict | None = None,
     ) -> PaperPosition:
-        """Dual entry simüle et — her iki taraf ask'tan fill edildi kabul edilir.
+        """Dual entry — both sides at ask, taker fill.
 
-        Integrity: max 1 call per window_ts. If called a second time for the same
-        window_ts, logs an integrity_violation and raises RuntimeError — the caller
-        (_signal_sent guard in main.py) should have prevented this.
+        Integrity: max 1 call per window_ts.
         """
         if window_ts in self._opened_window_ts:
-            # Belt-and-suspenders: _signal_sent in main.py must have failed.
             log_module.log_sync("integrity_violation", {
                 "violation": "duplicate_open_position",
                 "window_ts": window_ts,
@@ -220,7 +210,7 @@ class PaperTrader:
             })
             raise RuntimeError(
                 f"open_position called twice for window_ts={window_ts}. "
-                "Integrity violation — check _signal_sent guard in main.py."
+                "Check _signal_sent guard in main.py."
             )
 
         self._counter += 1
@@ -228,29 +218,19 @@ class PaperTrader:
         net_edge = round(1.0 - pair_sum, 4)
         ctx = market_context or {}
 
-        # Fee hesapla — entry anında, config'den okunan parametrelerle
         fee_up = compute_fee(shares, up_ask, self.fee_rate, self.fee_exponent)
         fee_down = compute_fee(shares, down_ask, self.fee_rate, self.fee_exponent)
         fee_total = round(fee_up + fee_down, 4)
 
         pos = PaperPosition(
             trade_id=f"dual-{int(time.time())}-{self._counter}",
-            up_ask=up_ask,
-            down_ask=down_ask,
-            pair_sum=pair_sum,
-            net_edge=net_edge,
-            shares=shares,
-            btc_open=btc_open,
-            opened_at=time.time(),
-            window_ts=window_ts,
-            interval=interval,
-            fee_up=fee_up,
-            fee_down=fee_down,
-            fee_total=fee_total,
-            fee_rate=self.fee_rate,
-            fee_exponent=self.fee_exponent,
-            fee_source=self.fee_source,
-            fee_status=self.fee_status,
+            up_ask=up_ask, down_ask=down_ask,
+            pair_sum=pair_sum, net_edge=net_edge,
+            shares=shares, btc_open=btc_open,
+            opened_at=time.time(), window_ts=window_ts, interval=interval,
+            fee_up=fee_up, fee_down=fee_down, fee_total=fee_total,
+            fee_rate=self.fee_rate, fee_exponent=self.fee_exponent,
+            fee_source=self.fee_source, fee_status=self.fee_status,
             execution_lane=self.execution_lane,
             market_slug=ctx.get("market_slug", ""),
             btc_mid_binance=ctx.get("btc_mid_binance", 0.0),
@@ -263,19 +243,84 @@ class PaperTrader:
         self._positions.append(pos)
         self._opened_window_ts.add(window_ts)
 
-        # Canonical trade_opened write is in main.py (log_module.log).
-        # truth_logger is NOT used here — single writer per event type.
+        # Canonical trade_opened write is in main.py. truth_logger NOT used here.
+        if self.risk_manager:
+            self.risk_manager.on_trade_opened()
 
+        return pos
+
+    def open_single_position(
+        self,
+        side: str,
+        entry_price: float,
+        shares: int,
+        btc_open: float,
+        window_ts: int,
+        interval: str = "5m",
+        market_context: dict | None = None,
+    ) -> PaperPosition:
+        """Single-side entry — one side at ask, taker fill.
+
+        PnL at resolve:
+          side wins  → gross = shares * (1.0 - entry_price)
+          side loses → gross = shares * (-entry_price)
+
+        Integrity: same _opened_window_ts guard as open_position.
+        """
+        if window_ts in self._opened_window_ts:
+            log_module.log_sync("integrity_violation", {
+                "violation": "duplicate_open_single_position",
+                "window_ts": window_ts,
+                "side": side,
+                "counter": self._counter,
+            })
+            raise RuntimeError(
+                f"open_single_position called twice for window_ts={window_ts}. "
+                "Check _signal_sent guard in main.py."
+            )
+
+        self._counter += 1
+        ctx = market_context or {}
+
+        fee_entry = compute_fee(shares, entry_price, self.fee_rate, self.fee_exponent)
+        fee_up = fee_entry if side == "up" else 0.0
+        fee_down = fee_entry if side == "down" else 0.0
+
+        pos = PaperPosition(
+            trade_id=f"single-{side}-{int(time.time())}-{self._counter}",
+            up_ask=ctx.get("up_ask", entry_price if side == "up" else 0.0),
+            down_ask=ctx.get("down_ask", entry_price if side == "down" else 0.0),
+            pair_sum=0.0, net_edge=0.0,
+            shares=shares, btc_open=btc_open,
+            opened_at=time.time(), window_ts=window_ts, interval=interval,
+            side=side, entry_price=entry_price,
+            fee_up=fee_up, fee_down=fee_down, fee_total=fee_entry,
+            fee_rate=self.fee_rate, fee_exponent=self.fee_exponent,
+            fee_source=self.fee_source, fee_status=self.fee_status,
+            execution_lane=self.execution_lane,
+            market_slug=ctx.get("market_slug", ""),
+            btc_mid_binance=ctx.get("btc_mid_binance", 0.0),
+            up_bid=ctx.get("up_bid", 0.0),
+            down_bid=ctx.get("down_bid", 0.0),
+            spread_up_pct=ctx.get("spread_up_pct", 0.0),
+            spread_down_pct=ctx.get("spread_down_pct", 0.0),
+            secs_to_res=ctx.get("secs_to_res", 0),
+        )
+        self._positions.append(pos)
+        self._opened_window_ts.add(window_ts)
+
+        # Canonical trade_opened write is in main.py. truth_logger NOT used here.
         if self.risk_manager:
             self.risk_manager.on_trade_opened()
 
         return pos
 
     async def resolve_pending(self, wait_secs: int | None = None) -> list[PaperPosition]:
-        """Bekleyen pozisyonları resolve et — resolution_truth layer üzerinden.
+        """Resolve pending positions via resolution_truth layer.
 
-        Integrity: max 1 resolution per trade_id (_resolved_ids guard).
-        Canonical trade_resolved write is log_module only — truth_logger not used here.
+        Integrity:
+          - max 1 resolution per trade_id (_resolved_ids guard)
+          - Single canonical writer: log_module only. truth_logger NOT used here.
         """
         pending = [pos for pos in self._positions if not pos.resolved]
         if not pending:
@@ -298,14 +343,12 @@ class PaperTrader:
                 continue
 
             try:
-                # Resolution truth layer — Binance + Chainlink (placeholder)
                 truth = await resolve_truth(
                     window_ts=pos.window_ts,
                     interval=pos.interval,
                     btc_open=pos.btc_open,
                 )
 
-                # Truth fields — her durumda doldur
                 pos.winner_source = truth.winner_source
                 pos.winner_binance = truth.winner_binance
                 pos.winner_chainlink = truth.winner_chainlink
@@ -313,7 +356,6 @@ class PaperTrader:
                 pos.resolution_match = truth.resolution_match
                 pos.chainlink_status = truth.chainlink_status
 
-                # Fetch başarısız → trade'i final olarak kapatma
                 if truth.winner_source == "none" or truth.winner_binance == "unknown":
                     now = time.time()
                     pos.resolution_blocked = True
@@ -325,16 +367,16 @@ class PaperTrader:
                     pos.last_resolution_attempt_ts = now
                     if pos.first_resolution_failure_ts == 0.0:
                         pos.first_resolution_failure_ts = now
-                    # resolved=False kalır — trade hâlâ açık sayılır
 
                     secs_since_first = round(now - pos.first_resolution_failure_ts, 1)
-
-                    blocked_data = {
+                    # Single canonical writer: log_module only.
+                    await log_module.log("trade_resolution_blocked", {
                         "trade_id": pos.trade_id,
                         "timestamp": now,
                         "window": pos.window_ts,
                         "interval": pos.interval,
                         "btc_open": pos.btc_open,
+                        "side": pos.side,
                         "resolution_truth_status": truth.resolution_truth_status,
                         "winner_source": truth.winner_source,
                         "winner_binance": truth.winner_binance,
@@ -344,23 +386,29 @@ class PaperTrader:
                         "secs_since_first_failure": secs_since_first,
                         "note": "Truth layer could not determine winner. "
                                 "Trade NOT finalized. No PnL assigned.",
-                    }
-                    # Single canonical writer: log_module only.
-                    await log_module.log("trade_resolution_blocked", blocked_data)
+                    })
                     continue
 
-                # Valid winner var — trade'i finalize et
+                # Valid winner — finalize
                 winning_side = truth.winner_binance
-                result = f"win_{winning_side}"
 
-                # PnL: fee-aware
-                gross_pnl = round(pos.shares * pos.net_edge, 4)
+                # PnL: dual vs single
+                if pos.side:
+                    # single-side: win = (1.0 - entry_price), lose = (-entry_price)
+                    if winning_side == pos.side:
+                        gross_pnl = round(pos.shares * (1.0 - pos.entry_price), 4)
+                    else:
+                        gross_pnl = round(pos.shares * (-pos.entry_price), 4)
+                else:
+                    # dual-side: always wins one leg at 1.0
+                    gross_pnl = round(pos.shares * pos.net_edge, 4)
+
                 net_pnl = round(gross_pnl - pos.fee_total, 4)
 
                 pos.resolved = True
                 pos.btc_close = truth.btc_close_binance
                 pos.winning_side = winning_side
-                pos.result = result
+                pos.result = f"win_{winning_side}"
                 pos.gross_pnl = gross_pnl
                 pos.net_pnl = net_pnl
 
@@ -373,6 +421,8 @@ class PaperTrader:
                     "timestamp": time.time(),
                     "window": pos.window_ts,
                     "interval": pos.interval,
+                    "side": pos.side,
+                    "entry_price": pos.entry_price,
                     "up_bid": pos.up_bid,
                     "up_ask": pos.up_ask,
                     "down_bid": pos.down_bid,
@@ -387,6 +437,7 @@ class PaperTrader:
                     "secs_to_res": pos.secs_to_res,
                     "btc_close": pos.btc_close,
                     "result": pos.result,
+                    "winning_side": pos.winning_side,
                     "fee_up": pos.fee_up,
                     "fee_down": pos.fee_down,
                     "fee_total": pos.fee_total,
@@ -406,7 +457,6 @@ class PaperTrader:
                 }
                 # Single canonical writer: log_module only.
                 await log_module.log("trade_resolved", resolved_data)
-                # Mark resolved — guard prevents any future duplicate
                 self._resolved_ids.add(pos.trade_id)
                 resolved.append(pos)
 
@@ -424,15 +474,12 @@ class PaperTrader:
         return list(self._positions)
 
     def total_pnl(self) -> float:
-        """Net PnL (fee-aware) — sadece resolved pozisyonlar."""
         return sum(pos.net_pnl for pos in self._positions if pos.resolved)
 
     def unresolved_positions(self) -> list[PaperPosition]:
-        """Resolution blocked olan pozisyonlar."""
         return [pos for pos in self._positions if pos.resolution_blocked]
 
     def summary_stats(self) -> dict:
-        """10 pencere sonunda rapor için istatistikler."""
         all_pos = self._positions
         resolved = [pos for pos in all_pos if pos.resolved]
         blocked = [pos for pos in all_pos if pos.resolution_blocked]
@@ -480,5 +527,5 @@ class PaperTrader:
             "execution_lane": self.execution_lane,
             "market_fee_attempted": self._market_fee_attempted,
             "market_fee_ok": self._market_fee_ok,
-            "dual_fill_rate": "100%",  # paper modda her zaman %100
+            "dual_fill_rate": "100%",
         }
