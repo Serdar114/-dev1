@@ -34,28 +34,39 @@ def _no_trade(reason: str, details: Dict[str, Any], canonical: bool = True) -> T
 
 
 # ─────────────────────────────────────────────────────────────
-# CANONICAL TRUTH RULES (Chainlink / window)
+# CANONICAL TRUTH RULES (source-agnostic)
+#
+# These rules reason about the canonical price the selector provided.
+# They do NOT name a specific physical source (RTDS or RPC).
+# canonical_source_tag in FeatureVector records which source was used —
+# that is an audit field, not a rule input.
 # ─────────────────────────────────────────────────────────────
 
-def rule_chainlink_not_missing(fv: FeatureVector) -> TradeVerdict:
-    """Chainlink must not be missing (we must have received at least one update)."""
+def rule_canonical_price_not_missing(fv: FeatureVector) -> TradeVerdict:
+    """Canonical price must be present (selector must have produced a fresh price)."""
     if fv.chainlink_now is None:
         return _no_trade(
-            NoTradeReasonCode.CHAINLINK_MISSING,
-            {"chainlink_now": None, "freshness": fv.chainlink_freshness},
+            NoTradeReasonCode.CANONICAL_PRICE_MISSING,
+            {
+                "canonical_price": None,
+                "canonical_source_tag": fv.canonical_source_tag,
+                "freshness": fv.chainlink_freshness,
+            },
             canonical=True,
         )
     return TRADE_OK
 
 
-def rule_chainlink_not_stale(fv: FeatureVector) -> TradeVerdict:
-    """Chainlink must be FRESH — STALE is not acceptable for canonical truth."""
+def rule_canonical_price_not_stale(fv: FeatureVector) -> TradeVerdict:
+    """Canonical price must be FRESH — STALE is not acceptable for canonical truth."""
     if fv.chainlink_freshness != FreshnessState.FRESH:
         return _no_trade(
-            NoTradeReasonCode.CHAINLINK_STALE,
+            NoTradeReasonCode.CANONICAL_PRICE_STALE,
             {
                 "freshness": fv.chainlink_freshness,
-                "chainlink_now": fv.chainlink_now,
+                "canonical_price": fv.chainlink_now,
+                "canonical_source_tag": fv.canonical_source_tag,
+                "fallback_active": fv.canonical_fallback_active,
             },
             canonical=True,
         )
@@ -209,8 +220,8 @@ def evaluate_all(
 
     # Canonical rules — hard stops
     for rule_fn in [
-        rule_chainlink_not_missing,
-        rule_chainlink_not_stale,
+        rule_canonical_price_not_missing,
+        rule_canonical_price_not_stale,
         rule_window_open_captured,
         lambda fv: rule_window_not_expired(fv, min_secs_to_expiry),
         rule_metadata_complete,

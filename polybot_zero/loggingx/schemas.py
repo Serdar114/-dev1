@@ -40,9 +40,9 @@ class ResolutionOutcome:
 
 
 class NoTradeReasonCode:
-    # Chainlink/truth issues
-    CHAINLINK_STALE          = "CHAINLINK_STALE"
-    CHAINLINK_MISSING        = "CHAINLINK_MISSING"
+    # Canonical price issues (source-agnostic — whichever source the selector chose)
+    CANONICAL_PRICE_MISSING  = "CANONICAL_PRICE_MISSING"
+    CANONICAL_PRICE_STALE    = "CANONICAL_PRICE_STALE"
     WINDOW_OPEN_NOT_CAPTURED = "WINDOW_OPEN_NOT_CAPTURED"
     WINDOW_CLOSE_NOT_CAPTURABLE = "WINDOW_CLOSE_NOT_CAPTURABLE"
 
@@ -135,13 +135,38 @@ class MarketMetadata:
 
 @dataclass
 class ChainlinkPrice:
-    """Canonical settlement truth source. Never fallback, never guessed."""
+    """Raw Chainlink price snapshot from one physical source (RPC or RTDS)."""
     price_usd:    float
     round_id:     int
     updated_at:   float   # UTC unix from chain
     fetched_at:   float   # UTC unix when we got it
     freshness:    str     # FreshnessState
     source:       str = "polygon_chainlink_btcusd"
+
+    def age_secs(self) -> float:
+        return time.time() - self.updated_at
+
+
+@dataclass
+class CanonicalPriceSnapshot:
+    """
+    The canonical price selected by the source arbitration layer.
+
+    source_tag:      which physical source was chosen ("rtds" | "chainlink_rpc")
+    selected_reason: why this source was chosen (logged explicitly)
+    fallback_active: True when using the secondary source (chainlink_rpc)
+
+    This is what the rest of the system reads.
+    Never constructed without a proven-fresh underlying price.
+    """
+    price_usd:       float
+    round_id:        int
+    updated_at:      float   # UTC unix from chain
+    fetched_at:      float   # UTC unix when we retrieved it
+    freshness:       str     # FreshnessState
+    source_tag:      str     # "rtds" | "chainlink_rpc"
+    selected_reason: str     # e.g. "rtds_fresh" | "rtds_unavailable" | "rtds_stale" | "rtds_disabled"
+    fallback_active: bool    # True = secondary source in use
 
     def age_secs(self) -> float:
         return time.time() - self.updated_at
@@ -250,11 +275,13 @@ class FeatureVector:
     # Timing
     secs_to_expiry:  Optional[float] = None
 
-    # Chainlink (canonical)
-    chainlink_open:       Optional[float] = None
-    chainlink_now:        Optional[float] = None
-    chainlink_delta_bps:  Optional[float] = None   # (now-open)/open * 10000
-    chainlink_freshness:  str = FreshnessState.MISSING
+    # Canonical price — set from whichever source the selector chose
+    chainlink_open:            Optional[float] = None
+    chainlink_now:             Optional[float] = None
+    chainlink_delta_bps:       Optional[float] = None   # (now-open)/open * 10000
+    chainlink_freshness:       str = FreshnessState.MISSING
+    canonical_source_tag:      Optional[str]  = None    # "rtds" | "chainlink_rpc" | None
+    canonical_fallback_active: Optional[bool] = None    # True = secondary source in use
 
     # Binance (auxiliary)
     binance_bid:          Optional[float] = None

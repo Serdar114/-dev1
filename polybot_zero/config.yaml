@@ -13,14 +13,21 @@ discovery:
   poll_interval_secs: 60
 
 feeds:
-  chainlink:
-    # Polygon Mainnet RPC — replace with your own for reliability
-    polygon_rpc_url: "https://polygon-rpc.com"
-    # BTC/USD Chainlink aggregator on Polygon Mainnet
-    btcusd_aggregator: "0xc907E116054Ad103354f2D350FD2514433D57F6f"
-    # How often to poll chain (seconds)
+  # Canonical source 1 — RTDS oracle feed (first candidate)
+  # Set url to your RTDS oracle endpoint. null = disabled (falls through to chainlink_rpc).
+  rtds:
+    url: null                       # e.g. "https://your-rtds-oracle/btcusd"
     poll_interval_secs: 10
-    # If no fresh update within this window, declare stale
+    staleness_threshold_secs: 45
+    price_field: "answer"           # JSON field for raw answer (int, unscaled)
+    updated_at_field: "updatedAt"   # JSON field for chain update timestamp
+    round_id_field: "roundId"       # JSON field for round identifier
+
+  # Canonical source 2 — direct Chainlink RPC on Polygon Mainnet (second candidate / fallback)
+  # Contract: 0xc907E116054Ad103354f2D350FD2514433D57F6f (BTC/USD aggregator)
+  chainlink_rpc:
+    polygon_rpc_url: "https://polygon-rpc.com"   # replace with your own for reliability
+    poll_interval_secs: 10
     staleness_threshold_secs: 45
 
   binance:

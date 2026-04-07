@@ -45,7 +45,9 @@ from app.modes import validate_mode, is_paper_active, MEASUREMENT_ONLY
 from discovery.market_discovery import MarketDiscovery
 from discovery.market_registry import MarketRegistry
 from metadata.market_metadata import MetadataFetcher
-from feeds.rtds_client import ChainlinkRTDSClient
+from feeds.rtds_client import RTDSOracleClient
+from feeds.chainlink_rpc import ChainlinkRPCClient
+from feeds.canonical_source import CanonicalSourceSelector
 from feeds.binance_aux import BinanceAuxClient
 from feeds.market_ws_client import MarketWSClient
 from truth.window_clock import WindowClock
@@ -106,13 +108,24 @@ class Runner:
         )
         self._require_fee = meta_cfg.get("require_fee_from_api", True)
 
-        # Feeds
-        feeds_cfg = config.get("feeds", {})
-        cl_cfg = feeds_cfg.get("chainlink", {})
-        self._chainlink = ChainlinkRTDSClient(
-            polygon_rpc_url=cl_cfg.get("polygon_rpc_url", "https://polygon-rpc.com"),
-            poll_interval_secs=cl_cfg.get("poll_interval_secs", 10),
-            staleness_threshold_secs=cl_cfg.get("staleness_threshold_secs", 45),
+        # Feeds — canonical price source arbitration
+        feeds_cfg  = config.get("feeds", {})
+        rtds_cfg   = feeds_cfg.get("rtds", {})
+        rpc_cfg    = feeds_cfg.get("chainlink_rpc", {})
+
+        self._rtds_client = RTDSOracleClient(
+            rtds_url=rtds_cfg.get("url", None),
+            poll_interval_secs=rtds_cfg.get("poll_interval_secs", 10),
+            staleness_threshold_secs=rtds_cfg.get("staleness_threshold_secs", 45),
+        )
+        self._rpc_client = ChainlinkRPCClient(
+            polygon_rpc_url=rpc_cfg.get("polygon_rpc_url", "https://polygon-rpc.com"),
+            poll_interval_secs=rpc_cfg.get("poll_interval_secs", 10),
+            staleness_threshold_secs=rpc_cfg.get("staleness_threshold_secs", 45),
+        )
+        self._canonical = CanonicalSourceSelector(
+            rtds=self._rtds_client,
+            rpc=self._rpc_client,
         )
         bn_cfg = feeds_cfg.get("binance", {})
         self._binance = BinanceAuxClient(
@@ -182,7 +195,8 @@ class Runner:
 
         # Start background feed tasks
         tasks = [
-            asyncio.create_task(self._chainlink.start(), name="chainlink"),
+            asyncio.create_task(self._rtds_client.start(), name="rtds"),
+            asyncio.create_task(self._rpc_client.start(), name="chainlink_rpc"),
             asyncio.create_task(self._binance.start(), name="binance"),
             asyncio.create_task(self._market_ws.start(), name="market_ws"),
             asyncio.create_task(self._discovery_loop(), name="discovery"),
@@ -201,7 +215,8 @@ class Runner:
             await self._shutdown()
 
     async def _shutdown(self) -> None:
-        await self._chainlink.stop()
+        await self._rtds_client.stop()
+        await self._rpc_client.stop()
         await self._binance.stop()
         await self._market_ws.stop()
         self._print_final_verdict()
@@ -278,16 +293,16 @@ class Runner:
 
     async def _tick(self) -> None:
         """Process one tick for all tracked markets."""
-        now = time.time()
-        chainlink = self._chainlink.latest()
+        now       = time.time()
+        canonical = self._canonical.latest()
         binance   = self._binance.latest()
 
-        # Log Chainlink state
-        if chainlink is None or chainlink.freshness != FreshnessState.FRESH:
+        # Log canonical price state
+        if canonical is None or canonical.freshness != FreshnessState.FRESH:
             self._n_chainlink_stale += 1
             self._elog.log_chainlink_stale(
-                last_updated_at=chainlink.updated_at if chainlink else None,
-                age_secs=chainlink.age_secs() if chainlink else None,
+                last_updated_at=canonical.updated_at if canonical else None,
+                age_secs=canonical.age_secs() if canonical else None,
             )
 
         for entry in self._registry.all_markets():
@@ -324,7 +339,7 @@ class Runner:
             if clock.should_fire_open():
                 self._registry.mark_live(cid)
                 self._n_windows_observed += 1
-                tracker.capture_open(chainlink)
+                tracker.capture_open(canonical)
                 self._elog.log_window_open(
                     condition_id=cid,
                     window_start_ts=identity.window_start_ts,
@@ -337,7 +352,7 @@ class Runner:
                 await self._market_ws.subscribe({identity.up_token_id, identity.down_token_id})
 
             if clock.should_fire_close():
-                tracker.capture_close(chainlink)
+                tracker.capture_close(canonical)
                 outcome = tracker.truth.outcome
 
                 self._elog.log_window_close(
@@ -391,7 +406,7 @@ class Runner:
                 down_token_id=identity.down_token_id,
                 window_start_ts=identity.window_start_ts,
                 window_end_ts=identity.window_end_ts,
-                chainlink=chainlink,
+                canonical=canonical,
                 chainlink_open=tracker.truth.chainlink_open,
                 binance=binance,
                 up_book=up_book,

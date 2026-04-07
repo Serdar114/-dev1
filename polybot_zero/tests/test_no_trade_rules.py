@@ -9,8 +9,8 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from signals.no_trade_rules import (
-    rule_chainlink_not_missing,
-    rule_chainlink_not_stale,
+    rule_canonical_price_not_missing,
+    rule_canonical_price_not_stale,
     rule_window_open_captured,
     rule_window_not_expired,
     rule_metadata_complete,
@@ -58,6 +58,8 @@ def _base_fv(**overrides) -> FeatureVector:
         tick_size=0.01,
         min_order_size=1.0,
         is_tradeable=True,
+        canonical_source_tag="rtds",
+        canonical_fallback_active=False,
     )
     defaults.update(overrides)
     return FeatureVector(**defaults)
@@ -65,38 +67,38 @@ def _base_fv(**overrides) -> FeatureVector:
 
 # ─── Individual rule tests ────────────────────────────────────
 
-class TestRuleChainlinkNotMissing:
+class TestRuleCanonicalPriceNotMissing:
     def test_passes_when_present(self):
         fv = _base_fv()
-        ok, reason, _ = rule_chainlink_not_missing(fv)
+        ok, reason, _ = rule_canonical_price_not_missing(fv)
         assert ok is True
 
     def test_fails_when_none(self):
         fv = _base_fv(chainlink_now=None)
-        ok, reason, details = rule_chainlink_not_missing(fv)
+        ok, reason, details = rule_canonical_price_not_missing(fv)
         assert ok is False
-        assert reason == NoTradeReasonCode.CHAINLINK_MISSING
+        assert reason == NoTradeReasonCode.CANONICAL_PRICE_MISSING
         assert details["_canonical"] is True
 
 
-class TestRuleChainlinkNotStale:
+class TestRuleCanonicalPriceNotStale:
     def test_passes_when_fresh(self):
         fv = _base_fv(chainlink_freshness=FreshnessState.FRESH)
-        ok, _, _ = rule_chainlink_not_stale(fv)
+        ok, _, _ = rule_canonical_price_not_stale(fv)
         assert ok is True
 
     def test_fails_when_stale(self):
         fv = _base_fv(chainlink_freshness=FreshnessState.STALE)
-        ok, reason, details = rule_chainlink_not_stale(fv)
+        ok, reason, details = rule_canonical_price_not_stale(fv)
         assert ok is False
-        assert reason == NoTradeReasonCode.CHAINLINK_STALE
+        assert reason == NoTradeReasonCode.CANONICAL_PRICE_STALE
         assert details["_canonical"] is True
 
     def test_fails_when_missing(self):
         fv = _base_fv(chainlink_freshness=FreshnessState.MISSING, chainlink_now=None)
-        ok, reason, _ = rule_chainlink_not_stale(fv)
+        ok, reason, _ = rule_canonical_price_not_stale(fv)
         assert ok is False
-        assert reason == NoTradeReasonCode.CHAINLINK_STALE
+        assert reason == NoTradeReasonCode.CANONICAL_PRICE_STALE
 
 
 class TestRuleWindowOpenCaptured:
@@ -242,18 +244,18 @@ class TestEvaluateAll:
         assert details is None
 
     def test_stops_at_first_canonical_failure(self):
-        # Chainlink missing should stop early, before book check
+        # Canonical price missing should stop early, before book check
         fv = _base_fv(chainlink_now=None, up_best_ask=None)
         ok, reason, _ = evaluate_all(fv)
         assert ok is False
-        # Should be chainlink issue, not book issue
-        assert reason == NoTradeReasonCode.CHAINLINK_MISSING
+        # Should be canonical price issue, not book issue
+        assert reason == NoTradeReasonCode.CANONICAL_PRICE_MISSING
 
-    def test_chainlink_stale_blocks_even_with_good_book(self):
+    def test_canonical_stale_blocks_even_with_good_book(self):
         fv = _base_fv(chainlink_freshness=FreshnessState.STALE)
         ok, reason, _ = evaluate_all(fv)
         assert ok is False
-        assert reason == NoTradeReasonCode.CHAINLINK_STALE
+        assert reason == NoTradeReasonCode.CANONICAL_PRICE_STALE
 
     def test_all_canonical_pass_book_blocks(self):
         fv = _base_fv(up_best_ask=None)

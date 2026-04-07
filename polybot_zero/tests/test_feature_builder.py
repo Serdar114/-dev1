@@ -10,14 +10,23 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from signals.feature_builder import FeatureBuilder
 from loggingx.schemas import (
-    ChainlinkPrice, BinancePrice, OrderBookSnapshot, PriceLevel,
+    CanonicalPriceSnapshot, BinancePrice, OrderBookSnapshot, PriceLevel,
     MarketMetadata, FreshnessState,
 )
 
 
-def _fresh_chainlink(price: float) -> ChainlinkPrice:
+def _fresh_canonical(price: float, source_tag: str = "rtds") -> CanonicalPriceSnapshot:
     now = time.time()
-    return ChainlinkPrice(price_usd=price, round_id=1, updated_at=now-5, fetched_at=now, freshness=FreshnessState.FRESH)
+    return CanonicalPriceSnapshot(
+        price_usd=price,
+        round_id=1,
+        updated_at=now - 5,
+        fetched_at=now,
+        freshness=FreshnessState.FRESH,
+        source_tag=source_tag,
+        selected_reason="rtds_fresh",
+        fallback_active=(source_tag != "rtds"),
+    )
 
 
 def _fresh_binance(bid: float, ask: float) -> BinancePrice:
@@ -54,7 +63,7 @@ def _base_fv(builder: FeatureBuilder, **overrides):
         down_token_id="dn_tok",
         window_start_ts=now - 150,
         window_end_ts=now + 150,
-        chainlink=_fresh_chainlink(50000.0),
+        canonical=_fresh_canonical(50000.0),
         chainlink_open=49900.0,
         binance=_fresh_binance(50010.0, 50020.0),
         up_book=_book("up_tok", 0.48, 0.52),
@@ -117,11 +126,12 @@ class TestFeatureBuilderMissingInputs:
     def setup_method(self):
         self.builder = FeatureBuilder()
 
-    def test_not_tradeable_when_chainlink_missing(self):
-        fv = _base_fv(self.builder, chainlink=None)
+    def test_not_tradeable_when_canonical_missing(self):
+        fv = _base_fv(self.builder, canonical=None)
         assert fv.is_tradeable is False
         assert fv.chainlink_now is None
         assert fv.chainlink_freshness == FreshnessState.MISSING
+        assert fv.canonical_source_tag is None
 
     def test_not_tradeable_when_chainlink_open_missing(self):
         fv = _base_fv(self.builder, chainlink_open=None)
@@ -172,18 +182,23 @@ class TestFeatureBuilderMissingInputs:
         assert fv.is_tradeable is False
 
 
-class TestFeatureBuilderStaleChainlink:
+class TestFeatureBuilderStaleCanonical:
     def setup_method(self):
         self.builder = FeatureBuilder()
 
     def test_not_tradeable_when_stale(self):
-        stale = ChainlinkPrice(
+        stale = CanonicalPriceSnapshot(
             price_usd=50000.0,
             round_id=1,
             updated_at=time.time() - 100,
             fetched_at=time.time(),
             freshness=FreshnessState.STALE,
+            source_tag="chainlink_rpc",
+            selected_reason="rtds_unavailable",
+            fallback_active=True,
         )
-        fv = _base_fv(self.builder, chainlink=stale)
+        fv = _base_fv(self.builder, canonical=stale)
         assert fv.is_tradeable is False
         assert fv.chainlink_freshness == FreshnessState.STALE
+        assert fv.canonical_source_tag == "chainlink_rpc"
+        assert fv.canonical_fallback_active is True

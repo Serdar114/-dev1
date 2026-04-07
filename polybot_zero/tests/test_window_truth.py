@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from truth.window_clock import WindowClock
 from truth.resolution_truth import ResolutionTruthTracker
 from truth.freshness import check_freshness, is_fresh, age_secs
-from loggingx.schemas import ChainlinkPrice, FreshnessState, ResolutionOutcome
+from loggingx.schemas import CanonicalPriceSnapshot, FreshnessState, ResolutionOutcome
 
 
 # ─── Freshness tests ──────────────────────────────────────────
@@ -115,25 +115,31 @@ class TestWindowClock:
 
 # ─── ResolutionTruthTracker tests ─────────────────────────────
 
-def _make_fresh_chainlink(price: float) -> ChainlinkPrice:
+def _make_fresh_canonical(price: float) -> CanonicalPriceSnapshot:
     now = time.time()
-    return ChainlinkPrice(
+    return CanonicalPriceSnapshot(
         price_usd=price,
         round_id=100,
-        updated_at=now - 5,   # 5s ago = fresh within 45s threshold
+        updated_at=now - 5,
         fetched_at=now,
         freshness=FreshnessState.FRESH,
+        source_tag="rtds",
+        selected_reason="rtds_fresh",
+        fallback_active=False,
     )
 
 
-def _make_stale_chainlink(price: float) -> ChainlinkPrice:
+def _make_stale_canonical(price: float) -> CanonicalPriceSnapshot:
     now = time.time()
-    return ChainlinkPrice(
+    return CanonicalPriceSnapshot(
         price_usd=price,
         round_id=100,
-        updated_at=now - 60,   # 60s ago = stale within 45s threshold
+        updated_at=now - 60,
         fetched_at=now,
         freshness=FreshnessState.STALE,
+        source_tag="chainlink_rpc",
+        selected_reason="rtds_unavailable",
+        fallback_active=True,
     )
 
 
@@ -148,58 +154,58 @@ class TestResolutionTruthTracker:
 
     def test_up_outcome(self):
         tracker = self._make_tracker()
-        tracker.capture_open(_make_fresh_chainlink(50000.0))
-        tracker.capture_close(_make_fresh_chainlink(50100.0))  # higher = UP
+        tracker.capture_open(_make_fresh_canonical(50000.0))
+        tracker.capture_close(_make_fresh_canonical(50100.0))  # higher = UP
         assert tracker.truth.outcome == ResolutionOutcome.UP
         assert tracker.is_resolved() is True
 
     def test_down_outcome(self):
         tracker = self._make_tracker()
-        tracker.capture_open(_make_fresh_chainlink(50000.0))
-        tracker.capture_close(_make_fresh_chainlink(49900.0))  # lower = DOWN
+        tracker.capture_open(_make_fresh_canonical(50000.0))
+        tracker.capture_close(_make_fresh_canonical(49900.0))  # lower = DOWN
         assert tracker.truth.outcome == ResolutionOutcome.DOWN
 
     def test_tie_goes_down(self):
         tracker = self._make_tracker()
-        tracker.capture_open(_make_fresh_chainlink(50000.0))
-        tracker.capture_close(_make_fresh_chainlink(50000.0))  # equal = DOWN
+        tracker.capture_open(_make_fresh_canonical(50000.0))
+        tracker.capture_close(_make_fresh_canonical(50000.0))  # equal = DOWN
         assert tracker.truth.outcome == ResolutionOutcome.DOWN
 
     def test_stale_open_gives_unresolved(self):
         tracker = self._make_tracker()
-        tracker.capture_open(_make_stale_chainlink(50000.0))   # stale!
-        tracker.capture_close(_make_fresh_chainlink(50100.0))
+        tracker.capture_open(_make_stale_canonical(50000.0))   # stale!
+        tracker.capture_close(_make_fresh_canonical(50100.0))
         assert tracker.truth.outcome == ResolutionOutcome.UNRESOLVED
         assert tracker.truth.chainlink_open_ok is False
 
     def test_stale_close_gives_unresolved(self):
         tracker = self._make_tracker()
-        tracker.capture_open(_make_fresh_chainlink(50000.0))
-        tracker.capture_close(_make_stale_chainlink(50100.0))  # stale!
+        tracker.capture_open(_make_fresh_canonical(50000.0))
+        tracker.capture_close(_make_stale_canonical(50100.0))  # stale!
         assert tracker.truth.outcome == ResolutionOutcome.UNRESOLVED
         assert tracker.truth.chainlink_close_ok is False
 
     def test_missing_open_gives_unresolved(self):
         tracker = self._make_tracker()
         tracker.capture_open(None)
-        tracker.capture_close(_make_fresh_chainlink(50100.0))
+        tracker.capture_close(_make_fresh_canonical(50100.0))
         assert tracker.truth.outcome == ResolutionOutcome.UNRESOLVED
         assert tracker.truth.chainlink_open_ok is False
 
     def test_missing_close_gives_unresolved(self):
         tracker = self._make_tracker()
-        tracker.capture_open(_make_fresh_chainlink(50000.0))
+        tracker.capture_open(_make_fresh_canonical(50000.0))
         tracker.capture_close(None)
         assert tracker.truth.outcome == ResolutionOutcome.UNRESOLVED
         assert tracker.truth.chainlink_close_ok is False
 
     def test_open_price_recorded(self):
         tracker = self._make_tracker()
-        tracker.capture_open(_make_fresh_chainlink(50000.0))
+        tracker.capture_open(_make_fresh_canonical(50000.0))
         assert tracker.truth.chainlink_open == pytest.approx(50000.0)
 
     def test_close_price_recorded(self):
         tracker = self._make_tracker()
-        tracker.capture_open(_make_fresh_chainlink(50000.0))
-        tracker.capture_close(_make_fresh_chainlink(50100.0))
+        tracker.capture_open(_make_fresh_canonical(50000.0))
+        tracker.capture_close(_make_fresh_canonical(50100.0))
         assert tracker.truth.chainlink_close == pytest.approx(50100.0)

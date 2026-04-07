@@ -14,7 +14,7 @@ import logging
 import time
 from typing import Optional, TYPE_CHECKING
 
-from loggingx.schemas import WindowTruth, ResolutionOutcome, ChainlinkPrice, FreshnessState
+from loggingx.schemas import WindowTruth, ResolutionOutcome, CanonicalPriceSnapshot, FreshnessState
 from truth.freshness import check_freshness
 
 if TYPE_CHECKING:
@@ -63,57 +63,60 @@ class ResolutionTruthTracker:
         )
         self._chainlink_max_age_secs = chainlink_max_age_secs
 
-    def capture_open(self, chainlink: Optional[ChainlinkPrice]) -> None:
+    def capture_open(self, canonical: Optional[CanonicalPriceSnapshot]) -> None:
         """
-        Called at window open time. Record Chainlink price if fresh.
-        If chainlink is None or stale, marks open as failed.
+        Called at window open time. Record canonical price if fresh.
+        If canonical is None or stale, marks open as failed.
+        Accepts whichever source the selector chose — not source-specific.
         """
-        if chainlink is None:
+        if canonical is None:
             self.truth.chainlink_open_ok = False
-            self.truth.open_capture_error = "chainlink_missing_at_open"
-            logger.warning("[%s] Open capture failed: Chainlink missing", self.truth.condition_id)
+            self.truth.open_capture_error = "canonical_price_missing_at_open"
+            logger.warning("[%s] Open capture failed: canonical price missing", self.truth.condition_id)
             return
 
-        if chainlink.freshness != FreshnessState.FRESH:
+        if canonical.freshness != FreshnessState.FRESH:
             self.truth.chainlink_open_ok = False
-            self.truth.open_capture_error = f"chainlink_{chainlink.freshness.lower()}_at_open"
+            self.truth.open_capture_error = f"canonical_{canonical.freshness.lower()}_at_open"
             logger.warning(
-                "[%s] Open capture failed: Chainlink %s (age=%.1fs)",
+                "[%s] Open capture failed: canonical price %s source=%s (age=%.1fs)",
                 self.truth.condition_id,
-                chainlink.freshness,
-                chainlink.age_secs(),
+                canonical.freshness,
+                canonical.source_tag,
+                canonical.age_secs(),
             )
             return
 
-        self.truth.chainlink_open = chainlink.price_usd
-        self.truth.chainlink_open_at = chainlink.fetched_at
+        self.truth.chainlink_open    = canonical.price_usd
+        self.truth.chainlink_open_at = canonical.fetched_at
         self.truth.chainlink_open_ok = True
         logger.info(
-            "[%s] Open captured: Chainlink BTC/USD = %.2f at ts=%.3f",
+            "[%s] Open captured: BTC/USD=%.2f source=%s ts=%.3f",
             self.truth.condition_id,
-            chainlink.price_usd,
-            chainlink.fetched_at,
+            canonical.price_usd,
+            canonical.source_tag,
+            canonical.fetched_at,
         )
 
-    def capture_close(self, chainlink: Optional[ChainlinkPrice]) -> None:
+    def capture_close(self, canonical: Optional[CanonicalPriceSnapshot]) -> None:
         """
-        Called at window close time. Record Chainlink price if fresh.
+        Called at window close time. Record canonical price if fresh.
         Then compute outcome.
         """
-        if chainlink is None:
+        if canonical is None:
             self.truth.chainlink_close_ok = False
-            self.truth.close_capture_error = "chainlink_missing_at_close"
-            self._set_unresolved("chainlink_missing_at_close")
+            self.truth.close_capture_error = "canonical_price_missing_at_close"
+            self._set_unresolved("canonical_price_missing_at_close")
             return
 
-        if chainlink.freshness != FreshnessState.FRESH:
+        if canonical.freshness != FreshnessState.FRESH:
             self.truth.chainlink_close_ok = False
-            self.truth.close_capture_error = f"chainlink_{chainlink.freshness.lower()}_at_close"
+            self.truth.close_capture_error = f"canonical_{canonical.freshness.lower()}_at_close"
             self._set_unresolved(self.truth.close_capture_error)
             return
 
-        self.truth.chainlink_close = chainlink.price_usd
-        self.truth.chainlink_close_at = chainlink.fetched_at
+        self.truth.chainlink_close    = canonical.price_usd
+        self.truth.chainlink_close_at = canonical.fetched_at
         self.truth.chainlink_close_ok = True
 
         self._compute_outcome()

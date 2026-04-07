@@ -30,7 +30,7 @@ import time
 from typing import Optional, TYPE_CHECKING
 
 from loggingx.schemas import (
-    FeatureVector, FreshnessState, ChainlinkPrice, BinancePrice,
+    FeatureVector, FreshnessState, CanonicalPriceSnapshot, BinancePrice,
     OrderBookSnapshot, MarketMetadata, WindowTruth,
 )
 
@@ -64,7 +64,7 @@ class FeatureBuilder:
         down_token_id: str,
         window_start_ts: float,
         window_end_ts: float,
-        chainlink: Optional[ChainlinkPrice],
+        canonical: Optional[CanonicalPriceSnapshot],
         chainlink_open: Optional[float],
         binance: Optional[BinancePrice],
         up_book: Optional[OrderBookSnapshot],
@@ -85,13 +85,19 @@ class FeatureBuilder:
         # Timing
         fv.secs_to_expiry = max(0.0, window_end_ts - now)
 
-        # ── Chainlink (canonical) ─────────────────────────────────
-        if chainlink is not None:
-            fv.chainlink_now = chainlink.price_usd
-            fv.chainlink_freshness = chainlink.freshness
+        # ── Canonical price (from source selector) ────────────────
+        # chainlink_now / chainlink_freshness hold the canonical price value.
+        # canonical_source_tag records which physical source provided it.
+        if canonical is not None:
+            fv.chainlink_now           = canonical.price_usd
+            fv.chainlink_freshness     = canonical.freshness
+            fv.canonical_source_tag    = canonical.source_tag
+            fv.canonical_fallback_active = canonical.fallback_active
         else:
-            fv.chainlink_now = None
-            fv.chainlink_freshness = FreshnessState.MISSING
+            fv.chainlink_now           = None
+            fv.chainlink_freshness     = FreshnessState.MISSING
+            fv.canonical_source_tag    = None
+            fv.canonical_fallback_active = None
 
         fv.chainlink_open = chainlink_open
 
