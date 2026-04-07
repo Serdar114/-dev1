@@ -159,11 +159,11 @@ class TestResolutionTruthTracker:
         tracker.capture_close(_make_fresh_chainlink(49900.0))  # lower = DOWN
         assert tracker.truth.outcome == ResolutionOutcome.DOWN
 
-    def test_tie_goes_down(self):
+    def test_tie_goes_up(self):
         tracker = self._make_tracker()
         tracker.capture_open(_make_fresh_chainlink(50000.0))
-        tracker.capture_close(_make_fresh_chainlink(50000.0))  # equal = DOWN
-        assert tracker.truth.outcome == ResolutionOutcome.DOWN
+        tracker.capture_close(_make_fresh_chainlink(50000.0))  # equal = UP (>= rule)
+        assert tracker.truth.outcome == ResolutionOutcome.UP
 
     def test_stale_open_gives_unresolved(self):
         tracker = self._make_tracker()

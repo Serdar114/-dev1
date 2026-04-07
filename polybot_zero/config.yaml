@@ -9,70 +9,67 @@ discovery:
   # Window duration range to qualify as "5m" market
   min_window_secs: 240
   max_window_secs: 360
-  # How often to re-scan for new markets
+  # How often to re-scan for new markets (seconds)
   poll_interval_secs: 60
 
 feeds:
-  chainlink:
-    # Polygon Mainnet RPC — replace with your own for reliability
-    polygon_rpc_url: "https://polygon-rpc.com"
-    # BTC/USD Chainlink aggregator on Polygon Mainnet
-    btcusd_aggregator: "0xc907E116054Ad103354f2D350FD2514433D57F6f"
-    # How often to poll chain (seconds)
-    poll_interval_secs: 10
-    # If no fresh update within this window, declare stale
-    staleness_threshold_secs: 45
+  # RTDS — Polymarket Real-Time Data Service
+  # Provides BOTH Chainlink canonical prices AND Binance auxiliary on one WebSocket.
+  # No Polygon RPC. No separate Binance WebSocket.
+  rtds:
+    url: "wss://ws-live-data.polymarket.com"
+    # Chainlink topic = canonical settlement truth
+    chainlink_topic: "crypto_prices_chainlink"
+    chainlink_symbol: "btc/usd"
+    # Binance topic = auxiliary signal only (NOT settlement truth)
+    binance_topic: "crypto_prices"
+    binance_symbol: "btcusdt"
+    # Freshness thresholds (seconds)
+    chainlink_staleness_secs: 30
+    # Gap threshold: RTDS has documented ~8s intermittent gaps (GitHub issue #31)
+    # If silent for longer than this, gap_flag=True
+    chainlink_gap_threshold_secs: 15
+    binance_staleness_secs: 20
+    # WebSocket reconnect / keepalive
+    reconnect_delay_secs: 3
+    ping_interval_secs: 5
 
-  binance:
-    ws_url: "wss://stream.binance.com:9443/ws/btcusdt@bookTicker"
-    staleness_threshold_secs: 20
-    reconnect_delay_secs: 5
-
-  polymarket_ws:
+  # CLOB WebSocket — order books only (separate service from RTDS)
+  clob_ws:
     url: "wss://ws-subscriptions-clob.polymarket.com/ws/"
-    staleness_threshold_secs: 30
     reconnect_delay_secs: 5
 
 metadata:
   clob_api_url: "https://clob.polymarket.com"
-  # If true: fee_rate must come from API. If missing, no-trade.
-  require_fee_from_api: true
+  # Fee rate endpoint — fetched per token_id, NOT from market object
+  fee_rate_endpoint: "https://clob.polymarket.com/fee-rate"
+  # If true: fee_rate_bps must be confirmed from /fee-rate endpoint; else no-trade
+  require_confirmed_fee: true
 
 truth:
   # Chainlink capture must be within this many seconds of window boundary
-  open_capture_tolerance_secs: 8
-  close_capture_tolerance_secs: 8
-
-book:
-  # Max acceptable spread on a $0-$1 outcome token
-  max_spread: 0.10
-  # pair_sum = up_best_ask + down_best_ask; expected ~1.0 + fee overhead
-  pair_sum_min: 0.90
-  pair_sum_max: 1.20
-  # Minimum number of levels on each side before orderbook is valid
-  min_bid_levels: 1
-  min_ask_levels: 1
+  open_capture_tolerance_secs: 10
+  close_capture_tolerance_secs: 10
 
 no_trade:
-  # Chainlink must be fresher than this
-  chainlink_max_staleness_secs: 45
-  # Binance must be fresher than this (it's auxiliary, but stale = reduced signal)
-  binance_max_staleness_secs: 20
+  # Chainlink must be fresher than this (seconds)
+  chainlink_max_staleness_secs: 30
   # Must have at least this many seconds left in window to consider entry
   min_secs_to_expiry: 30
-  # Spread / pair_sum limits (from book section above, re-stated for clarity)
+  # Max acceptable spread on a $0-$1 outcome token
   max_spread: 0.10
+  # pair_sum = up_best_ask + down_best_ask; structural check only
   pair_sum_min: 0.90
   pair_sum_max: 1.20
 
 paper:
   # Maximum simultaneous open hypothetical positions (phase 2 only)
   max_open_positions: 1
-  # Maximum USDC stake per trade (phase 2 only)
+  # Maximum USDC stake per trade
   max_stake_usdc: 5.0
   # Minimum observations in a bucket before it is considered for paper mode
   min_bucket_observations: 20
-  # Minimum win rate in a bucket to qualify (after fees)
+  # Minimum net edge in a bucket to qualify (after fees)
   min_bucket_net_edge: 0.02
 
 analytics:
@@ -82,5 +79,10 @@ analytics:
 logging:
   log_dir: "logs"
   events_file: "events.jsonl"
-  summary_file: "summary.jsonl"
+  discovery_dump_file: "discovery_dump.jsonl"
   level: "DEBUG"
+
+# Debug mode — set true to dump raw market JSON on first discovery poll
+debug:
+  market_inspector: false
+  market_inspector_max: 20

@@ -13,9 +13,17 @@ Design:
     - active (market must be active)
     - closed (market must not be closed)
 
-  Fee fields (from API, not hardcoded):
-    - feeRate or equivalent — None if not found in response
-    - feesEnabled — None if not found
+  Fee fields:
+    Fee rate MUST come from the /fee-rate endpoint per token_id, NOT from the
+    market object (market object feeRate/makerBaseFee fields are NOT the correct
+    fee rate for fee curve computation).
+
+    Endpoint: GET https://clob.polymarket.com/fee-rate?token_id={token_id}
+    Response: {"feeRateBps": <int>}
+
+    We fetch for both up_token_id and down_token_id separately.
+    If feeRateBps differs between tokens, we log a warning and use the higher.
+    If fetch fails for either token, fee provenance = UNRESOLVED → no-trade.
 """
 
 from __future__ import annotations
@@ -31,11 +39,9 @@ except ImportError:
     AIOHTTP_AVAILABLE = False
 
 from loggingx.schemas import MarketMetadata
-from metadata.fee_schedule import FeeSchedule
+from metadata.fee_schedule import FeeSchedule, FeeProvenance
 
 logger = logging.getLogger("polybot.market_metadata")
-
-CLOB_MARKET_URL = "https://clob.polymarket.com/markets/{condition_id}"
 
 
 class MetadataFetcher:
@@ -43,20 +49,30 @@ class MetadataFetcher:
     Fetches market metadata from Polymarket CLOB REST API.
 
     Job: retrieve and normalize metadata for a given condition_id.
-    Input: condition_id (str)
+    Input: condition_id (str), up_token_id (str), down_token_id (str)
     Output: MarketMetadata dataclass
     Failure:
       - HTTP error → MarketMetadata with fetch_error set, all fields None
       - Missing field → field stays None (explicit, not defaulted)
-      - fee_rate missing → fee_rate=None, fee_source=None
+      - fee_rate_bps missing → provenance=UNRESOLVED
     """
 
-    def __init__(self, clob_api_url: str = "https://clob.polymarket.com"):
+    def __init__(
+        self,
+        clob_api_url: str = "https://clob.polymarket.com",
+        fee_rate_endpoint: str = "https://clob.polymarket.com/fee-rate",
+    ):
         self._base = clob_api_url.rstrip("/")
+        self._fee_rate_endpoint = fee_rate_endpoint.rstrip("/")
 
-    async def fetch(self, condition_id: str) -> MarketMetadata:
+    async def fetch(
+        self,
+        condition_id: str,
+        up_token_id: Optional[str] = None,
+        down_token_id: Optional[str] = None,
+    ) -> MarketMetadata:
         """
-        Fetch metadata for one market.
+        Fetch metadata for one market including per-token fee rates.
         Returns MarketMetadata with fetch_error set on any failure.
         Never raises — errors are explicit in the returned object.
         """
@@ -70,6 +86,7 @@ class MetadataFetcher:
         url = f"{self._base}/markets/{condition_id}"
         try:
             async with aiohttp.ClientSession() as session:
+                # Fetch market object
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     if resp.status != 200:
                         meta.fetch_error = f"http_{resp.status}"
@@ -77,7 +94,10 @@ class MetadataFetcher:
                         return meta
 
                     data: Dict[str, Any] = await resp.json()
-                    return self._parse(meta, data)
+                    meta = self._parse_market(meta, data)
+
+                # Fetch fee rates per token_id
+                await self._fetch_fee_rates(session, meta, up_token_id, down_token_id)
 
         except asyncio.TimeoutError:
             meta.fetch_error = "timeout"
@@ -88,18 +108,17 @@ class MetadataFetcher:
 
         return meta
 
-    def _parse(self, meta: MarketMetadata, data: Dict[str, Any]) -> MarketMetadata:
+    def _parse_market(self, meta: MarketMetadata, data: Dict[str, Any]) -> MarketMetadata:
         """
-        Parse raw API response into MarketMetadata.
-        Every field is Optional. Missing → None, logged.
+        Parse raw market API response into MarketMetadata.
+        Does NOT parse fee rate here — that comes from /fee-rate endpoint.
         """
         meta.fetched_at = time.time()
 
-        # Market status
         meta.active = data.get("active")
         meta.closed = data.get("closed")
 
-        # Tick size — critical for order placement
+        # Tick size
         tick_raw = data.get("minimum_tick_size") or data.get("tickSize")
         if tick_raw is not None:
             try:
@@ -109,7 +128,7 @@ class MetadataFetcher:
         else:
             logger.warning("[%s] tick_size missing from API response", meta.condition_id)
 
-        # Min order size — critical for order placement
+        # Min order size
         min_order_raw = data.get("minimum_order_size") or data.get("minOrderSize")
         if min_order_raw is not None:
             try:
@@ -119,46 +138,116 @@ class MetadataFetcher:
         else:
             logger.warning("[%s] min_order_size missing from API response", meta.condition_id)
 
-        # Fee fields — must come from API, never hardcoded
-        # Polymarket may expose this as "feeRate", "fee_rate", or not at all
-        fee_rate_raw = (
-            data.get("feeRate")
-            or data.get("fee_rate")
-            or data.get("makerBaseFee")   # alternative key observed in some APIs
-        )
+        # feesEnabled flag from market object (informational only)
         fees_enabled_raw = data.get("feesEnabled") or data.get("fees_enabled")
-
-        if fee_rate_raw is not None:
-            try:
-                meta.fee_rate = float(fee_rate_raw)
-                meta.fee_source = f"api:clob/markets/{meta.condition_id}"
-                meta.fees_enabled = bool(fees_enabled_raw) if fees_enabled_raw is not None else None
-            except (ValueError, TypeError):
-                logger.warning("[%s] fee_rate parse error: %r", meta.condition_id, fee_rate_raw)
-                meta.fee_rate = None
-                meta.fee_source = None
-        else:
-            # Fee rate not found in response
-            meta.fee_rate = None
-            meta.fee_source = None
-            meta.fees_enabled = None
-            logger.warning(
-                "[%s] fee_rate NOT found in API response — "
-                "fee_source=None, no-trade will be required if require_fee_from_api=true",
-                meta.condition_id,
-            )
+        if fees_enabled_raw is not None:
+            meta.fees_enabled = bool(fees_enabled_raw)
 
         return meta
 
-    def build_fee_schedule(self, meta: MarketMetadata) -> FeeSchedule:
-        """Build a FeeSchedule from fetched metadata."""
-        return FeeSchedule(
-            fee_rate=meta.fee_rate,
-            fee_source=meta.fee_source,
-            fees_enabled=meta.fees_enabled,
+    async def _fetch_fee_rates(
+        self,
+        session,
+        meta: MarketMetadata,
+        up_token_id: Optional[str],
+        down_token_id: Optional[str],
+    ) -> None:
+        """
+        Fetch feeRateBps from /fee-rate?token_id for each token.
+        Sets meta.fee_rate_bps and meta.fee_source.
+        If tokens are None (not provided), fee provenance stays UNRESOLVED.
+        """
+        if up_token_id is None and down_token_id is None:
+            logger.warning(
+                "[%s] No token IDs provided — cannot fetch fee rates",
+                meta.condition_id,
+            )
+            meta.fee_rate = None
+            meta.fee_source = None
+            return
+
+        up_bps = await self._fetch_one_fee_rate(session, up_token_id) if up_token_id else None
+        down_bps = await self._fetch_one_fee_rate(session, down_token_id) if down_token_id else None
+
+        if up_bps is None and down_bps is None:
+            logger.warning(
+                "[%s] fee-rate fetch failed for both tokens — UNRESOLVED",
+                meta.condition_id,
+            )
+            meta.fee_rate = None
+            meta.fee_source = None
+            return
+
+        # Warn on mismatch; use the higher for conservative fee estimation
+        if up_bps is not None and down_bps is not None and up_bps != down_bps:
+            logger.warning(
+                "[%s] Fee rate mismatch: up_bps=%d down_bps=%d — using higher",
+                meta.condition_id, up_bps, down_bps,
+            )
+            bps = max(up_bps, down_bps)
+        else:
+            bps = up_bps if up_bps is not None else down_bps
+
+        meta.fee_rate = bps / 10000.0
+        meta.fee_source = f"fee_rate_endpoint:token"
+        logger.info(
+            "[%s] fee_rate_bps=%d (%.4f) from /fee-rate endpoint",
+            meta.condition_id, bps, meta.fee_rate,
         )
 
-    def is_metadata_complete(self, meta: MarketMetadata, require_fee: bool = True) -> tuple[bool, list]:
+    async def _fetch_one_fee_rate(self, session, token_id: str) -> Optional[int]:
+        """
+        GET /fee-rate?token_id={token_id} → {"feeRateBps": <int>}
+        Returns integer bps or None on failure.
+        """
+        try:
+            async with session.get(
+                self._fee_rate_endpoint,
+                params={"token_id": token_id},
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning(
+                        "fee-rate endpoint HTTP %d for token_id=%s",
+                        resp.status, token_id,
+                    )
+                    return None
+                data = await resp.json()
+                raw_bps = data.get("feeRateBps")
+                if raw_bps is None:
+                    logger.warning(
+                        "feeRateBps missing in /fee-rate response for token_id=%s: %r",
+                        token_id, data,
+                    )
+                    return None
+                return int(raw_bps)
+        except asyncio.TimeoutError:
+            logger.warning("fee-rate fetch timeout for token_id=%s", token_id)
+            return None
+        except Exception as exc:
+            logger.warning("fee-rate fetch error for token_id=%s: %s", token_id, exc)
+            return None
+
+    def build_fee_schedule(
+        self,
+        meta: MarketMetadata,
+        token_id: Optional[str] = None,
+    ) -> FeeSchedule:
+        """Build a FeeSchedule from fetched metadata."""
+        if meta.fee_rate is None:
+            return FeeSchedule(
+                fee_rate_bps=None,
+                provenance=FeeProvenance.UNRESOLVED,
+                token_id=token_id,
+            )
+        bps = int(round(meta.fee_rate * 10000))
+        return FeeSchedule.from_bps(fee_rate_bps=bps, token_id=token_id)
+
+    def is_metadata_complete(
+        self,
+        meta: MarketMetadata,
+        require_fee: bool = True,
+    ) -> tuple[bool, list]:
         """
         Check if metadata has all required fields.
         Returns (is_complete: bool, missing_fields: list[str])

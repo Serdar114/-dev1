@@ -4,23 +4,27 @@ runner.py — Main asyncio orchestration loop.
 Design:
   Orchestrates all layers in the correct build order.
   Phase 1: discovery
-  Phase 2: metadata
-  Phase 3: feeds (chainlink, binance, market ws)
-  Phase 4: window truth tracking
-  Phase 5: measurement-only mode
+  Phase 2: metadata (market object + /fee-rate per token)
+  Phase 3: feeds (RTDS for Chainlink + Binance, CLOB WS for order books)
+  Phase 4: window truth tracking (ChainlinkState wrapper)
+  Phase 5: measurement-only mode (feature build + no-trade eval + hypotheticals)
   Phase 6: bucket analysis (in-memory, continuous)
   Phase 7: selective paper (only if mode=selective_paper and proven buckets exist)
 
-  The main tick loop runs every tick_interval_secs.
+  Canonical price source: RTDSClient.chainlink_latest() via ChainlinkState.
+  Binance auxiliary: RTDSClient.binance_latest() — same connection, different topic.
+  Order books: CLOBWSClient (separate service, different WebSocket endpoint).
+
+  The main tick loop runs every 1 second.
   For each live market, per tick:
     - Build FeatureVector from live state
     - Evaluate no-trade rules
-    - Record hypothetical entries (both UP and DOWN)
+    - Record hypothetical entries (both UP and DOWN) regardless of no-trade
     - If paper mode AND proven bucket AND rules pass: open paper trade
     - Log all events
 
   Resolution handling:
-    - At window close, capture Chainlink close price
+    - At window close, capture Chainlink close price via ChainlinkState
     - Compute outcome
     - Resolve all hypothetical entries for that window
     - Close all paper positions for that window
@@ -45,9 +49,9 @@ from app.modes import validate_mode, is_paper_active, MEASUREMENT_ONLY
 from discovery.market_discovery import MarketDiscovery
 from discovery.market_registry import MarketRegistry
 from metadata.market_metadata import MetadataFetcher
-from feeds.rtds_client import ChainlinkRTDSClient
-from feeds.binance_aux import BinanceAuxClient
-from feeds.market_ws_client import MarketWSClient
+from feeds.rtds_client import RTDSClient
+from feeds.clob_ws_client import CLOBWSClient
+from truth.chainlink_state import ChainlinkState
 from truth.window_clock import WindowClock
 from truth.resolution_truth import ResolutionTruthTracker
 from truth.freshness import check_freshness
@@ -103,26 +107,36 @@ class Runner:
         meta_cfg = config.get("metadata", {})
         self._meta_fetcher = MetadataFetcher(
             clob_api_url=meta_cfg.get("clob_api_url", "https://clob.polymarket.com"),
+            fee_rate_endpoint=meta_cfg.get("fee_rate_endpoint", "https://clob.polymarket.com/fee-rate"),
         )
-        self._require_fee = meta_cfg.get("require_fee_from_api", True)
+        self._require_fee = meta_cfg.get("require_confirmed_fee", True)
 
-        # Feeds
+        # RTDS feed (Chainlink canonical + Binance auxiliary on same WS)
         feeds_cfg = config.get("feeds", {})
-        cl_cfg = feeds_cfg.get("chainlink", {})
-        self._chainlink = ChainlinkRTDSClient(
-            polygon_rpc_url=cl_cfg.get("polygon_rpc_url", "https://polygon-rpc.com"),
-            poll_interval_secs=cl_cfg.get("poll_interval_secs", 10),
-            staleness_threshold_secs=cl_cfg.get("staleness_threshold_secs", 45),
+        rtds_cfg = feeds_cfg.get("rtds", {})
+        self._rtds = RTDSClient(
+            ws_url=rtds_cfg.get("url", "wss://ws-live-data.polymarket.com"),
+            chainlink_topic=rtds_cfg.get("chainlink_topic", "crypto_prices_chainlink"),
+            chainlink_symbol=rtds_cfg.get("chainlink_symbol", "btc/usd"),
+            binance_topic=rtds_cfg.get("binance_topic", "crypto_prices"),
+            binance_symbol=rtds_cfg.get("binance_symbol", "btcusdt"),
+            chainlink_staleness_secs=rtds_cfg.get("chainlink_staleness_secs", 30),
+            binance_staleness_secs=rtds_cfg.get("binance_staleness_secs", 20),
+            reconnect_delay_secs=rtds_cfg.get("reconnect_delay_secs", 3),
+            ping_interval_secs=rtds_cfg.get("ping_interval_secs", 5),
         )
-        bn_cfg = feeds_cfg.get("binance", {})
-        self._binance = BinanceAuxClient(
-            ws_url=bn_cfg.get("ws_url", "wss://stream.binance.com:9443/ws/btcusdt@bookTicker"),
-            staleness_threshold_secs=bn_cfg.get("staleness_threshold_secs", 20),
-            reconnect_delay_secs=bn_cfg.get("reconnect_delay_secs", 5),
+
+        # ChainlinkState wrapper with gap detection
+        self._chainlink_state = ChainlinkState(
+            rtds_client=self._rtds,
+            gap_threshold_secs=rtds_cfg.get("chainlink_gap_threshold_secs", 15),
         )
-        pm_cfg = feeds_cfg.get("polymarket_ws", {})
-        self._market_ws = MarketWSClient(
-            ws_url=pm_cfg.get("url", "wss://ws-subscriptions-clob.polymarket.com/ws/"),
+
+        # CLOB WebSocket (order books only — separate service)
+        clob_ws_cfg = feeds_cfg.get("clob_ws", {})
+        self._clob_ws = CLOBWSClient(
+            ws_url=clob_ws_cfg.get("url", "wss://ws-subscriptions-clob.polymarket.com/ws/"),
+            reconnect_delay_secs=clob_ws_cfg.get("reconnect_delay_secs", 5),
             on_book_update=self._on_book_update,
         )
 
@@ -130,15 +144,15 @@ class Runner:
         self._book_states: Dict[str, OrderBookState] = {}
 
         # Per-market window trackers
-        self._window_clocks:   Dict[str, WindowClock] = {}
-        self._truth_trackers:  Dict[str, ResolutionTruthTracker] = {}
+        self._window_clocks:  Dict[str, WindowClock] = {}
+        self._truth_trackers: Dict[str, ResolutionTruthTracker] = {}
 
         # Feature builder
         self._feat_builder = FeatureBuilder()
 
         # No-trade config
         nt_cfg = config.get("no_trade", {})
-        self._nt_max_staleness = nt_cfg.get("chainlink_max_staleness_secs", 45)
+        self._nt_max_staleness = nt_cfg.get("chainlink_max_staleness_secs", 30)
         self._nt_min_secs      = nt_cfg.get("min_secs_to_expiry", 30)
         self._nt_max_spread    = nt_cfg.get("max_spread", 0.10)
         self._nt_sum_min       = nt_cfg.get("pair_sum_min", 0.90)
@@ -174,19 +188,17 @@ class Runner:
         self._n_chainlink_stale       = 0
 
         # Per-window hypothetical tracking
-        self._window_hypotheticals: Dict[str, list] = {}  # condition_id → [up_entry, down_entry]
+        self._window_hypotheticals: Dict[str, list] = {}
 
     async def run(self) -> None:
         self._elog.log_system_start(self.config)
         logger.info("Runner starting — mode=%s", self.mode)
 
-        # Start background feed tasks
         tasks = [
-            asyncio.create_task(self._chainlink.start(), name="chainlink"),
-            asyncio.create_task(self._binance.start(), name="binance"),
-            asyncio.create_task(self._market_ws.start(), name="market_ws"),
-            asyncio.create_task(self._discovery_loop(), name="discovery"),
-            asyncio.create_task(self._main_tick_loop(), name="tick"),
+            asyncio.create_task(self._rtds.start(),      name="rtds"),
+            asyncio.create_task(self._clob_ws.start(),   name="clob_ws"),
+            asyncio.create_task(self._discovery_loop(),  name="discovery"),
+            asyncio.create_task(self._main_tick_loop(),  name="tick"),
         ]
 
         try:
@@ -201,9 +213,8 @@ class Runner:
             await self._shutdown()
 
     async def _shutdown(self) -> None:
-        await self._chainlink.stop()
-        await self._binance.stop()
-        await self._market_ws.stop()
+        await self._rtds.stop()
+        await self._clob_ws.stop()
         self._print_final_verdict()
         self._elog.close()
         logger.info("Runner stopped")
@@ -227,13 +238,11 @@ class Runner:
                             window_start_ts=identity.window_start_ts,
                             window_end_ts=identity.window_end_ts,
                         )
-                        # Fetch metadata for new market
-                        await self._fetch_metadata(identity.condition_id)
+                        await self._fetch_metadata(identity)
 
-                # Subscribe to any newly discovered token IDs
                 active_ids = self._registry.active_token_ids()
                 if active_ids:
-                    await self._market_ws.subscribe(active_ids)
+                    await self._clob_ws.subscribe(active_ids)
 
             except Exception as exc:
                 logger.error("Discovery loop error: %s", exc)
@@ -241,21 +250,26 @@ class Runner:
 
             await asyncio.sleep(interval)
 
-    async def _fetch_metadata(self, condition_id: str) -> None:
-        """Fetch and store metadata for one market."""
-        meta = await self._meta_fetcher.fetch(condition_id)
-        self._registry.set_metadata(condition_id, meta)
+    async def _fetch_metadata(self, identity) -> None:
+        """Fetch and store metadata for one market, including per-token fee rates."""
+        meta = await self._meta_fetcher.fetch(
+            condition_id=identity.condition_id,
+            up_token_id=identity.up_token_id,
+            down_token_id=identity.down_token_id,
+        )
+        self._registry.set_metadata(identity.condition_id, meta)
 
         if meta.fetch_error:
             self._elog.log("METADATA_FAILED", {
-                "condition_id": condition_id,
+                "condition_id": identity.condition_id,
                 "error": meta.fetch_error,
             })
         else:
             self._elog.log("METADATA_FETCHED", {
-                "condition_id":   condition_id,
+                "condition_id":   identity.condition_id,
                 "fee_rate":       meta.fee_rate,
                 "fee_source":     meta.fee_source,
+                "fees_enabled":   meta.fees_enabled,
                 "tick_size":      meta.tick_size,
                 "min_order_size": meta.min_order_size,
                 "active":         meta.active,
@@ -263,9 +277,7 @@ class Runner:
 
     async def _main_tick_loop(self) -> None:
         """Main per-market tick loop. Runs every second."""
-        tick_interval = 1.0  # 1 second ticks
-
-        # Wait briefly for feeds to connect
+        # Wait briefly for feeds to connect and subscribe
         await asyncio.sleep(5)
 
         while True:
@@ -274,21 +286,22 @@ class Runner:
             except Exception as exc:
                 logger.error("Tick loop error: %s", exc)
                 self._elog.log_error("tick_loop", str(exc))
-            await asyncio.sleep(tick_interval)
+            await asyncio.sleep(1.0)
 
     async def _tick(self) -> None:
         """Process one tick for all tracked markets."""
-        now = time.time()
-        chainlink = self._chainlink.latest()
-        binance   = self._binance.latest()
+        chainlink = self._chainlink_state.latest()
+        binance   = self._rtds.binance_latest()
 
-        # Log Chainlink state
+        # Log Chainlink gap/stale events
         if chainlink is None or chainlink.freshness != FreshnessState.FRESH:
             self._n_chainlink_stale += 1
             self._elog.log_chainlink_stale(
                 last_updated_at=chainlink.updated_at if chainlink else None,
                 age_secs=chainlink.age_secs() if chainlink else None,
             )
+        elif self._chainlink_state.gap_flag:
+            logger.debug("Chainlink gap_flag=True (silent > threshold)")
 
         for entry in self._registry.all_markets():
             cid = entry.condition_id
@@ -333,8 +346,7 @@ class Runner:
                     chainlink_ok=tracker.truth.chainlink_open_ok,
                     error=tracker.truth.open_capture_error,
                 )
-                # Subscribe to book for this market
-                await self._market_ws.subscribe({identity.up_token_id, identity.down_token_id})
+                await self._clob_ws.subscribe({identity.up_token_id, identity.down_token_id})
 
             if clock.should_fire_close():
                 tracker.capture_close(chainlink)
@@ -356,10 +368,8 @@ class Runner:
                     chainlink_close=tracker.truth.chainlink_close,
                 )
 
-                # Resolve all hypotheticals for this window
                 self._resolve_window(cid, outcome)
 
-                # Close paper positions
                 if is_paper_active(self.mode):
                     closed = self._paper_exec.close_all_for_market(cid, outcome)
                     for t in closed:
@@ -382,8 +392,8 @@ class Runner:
                 self._registry.mark_expiring(cid)
 
             # Build features
-            up_book   = self._market_ws.get_book(identity.up_token_id)
-            down_book = self._market_ws.get_book(identity.down_token_id)
+            up_book   = self._clob_ws.get_book(identity.up_token_id)
+            down_book = self._clob_ws.get_book(identity.down_token_id)
 
             fv = self._feat_builder.build(
                 condition_id=cid,
@@ -419,12 +429,10 @@ class Runner:
                     details={k: v for k, v in (details or {}).items() if k != "_canonical"},
                 )
                 self._elog.log_no_trade(no_trade_evt)
-                # Still compute hypothetical for measurement
                 up_entry, down_entry = self._hyp_engine.compute(fv, no_trade_reason=reason_code)
             else:
                 up_entry, down_entry = self._hyp_engine.compute(fv, no_trade_reason=None)
 
-            # Store hypotheticals for resolution
             self._window_hypotheticals[cid] = [up_entry, down_entry]
             self._n_hypothetical_entries += 2
 
@@ -439,7 +447,6 @@ class Runner:
                 )
                 bucket_id = assign_bucket(fv)
                 if bucket_id in proven:
-                    # Pick side from bucket history (simplified: pick most correct side)
                     side = self._pick_paper_side(bucket_id, fv)
                     if side and not self._paper_exec.has_open_position_for(cid):
                         trade = self._paper_exec.open_trade(fv, side, bucket_id, proven)
@@ -447,30 +454,20 @@ class Runner:
                             self._elog.log_paper_trade_open(asdict(trade))
 
     def _resolve_window(self, condition_id: str, outcome: str) -> None:
-        """Resolve all hypothetical entries for a window."""
         hyps = self._window_hypotheticals.pop(condition_id, [])
         for entry in hyps:
             resolved = self._hyp_engine.resolve(entry, outcome)
             self._bucket_acc.record(resolved)
 
     def _pick_paper_side(self, bucket_id: str, fv) -> Optional[str]:
-        """
-        Pick paper trade side based on bucket history.
-        Simple heuristic: pick side with more correct hypotheticals in this bucket.
-        Returns None if ambiguous.
-        """
-        # This is intentionally simple — not alpha storytelling
-        # Proper side selection requires deeper analysis (send to ChatGPT)
-        return None  # Conservative default: do not pick side without explicit evidence
+        return None  # Conservative default; requires proven bucket analysis
 
     async def _on_book_update(self, token_id: str, book) -> None:
-        """Callback from MarketWSClient on book update."""
         if token_id not in self._book_states:
             self._book_states[token_id] = OrderBookState(token_id=token_id)
         self._book_states[token_id].update(book)
 
     def _print_final_verdict(self) -> None:
-        """Print final measurement summary to logs."""
         all_stats = self._bucket_acc.all_stats(self._min_bucket_edge)
         rows = self._edge_report.generate(all_stats)
         proven = self._bucket_acc.proven_buckets(self._min_bucket_obs, self._min_bucket_edge)

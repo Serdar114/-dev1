@@ -135,11 +135,10 @@ class ResolutionTruthTracker:
             self._set_unresolved("price_fields_none_despite_ok_flags")
             return
 
-        # UP = close > open at resolution time (Chainlink)
-        if self.truth.chainlink_close > self.truth.chainlink_open:
+        # UP = close >= open (ties → UP per Polymarket BTC 5m resolution rule)
+        if self.truth.chainlink_close >= self.truth.chainlink_open:
             self.truth.outcome = ResolutionOutcome.UP
         else:
-            # Ties go DOWN per typical Polymarket BTC 5m structure
             self.truth.outcome = ResolutionOutcome.DOWN
 
         self.truth.outcome_captured_at = time.time()

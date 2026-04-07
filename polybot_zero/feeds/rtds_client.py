@@ -1,224 +1,283 @@
 """
-rtds_client.py — Chainlink BTC/USD canonical price feed via Polygon RPC.
+rtds_client.py — Polymarket RTDS WebSocket client for canonical BTC/USD prices.
 
 Design:
-  This is the CANONICAL settlement truth source. No fallback is permitted.
-  We read directly from the Chainlink BTC/USD aggregator on Polygon Mainnet.
-  This is the same source Polymarket uses for market resolution.
+  Connects to wss://ws-live-data.polymarket.com
+  Subscribes to TWO topics on the same connection:
+    1. crypto_prices_chainlink  → symbol btc/usd   → CANONICAL truth source
+    2. crypto_prices            → symbol btcusdt   → Binance auxiliary only
 
-  Method: polling via JSON-RPC (eth_call to latestRoundData).
-  Why polling not WebSocket: simpler, more reliable, verifiable.
-  Poll interval: configurable (default 10s).
+  RTDS subscription format:
+    {
+      "action": "subscribe",
+      "subscriptions": [
+        {"topic": "<topic>", "type": "*", "filters": "{\"symbol\":\"<sym>\"}"}
+      ]
+    }
 
-  Chainlink BTC/USD on Polygon Mainnet:
-    Contract: 0xc907E116054Ad103354f2D350FD2514433D57F6f
-    Decimals: 8 (divide answer by 1e8 to get USD price)
-    Function: latestRoundData() → (roundId, answer, startedAt, updatedAt, answeredInRound)
+  RTDS message format:
+    {
+      "topic": "<topic>",
+      "type": "<type>",
+      "timestamp": <ms>,
+      "payload": {"symbol": "<sym>", "timestamp_ms": <ms>, "value": <float>}
+    }
 
-  Staleness:
-    If updated_at is older than staleness_threshold_secs, the price is STALE.
-    STALE prices must NOT be used as canonical truth.
-    Missing prices must NOT be used as canonical truth.
+  Gap detection:
+    Chainlink RTDS has documented ~8s intermittent gaps (GitHub issue #31).
+    If last Chainlink update is older than chainlink_gap_threshold_secs, gap_flag=True.
+    Gap at window boundary → outcome UNRESOLVED (handled by resolution_truth.py via
+    freshness check).
 
-  This module holds the latest ChainlinkPrice snapshot.
-  Callers read the snapshot — they are responsible for checking freshness.
+  Staleness vs gap:
+    staleness_secs: threshold for FreshnessState.FRESH/STALE — canonical validity
+    The gap_threshold is handled in chainlink_state.py above this layer.
 """
 
 from __future__ import annotations
 import asyncio
+import json
 import logging
 import time
 from typing import Optional
 
 try:
-    from web3 import Web3
-    from web3.exceptions import ContractLogicError
-    WEB3_AVAILABLE = True
+    import websockets
+    WEBSOCKETS_AVAILABLE = True
 except ImportError:
-    WEB3_AVAILABLE = False
+    WEBSOCKETS_AVAILABLE = False
 
-from loggingx.schemas import ChainlinkPrice, FreshnessState
+from loggingx.schemas import ChainlinkPrice, BinancePrice, FreshnessState
 from truth.freshness import check_freshness
 
 logger = logging.getLogger("polybot.rtds_client")
 
-# Chainlink BTC/USD aggregator on Polygon Mainnet
-BTCUSD_AGGREGATOR = "0xc907E116054Ad103354f2D350FD2514433D57F6f"
-BTCUSD_DECIMALS = 8
-
-# Minimal ABI for latestRoundData
-AGGREGATOR_ABI = [
-    {
-        "inputs": [],
-        "name": "latestRoundData",
-        "outputs": [
-            {"name": "roundId",         "type": "uint80"},
-            {"name": "answer",          "type": "int256"},
-            {"name": "startedAt",       "type": "uint256"},
-            {"name": "updatedAt",       "type": "uint256"},
-            {"name": "answeredInRound", "type": "uint80"},
-        ],
-        "stateMutability": "view",
-        "type": "function",
-    }
-]
+RTDS_URL = "wss://ws-live-data.polymarket.com"
+CHAINLINK_TOPIC  = "crypto_prices_chainlink"
+CHAINLINK_SYMBOL = "btc/usd"
+BINANCE_TOPIC    = "crypto_prices"
+BINANCE_SYMBOL   = "btcusdt"
 
 
-class ChainlinkRTDSClient:
+class RTDSClient:
     """
-    Polls Chainlink BTC/USD on Polygon Mainnet.
+    Polymarket RTDS WebSocket client.
 
-    Job: Maintain the latest fresh ChainlinkPrice snapshot.
-    Input: polygon_rpc_url, poll_interval_secs, staleness_threshold_secs
-    Output: latest_price (ChainlinkPrice | None), freshness state
+    Job: Maintain latest Chainlink and Binance price snapshots from RTDS.
+    Input: config (url, topics, symbols, staleness thresholds)
+    Output: chainlink_latest(), binance_latest()
     Failure:
-      - RPC error: last known price remains, freshness becomes STALE/MISSING
-      - web3 not installed: logs error, all reads return None with MISSING state
+      - Disconnect: reconnect with delay, re-subscribe
+      - Parse error: skip message, log
+      - websockets not installed: log error, all reads return None
     """
 
     def __init__(
         self,
-        polygon_rpc_url: str,
-        poll_interval_secs: float = 10.0,
-        staleness_threshold_secs: float = 45.0,
-        aggregator_address: str = BTCUSD_AGGREGATOR,
+        ws_url: str = RTDS_URL,
+        chainlink_topic: str = CHAINLINK_TOPIC,
+        chainlink_symbol: str = CHAINLINK_SYMBOL,
+        binance_topic: str = BINANCE_TOPIC,
+        binance_symbol: str = BINANCE_SYMBOL,
+        chainlink_staleness_secs: float = 30.0,
+        binance_staleness_secs: float = 20.0,
+        reconnect_delay_secs: float = 3.0,
+        ping_interval_secs: float = 5.0,
     ):
-        self._rpc_url = polygon_rpc_url
-        self._poll_interval = poll_interval_secs
-        self._staleness_threshold = staleness_threshold_secs
-        self._aggregator_address = aggregator_address
+        self._ws_url = ws_url
+        self._chainlink_topic  = chainlink_topic
+        self._chainlink_symbol = chainlink_symbol.lower()
+        self._binance_topic    = binance_topic
+        self._binance_symbol   = binance_symbol.lower()
+        self._chainlink_staleness = chainlink_staleness_secs
+        self._binance_staleness   = binance_staleness_secs
+        self._reconnect_delay = reconnect_delay_secs
+        self._ping_interval   = ping_interval_secs
 
-        self._latest: Optional[ChainlinkPrice] = None
-        self._w3: Optional[Any] = None
-        self._contract: Optional[Any] = None
+        self._chainlink_raw_price: Optional[float] = None
+        self._chainlink_raw_ts: Optional[float] = None    # unix seconds
+
+        self._binance_raw_price: Optional[float] = None
+        self._binance_raw_ts: Optional[float] = None
+
         self._running = False
+        self._ws = None
 
-        if not WEB3_AVAILABLE:
+        if not WEBSOCKETS_AVAILABLE:
             logger.error(
-                "web3 not installed — Chainlink feed UNAVAILABLE. "
-                "Install web3>=6.0 to enable canonical truth source."
+                "websockets not installed — RTDS feed UNAVAILABLE. "
+                "Run: pip install websockets"
             )
-        else:
-            self._init_web3()
-
-    def _init_web3(self) -> None:
-        try:
-            self._w3 = Web3(Web3.HTTPProvider(self._rpc_url))
-            checksum_addr = Web3.to_checksum_address(self._aggregator_address)
-            self._contract = self._w3.eth.contract(
-                address=checksum_addr,
-                abi=AGGREGATOR_ABI,
-            )
-            logger.info(
-                "Chainlink client initialized: RPC=%s aggregator=%s",
-                self._rpc_url, self._aggregator_address,
-            )
-        except Exception as exc:
-            logger.error("Chainlink client init failed: %s", exc)
-            self._w3 = None
-            self._contract = None
 
     async def start(self) -> None:
-        """Start polling loop. Run as asyncio task."""
+        """Start the WebSocket loop. Run as asyncio task."""
+        if not WEBSOCKETS_AVAILABLE:
+            return
         self._running = True
-        logger.info("Chainlink poller started (interval=%.1fs)", self._poll_interval)
+        logger.info("RTDS client starting: %s", self._ws_url)
         while self._running:
-            await self._poll()
-            await asyncio.sleep(self._poll_interval)
+            try:
+                await self._connect_and_listen()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning(
+                    "RTDS disconnected: %s — reconnecting in %.1fs",
+                    exc, self._reconnect_delay,
+                )
+                self._ws = None
+                await asyncio.sleep(self._reconnect_delay)
 
     async def stop(self) -> None:
         self._running = False
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
 
-    async def _poll(self) -> None:
-        """Fetch latest round data from chain. Update self._latest."""
-        if self._contract is None:
+    async def _connect_and_listen(self) -> None:
+        async with websockets.connect(
+            self._ws_url,
+            ping_interval=self._ping_interval,
+            ping_timeout=10,
+        ) as ws:
+            self._ws = ws
+            logger.info("RTDS connected")
+            await self._subscribe(ws)
+            async for raw_msg in ws:
+                if not self._running:
+                    break
+                await self._handle_message(raw_msg)
+
+    async def _subscribe(self, ws) -> None:
+        """Send subscription for both Chainlink and Binance topics."""
+        sub_msg = json.dumps({
+            "action": "subscribe",
+            "subscriptions": [
+                {
+                    "topic": self._chainlink_topic,
+                    "type": "*",
+                    "filters": json.dumps({"symbol": self._chainlink_symbol}),
+                },
+                {
+                    "topic": self._binance_topic,
+                    "type": "*",
+                    "filters": json.dumps({"symbol": self._binance_symbol}),
+                },
+            ],
+        })
+        await ws.send(sub_msg)
+        logger.info(
+            "RTDS subscribed: chainlink=%s/%s binance=%s/%s",
+            self._chainlink_topic, self._chainlink_symbol,
+            self._binance_topic, self._binance_symbol,
+        )
+
+    async def _handle_message(self, raw: str) -> None:
+        try:
+            msg = json.loads(raw)
+            topic = msg.get("topic", "")
+            payload = msg.get("payload", {})
+            symbol = (payload.get("symbol") or "").lower()
+
+            if topic == self._chainlink_topic and symbol == self._chainlink_symbol:
+                self._handle_chainlink(payload)
+            elif topic == self._binance_topic and symbol == self._binance_symbol:
+                self._handle_binance(payload)
+            else:
+                logger.debug("RTDS unhandled: topic=%s symbol=%s", topic, symbol)
+
+        except json.JSONDecodeError as exc:
+            logger.warning("RTDS JSON error: %s | raw=%r", exc, raw[:120])
+        except Exception as exc:
+            logger.warning("RTDS message handler error: %s", exc)
+
+    def _handle_chainlink(self, payload: dict) -> None:
+        value = payload.get("value")
+        ts_ms = payload.get("timestamp_ms") or payload.get("timestamp")
+        if value is None:
+            logger.debug("Chainlink payload missing value: %r", payload)
             return
-
         try:
-            # Run blocking web3 call in executor to avoid blocking event loop
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(None, self._fetch_latest_round)
-            if result is not None:
-                self._latest = result
-                logger.debug(
-                    "Chainlink: BTC/USD=%.2f roundId=%d updatedAt=%.0f age=%.1fs",
-                    result.price_usd,
-                    result.round_id,
-                    result.updated_at,
-                    result.age_secs(),
-                )
-        except Exception as exc:
-            logger.warning("Chainlink poll error: %s", exc)
+            self._chainlink_raw_price = float(value)
+            self._chainlink_raw_ts = float(ts_ms) / 1000.0 if ts_ms else time.time()
+            logger.debug(
+                "Chainlink BTC/USD=%.2f ts=%.3f",
+                self._chainlink_raw_price,
+                self._chainlink_raw_ts,
+            )
+        except (TypeError, ValueError) as exc:
+            logger.warning("Chainlink value parse error: %s payload=%r", exc, payload)
 
-    def _fetch_latest_round(self) -> Optional[ChainlinkPrice]:
-        """
-        Blocking call — runs in executor.
-        Returns ChainlinkPrice or None on error.
-        """
+    def _handle_binance(self, payload: dict) -> None:
+        value = payload.get("value")
+        ts_ms = payload.get("timestamp_ms") or payload.get("timestamp")
+        if value is None:
+            logger.debug("Binance payload missing value: %r", payload)
+            return
         try:
-            round_id, answer, started_at, updated_at, answered_in_round = (
-                self._contract.functions.latestRoundData().call()
+            self._binance_raw_price = float(value)
+            self._binance_raw_ts = float(ts_ms) / 1000.0 if ts_ms else time.time()
+            logger.debug(
+                "Binance BTC/USDT=%.2f ts=%.3f",
+                self._binance_raw_price,
+                self._binance_raw_ts,
             )
-            if answer <= 0:
-                logger.warning("Chainlink returned non-positive answer: %d", answer)
-                return None
+        except (TypeError, ValueError) as exc:
+            logger.warning("Binance value parse error: %s payload=%r", exc, payload)
 
-            price_usd = answer / (10 ** BTCUSD_DECIMALS)
-            fetched_now = time.time()
-
-            freshness = check_freshness(
-                last_updated_ts=float(updated_at),
-                max_age_secs=self._staleness_threshold,
-            )
-
-            return ChainlinkPrice(
-                price_usd=price_usd,
-                round_id=int(round_id),
-                updated_at=float(updated_at),
-                fetched_at=fetched_now,
-                freshness=freshness,
-            )
-        except Exception as exc:
-            logger.error("latestRoundData() call failed: %s", exc)
+    def chainlink_latest(self) -> Optional[ChainlinkPrice]:
+        """
+        Return latest Chainlink price with freshness computed at read time.
+        Returns None if no data received yet.
+        """
+        if self._chainlink_raw_price is None or self._chainlink_raw_ts is None:
             return None
 
-    def latest(self) -> Optional[ChainlinkPrice]:
-        """
-        Return the latest ChainlinkPrice snapshot with current freshness.
-        Freshness is recomputed on read so it degrades as time passes.
-        Returns None if we have never received data.
-        """
-        if self._latest is None:
-            return None
-
-        # Recompute freshness based on when the chain last updated the price
         freshness = check_freshness(
-            last_updated_ts=self._latest.updated_at,
-            max_age_secs=self._staleness_threshold,
+            last_updated_ts=self._chainlink_raw_ts,
+            max_age_secs=self._chainlink_staleness,
         )
-
         return ChainlinkPrice(
-            price_usd=self._latest.price_usd,
-            round_id=self._latest.round_id,
-            updated_at=self._latest.updated_at,
-            fetched_at=self._latest.fetched_at,
+            price_usd=self._chainlink_raw_price,
+            round_id=0,          # RTDS does not expose round IDs
+            updated_at=self._chainlink_raw_ts,
+            fetched_at=time.time(),
             freshness=freshness,
+            source="rtds_chainlink_btcusd",
         )
 
-    def is_fresh(self) -> bool:
-        p = self.latest()
+    def binance_latest(self) -> Optional[BinancePrice]:
+        """
+        Return latest Binance auxiliary price with freshness computed at read time.
+        Returns None if no data received yet.
+        RTDS provides a single value (not bid/ask); bid == ask == value.
+        """
+        if self._binance_raw_price is None or self._binance_raw_ts is None:
+            return None
+
+        freshness = check_freshness(
+            last_updated_ts=self._binance_raw_ts,
+            max_age_secs=self._binance_staleness,
+        )
+        price = self._binance_raw_price
+        return BinancePrice(
+            bid=price,
+            ask=price,
+            fetched_at=self._binance_raw_ts,
+            freshness=freshness,
+            source="rtds_binance_btcusdt",
+        )
+
+    def chainlink_last_ts(self) -> Optional[float]:
+        """Return unix timestamp of last Chainlink update, or None."""
+        return self._chainlink_raw_ts
+
+    def is_chainlink_fresh(self) -> bool:
+        p = self.chainlink_latest()
         return p is not None and p.freshness == FreshnessState.FRESH
 
-    def price_or_none(self) -> Optional[float]:
-        p = self.latest()
-        if p and p.freshness == FreshnessState.FRESH:
-            return p.price_usd
-        return None
-
-
-# Type hint workaround for web3 optional
-try:
-    from web3 import Web3 as _W3
-    Any = _W3
-except ImportError:
-    Any = object
+    # Legacy alias — runner.py calls .latest()
+    def latest(self) -> Optional[ChainlinkPrice]:
+        return self.chainlink_latest()

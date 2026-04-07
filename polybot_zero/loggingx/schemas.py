@@ -33,6 +33,12 @@ class FreshnessState:
     MISSING = "MISSING"
 
 
+class FeeProvenance:
+    CONFIRMED  = "CONFIRMED"   # feeRateBps from /fee-rate endpoint, non-zero
+    ZERO       = "ZERO"        # feeRateBps=0 from API (suspicious, accepted)
+    UNRESOLVED = "UNRESOLVED"  # endpoint failed or no data — no-trade required
+
+
 class ResolutionOutcome:
     UP         = "UP"
     DOWN       = "DOWN"
@@ -141,7 +147,7 @@ class ChainlinkPrice:
     updated_at:   float   # UTC unix from chain
     fetched_at:   float   # UTC unix when we got it
     freshness:    str     # FreshnessState
-    source:       str = "polygon_chainlink_btcusd"
+    source:       str = "rtds_chainlink_btcusd"
 
     def age_secs(self) -> float:
         return time.time() - self.updated_at
@@ -278,11 +284,15 @@ class FeatureVector:
     # Pair structure
     pair_sum_best_ask: Optional[float] = None   # up_ask + down_ask
 
+    # Canonical price source (always "rtds_chainlink_btcusd" in this system)
+    canonical_price_source: Optional[str] = None
+
     # Fees
     fees_enabled:    Optional[bool]  = None
     fee_rate:        Optional[float] = None
     fee_source:      Optional[str]   = None
-    effective_fee:   Optional[float] = None   # fee_rate * entry_price
+    fee_provenance:  str = FeeProvenance.UNRESOLVED
+    effective_fee:   Optional[float] = None   # curve fee at entry price
 
     # Metadata flags
     tick_size:       Optional[float] = None
@@ -318,9 +328,13 @@ class HypotheticalEntry:
     # Costs
     stake_usdc:          float
     fee_rate:            float
-    effective_fee_usdc:  float          # fee_rate * stake_usdc
-    effective_cost_usdc: float          # stake_usdc (token cost)
-    max_payout_usdc:     float          # 1.0 * quantity
+    fee_provenance:      str = FeeProvenance.UNRESOLVED
+    effective_fee_usdc:  float = 0.0   # curve: stake * feeRate * p * (1-p)
+    effective_cost_usdc: float = 0.0   # stake + fee
+
+    # Fee curve inputs (for audit)
+    fee_curve_inputs:    Optional[Dict[str, Any]] = None  # {feeRate, p, stake}
+    max_payout_usdc:     float = 0.0    # 1.0 * quantity (= stake / entry_price)
 
     # Outcome (filled after resolution)
     outcome_known:       bool = False

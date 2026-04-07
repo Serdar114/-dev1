@@ -1,17 +1,27 @@
 """
-fee_schedule.py — Fee computation from API-sourced data.
+fee_schedule.py — Fee computation using Polymarket fee curve formula.
 
 Design:
-  Fee rate MUST come from the API. It may NOT be hardcoded as canonical truth.
-  If fee_rate is missing, effective_fee is None, and no-trade is required.
-  We separate fee_rate (input from API) from effective_fee (computed from stake).
-  Maker vs taker distinction: at this phase, we are taker-only.
-  Fill assumption: taker = pays fee_rate on the stake amount.
+  Polymarket Crypto category fee formula (exponent = 1):
+    fee = C × feeRate × p × (1 − p)
+  where:
+    C          = stake in USDC
+    feeRate    = rate from /fee-rate?token_id endpoint (in basis points → decimal)
+    p          = entry price (probability, 0 < p < 1)
 
-  Note on Polymarket fee structure (as of design):
-    The fee is typically embedded in the spread or explicit in the API response.
-    We read it from the API and do NOT assume any rate.
-    If fee_rate is 0.0 from API, we log it as suspicious but accept it.
+  This is NOT a flat fee on stake. The fee depends on entry price p.
+  At p=0.5: fee is maximised (0.25 × C × feeRate)
+  At p→0 or p→1: fee → 0
+
+  feeRate source: GET /fee-rate?token_id={token_id} → {"feeRateBps": <int>}
+  feeRate decimal = feeRateBps / 10000
+
+  FeeProvenance:
+    CONFIRMED  — feeRateBps received from /fee-rate endpoint, non-zero
+    ZERO       — feeRateBps received but equals 0 (suspicious, logged, accepted)
+    UNRESOLVED — endpoint failed, no data, or parse error → no-trade required
+
+  pair_sum is explicitly NOT a fee source.
 """
 
 from __future__ import annotations
@@ -21,97 +31,131 @@ from typing import Optional
 logger = logging.getLogger("polybot.fee_schedule")
 
 
+class FeeProvenance:
+    CONFIRMED  = "CONFIRMED"   # fee rate received from API, non-zero
+    ZERO       = "ZERO"        # fee rate is 0.0 from API (suspicious but accepted)
+    UNRESOLVED = "UNRESOLVED"  # no fee data — no-trade required
+
+
 class FeeSchedule:
     """
-    Holds the fee schedule for one market.
+    Fee schedule for one token.
 
-    Job: compute effective fees given entry price and stake.
-    Input: fee_rate (from API), provenance string.
-    Output: effective_fee_usdc, effective_cost_usdc.
-    Failure: if fee_rate is None, all computed values are None.
+    Job: compute fee-adjusted costs using the Polymarket Crypto fee curve.
+    Input: fee_rate_bps (int from /fee-rate endpoint), provenance.
+    Output: fee_usdc, net_pnl, etc.
+    Failure: if provenance is UNRESOLVED, all computed values return None.
 
     This class never guesses a fee rate.
     """
 
     def __init__(
         self,
-        fee_rate: Optional[float],
-        fee_source: Optional[str],
-        fees_enabled: Optional[bool],
+        fee_rate_bps: Optional[int],
+        provenance: str,
+        token_id: Optional[str] = None,
     ):
-        self.fee_rate = fee_rate
-        self.fee_source = fee_source
-        self.fees_enabled = fees_enabled
+        self.token_id = token_id
+        self.fee_rate_bps = fee_rate_bps
+        self.provenance = provenance
 
-        if fee_rate is None:
-            logger.warning("FeeSchedule: fee_rate is None (source=%s) — no-trade required", fee_source)
-        elif fee_rate == 0.0:
+        if fee_rate_bps is None:
+            self.fee_rate = None
+        else:
+            self.fee_rate = fee_rate_bps / 10000.0
+
+        if provenance == FeeProvenance.UNRESOLVED:
             logger.warning(
-                "FeeSchedule: fee_rate is 0.0 from source=%s — "
-                "verify this is correct before trusting it", fee_source
+                "FeeSchedule[%s]: UNRESOLVED — no-trade required",
+                token_id or "unknown",
+            )
+        elif provenance == FeeProvenance.ZERO:
+            logger.warning(
+                "FeeSchedule[%s]: fee_rate=0.0 from API — verify this is correct",
+                token_id or "unknown",
             )
 
+    @classmethod
+    def from_bps(cls, fee_rate_bps: Optional[int], token_id: Optional[str] = None) -> "FeeSchedule":
+        """Build FeeSchedule from raw bps value from /fee-rate endpoint."""
+        if fee_rate_bps is None:
+            return cls(fee_rate_bps=None, provenance=FeeProvenance.UNRESOLVED, token_id=token_id)
+        if fee_rate_bps == 0:
+            return cls(fee_rate_bps=0, provenance=FeeProvenance.ZERO, token_id=token_id)
+        return cls(fee_rate_bps=fee_rate_bps, provenance=FeeProvenance.CONFIRMED, token_id=token_id)
+
     def is_known(self) -> bool:
-        """True only if fee_rate was received from a known source."""
-        return self.fee_rate is not None and self.fee_source is not None
+        """True only if fee rate is available (CONFIRMED or ZERO)."""
+        return self.provenance in (FeeProvenance.CONFIRMED, FeeProvenance.ZERO)
 
-    def effective_fee_usdc(self, stake_usdc: float) -> Optional[float]:
+    def fee_usdc(self, stake_usdc: float, entry_price: float) -> Optional[float]:
         """
-        Compute effective fee for a given stake.
-        Returns None if fee_rate is unknown.
-        fee = fee_rate * stake_usdc (applied to the amount spent, not the payout)
+        Compute fee in USDC for a given stake and entry price.
+
+        Formula: fee = stake × feeRate × entry_price × (1 − entry_price)
+
+        Returns None if fee is UNRESOLVED.
         """
         if self.fee_rate is None:
             return None
-        return self.fee_rate * stake_usdc
+        if not (0.0 < entry_price < 1.0):
+            logger.warning(
+                "fee_usdc: entry_price=%.4f is outside (0, 1) — fee may be zero",
+                entry_price,
+            )
+        return stake_usdc * self.fee_rate * entry_price * (1.0 - entry_price)
 
-    def effective_cost_usdc(self, entry_price: float, quantity: float) -> Optional[float]:
+    def total_cost_usdc(self, stake_usdc: float, entry_price: float) -> Optional[float]:
         """
-        Total cost = token cost + fee.
-        token_cost = entry_price * quantity
-        fee = fee_rate * token_cost
-        effective_cost = token_cost * (1 + fee_rate)
-        Returns None if fee_rate is unknown.
+        Total cost = stake + fee.
+        Returns None if fee is UNRESOLVED.
         """
-        if self.fee_rate is None:
+        fee = self.fee_usdc(stake_usdc, entry_price)
+        if fee is None:
             return None
-        token_cost = entry_price * quantity
-        return token_cost * (1.0 + self.fee_rate)
+        return stake_usdc + fee
 
     def quantity_from_stake(self, entry_price: float, stake_usdc: float) -> Optional[float]:
         """
-        Given a stake amount (USDC) and entry price, compute how many tokens.
-        stake = entry_price * quantity * (1 + fee_rate)
-        quantity = stake / (entry_price * (1 + fee_rate))
-        Returns None if fee_rate or entry_price is unknown/zero.
+        Tokens purchased = stake / entry_price.
+        (Fee is charged separately, not deducted from tokens.)
+        Returns None if entry_price is zero or fee is UNRESOLVED.
         """
-        if self.fee_rate is None or entry_price <= 0:
+        if self.fee_rate is None:
             return None
-        return stake_usdc / (entry_price * (1.0 + self.fee_rate))
+        if entry_price <= 0:
+            return None
+        return stake_usdc / entry_price
 
-    def payout_if_correct(self, quantity: float) -> float:
-        """Payout is always 1.0 per token on a binary outcome market."""
-        return quantity * 1.0
-
-    def net_pnl(self, stake_usdc: float, quantity: float, correct: bool) -> Optional[float]:
+    def net_pnl(
+        self,
+        stake_usdc: float,
+        entry_price: float,
+        correct: bool,
+    ) -> Optional[float]:
         """
         Net PnL for a resolved position.
-        correct=True: payout = quantity * 1.0; net = payout - stake - fee
-        correct=False: payout = 0; net = -stake - fee
-        Returns None if fee_rate is unknown.
+          quantity = stake / entry_price
+          payout (correct)   = quantity * 1.0 = stake / entry_price
+          payout (incorrect) = 0
+          fee = stake × feeRate × p × (1 − p)
+          net = payout − stake − fee
+
+        Returns None if fee is UNRESOLVED.
         """
-        fee = self.effective_fee_usdc(stake_usdc)
+        fee = self.fee_usdc(stake_usdc, entry_price)
         if fee is None:
             return None
         if correct:
-            payout = self.payout_if_correct(quantity)
+            quantity = stake_usdc / entry_price if entry_price > 0 else 0.0
+            payout = quantity * 1.0
             return payout - stake_usdc - fee
         else:
             return -stake_usdc - fee
 
     def describe(self) -> str:
         return (
-            f"FeeSchedule(fee_rate={self.fee_rate}, "
-            f"fees_enabled={self.fees_enabled}, "
-            f"source={self.fee_source})"
+            f"FeeSchedule(token={self.token_id} "
+            f"fee_rate_bps={self.fee_rate_bps} "
+            f"provenance={self.provenance})"
         )

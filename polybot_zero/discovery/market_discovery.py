@@ -12,12 +12,13 @@ Design:
   This module NEVER invents or defaults market fields.
 
   Token role assignment:
-    Polymarket binary markets have "Yes" and "No" outcome tokens.
-    For BTC 5m Up/Down:
-      "Yes" = price went Up → up_token_id
-      "No"  = price went Down → down_token_id
-    We verify this from the "outcomes" or "tokens[].outcome" field.
-    If token roles are ambiguous, the market is dropped with a log.
+    BTC 5m markets use "Up" / "Down" outcome labels (NOT "Yes" / "No").
+    Primary match: outcome.lower() in ("up",) → up_token_id
+                   outcome.lower() in ("down",) → down_token_id
+    Fallback:      outcome.lower() in ("yes",) → up_token_id
+                   outcome.lower() in ("no",) → down_token_id
+    If token roles are ambiguous, all raw outcome strings are logged and
+    the market is dropped.
 """
 
 from __future__ import annotations
@@ -217,26 +218,41 @@ class MarketDiscovery:
     ) -> tuple[Optional[str], Optional[str]]:
         """
         Assign up_token_id and down_token_id from token list.
-        Expects outcome labels "Yes"/"Up" → up, "No"/"Down" → down.
-        Returns (None, None) if ambiguous.
+        Primary: "up" → up, "down" → down.
+        Fallback: "yes" → up, "no" → down.
+        Returns (None, None) if ambiguous; logs all raw outcome strings on failure.
         """
         up_token = None
         down_token = None
+        seen_outcomes: List[str] = []
 
         for tok in tokens:
             token_id = tok.get("token_id") or tok.get("tokenId")
             outcome = (tok.get("outcome") or "").strip()
+            seen_outcomes.append(repr(outcome))
 
             if not token_id:
                 logger.debug("[%s] Token missing token_id", condition_id)
                 continue
 
-            if outcome.lower() in ("yes", "up"):
+            outcome_lc = outcome.lower()
+            if outcome_lc == "up":
                 up_token = token_id
-            elif outcome.lower() in ("no", "down"):
+            elif outcome_lc == "down":
+                down_token = token_id
+            elif outcome_lc == "yes":
+                up_token = token_id
+            elif outcome_lc == "no":
                 down_token = token_id
             else:
                 logger.debug("[%s] Unrecognized outcome label: %r", condition_id, outcome)
+
+        if up_token is None or down_token is None:
+            logger.warning(
+                "[%s] Cannot assign token roles — raw outcomes: %s",
+                condition_id,
+                ", ".join(seen_outcomes),
+            )
 
         return up_token, down_token
 
