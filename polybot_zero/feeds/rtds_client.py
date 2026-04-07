@@ -2,9 +2,13 @@
 rtds_client.py — Chainlink BTC/USD canonical price feed via Polygon RPC.
 
 Design:
-  This is the CANONICAL settlement truth source. No fallback is permitted.
+  This is the FIRST OFFICIAL CANDIDATE for canonical settlement truth.
   We read directly from the Chainlink BTC/USD aggregator on Polygon Mainnet.
-  This is the same source Polymarket uses for market resolution.
+  Whether this is the exact source the Polymarket resolution engine reads is
+  NOT proven from runtime or official documentation and must not be stated as
+  fact. Runtime must probe this source, confirm it is available and stable,
+  and log that decision. Direct Chainlink RPC is the second candidate source.
+  If neither source is confirmed available and fresh, outcome is UNRESOLVED.
 
   Method: polling via JSON-RPC (eth_call to latestRoundData).
   Why polling not WebSocket: simpler, more reliable, verifiable.

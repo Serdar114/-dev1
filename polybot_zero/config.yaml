@@ -46,7 +46,7 @@ truth:
 book:
   # Max acceptable spread on a $0-$1 outcome token
   max_spread: 0.10
-  # pair_sum = up_best_ask + down_best_ask; expected ~1.0 + fee overhead
+  # pair_sum = up_best_ask + down_best_ask; market-structure metric only — NOT a fee source
   pair_sum_min: 0.90
   pair_sum_max: 1.20
   # Minimum number of levels on each side before orderbook is valid
