@@ -83,19 +83,27 @@ class WindowClock:
 
     def should_fire_open(self) -> bool:
         """
-        True once, when now is within [start - tol, start + tol] and not yet fired.
-        Fires within the open tolerance window around window_start.
+        True once, when now is within the window (start <= now < end) or within
+        the open tolerance after start. Never fires if window has already ended.
         """
         if self._open_fired:
             return False
         now = self.now()
-        in_window = (self.window_start_ts - self.open_tol) <= now <= (self.window_start_ts + self.open_tol)
-        # Also fire if we are already past start (late start scenario)
-        already_past = now > self.window_start_ts
-        if in_window or already_past:
+        # Window already over — do not fire open for expired markets
+        if now >= self.window_end_ts:
+            return False
+        in_window = (self.window_start_ts - self.open_tol) <= now < self.window_end_ts
+        if in_window:
             self._open_fired = True
             return True
         return False
+
+    def is_expired_unobserved(self) -> bool:
+        """
+        True if the window has ended but open was never fired.
+        These markets were discovered too late and must be skipped immediately.
+        """
+        return self.is_after_close() and not self._open_fired
 
     def should_fire_close(self) -> bool:
         """

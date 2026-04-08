@@ -168,18 +168,40 @@ class CLOBWSClient:
             raise
 
     async def _handle_message(self, raw: str) -> None:
+        # Non-JSON control frames — "INVALID OPERATION" is sent by the server
+        # on bad subscribe payloads or during reconnect; log once and continue.
+        stripped = raw.strip() if raw else ""
+        if not stripped:
+            return
+        if stripped == "INVALID OPERATION":
+            logger.warning("CLOB_WS_INVALID_OPERATION received — check subscribe payload")
+            return
+
         try:
-            msg = json.loads(raw)
-            event_type = msg.get("event_type", "")
-            logger.debug("CLOB WS message: event_type=%s", event_type)
-
-            if event_type == "book":
-                await self._handle_book(msg)
-
+            parsed = json.loads(stripped)
         except json.JSONDecodeError as exc:
-            logger.warning("CLOB WS JSON parse error: %s | raw=%r", exc, raw[:100])
+            logger.warning("CLOB_WS_JSON_ERROR: %s | raw=%r", exc, raw[:100])
+            return
+
+        try:
+            # First message (and some others) can arrive as a JSON list
+            if isinstance(parsed, list):
+                for item in parsed:
+                    if isinstance(item, dict):
+                        await self._dispatch(item)
+            elif isinstance(parsed, dict):
+                await self._dispatch(parsed)
+            else:
+                logger.debug("CLOB_WS_UNKNOWN_SHAPE type=%s", type(parsed).__name__)
         except Exception as exc:
-            logger.warning("CLOB WS message handler error: %s", exc)
+            logger.warning("CLOB_WS_HANDLER_ERROR: %s", exc)
+
+    async def _dispatch(self, msg: dict) -> None:
+        """Route a single parsed dict message to the correct handler."""
+        event_type = msg.get("event_type", "")
+        if event_type == "book":
+            await self._handle_book(msg)
+        # price_change and last_trade_price are informational; not needed here
 
     async def _handle_book(self, msg: dict) -> None:
         token_id = msg.get("asset_id") or msg.get("market")

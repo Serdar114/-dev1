@@ -96,9 +96,11 @@ class RTDSClient:
 
         self._chainlink_raw_price: Optional[float] = None
         self._chainlink_raw_ts: Optional[float] = None    # unix seconds
+        self._chainlink_update_count: int = 0
 
         self._binance_raw_price: Optional[float] = None
         self._binance_raw_ts: Optional[float] = None
+        self._binance_update_count: int = 0
 
         self._running = False
         self._ws = None
@@ -126,6 +128,9 @@ class RTDSClient:
                     exc, self._reconnect_delay,
                 )
                 self._ws = None
+                # Reset counts so reconnect logs first updates at INFO
+                self._chainlink_update_count = 0
+                self._binance_update_count   = 0
                 await asyncio.sleep(self._reconnect_delay)
 
     async def stop(self) -> None:
@@ -244,11 +249,20 @@ class RTDSClient:
             if is_chainlink:
                 self._chainlink_raw_price = price
                 self._chainlink_raw_ts    = ts
-                logger.info("RTDS_CHAINLINK BTC/USD=%.2f ts=%.3f", price, ts)
+                self._chainlink_update_count += 1
+                # INFO on first update only; subsequent updates are DEBUG
+                if self._chainlink_update_count == 1:
+                    logger.info("RTDS_CHAINLINK first update BTC/USD=%.2f ts=%.3f", price, ts)
+                else:
+                    logger.debug("RTDS_CHAINLINK BTC/USD=%.2f ts=%.3f", price, ts)
             else:
                 self._binance_raw_price = price
                 self._binance_raw_ts    = ts
-                logger.info("RTDS_BINANCE BTC/USDT=%.2f ts=%.3f", price, ts)
+                self._binance_update_count += 1
+                if self._binance_update_count == 1:
+                    logger.info("RTDS_BINANCE first update BTC/USDT=%.2f ts=%.3f", price, ts)
+                else:
+                    logger.debug("RTDS_BINANCE BTC/USDT=%.2f ts=%.3f", price, ts)
         except (TypeError, ValueError) as exc:
             logger.warning(
                 "RTDS_%s value parse error: %s payload=%r",

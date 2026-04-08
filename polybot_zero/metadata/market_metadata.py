@@ -197,7 +197,9 @@ class MetadataFetcher:
 
     async def _fetch_one_fee_rate(self, session, token_id: str) -> Optional[int]:
         """
-        GET /fee-rate?token_id={token_id} → {"feeRateBps": <int>}
+        GET /fee-rate?token_id={token_id}
+        Runtime response shape: {"base_fee": 1000}
+        Fallback field names: feeRateBps, fee_rate_bps
         Returns integer bps or None on failure.
         """
         try:
@@ -213,10 +215,15 @@ class MetadataFetcher:
                     )
                     return None
                 data = await resp.json()
-                raw_bps = data.get("feeRateBps")
+                # Accept runtime field first, then legacy names
+                raw_bps = (
+                    data.get("base_fee")
+                    or data.get("feeRateBps")
+                    or data.get("fee_rate_bps")
+                )
                 if raw_bps is None:
                     logger.warning(
-                        "feeRateBps missing in /fee-rate response for token_id=%s: %r",
+                        "fee-rate: no recognised field in response for token_id=%s: %r",
                         token_id, data,
                     )
                     return None

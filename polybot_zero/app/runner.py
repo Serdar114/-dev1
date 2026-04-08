@@ -329,7 +329,18 @@ class Runner:
             clock   = self._window_clocks[cid]
             tracker = self._truth_trackers[cid]
 
-            # Window state machine
+            # ── Expired guard: window over before we ever observed it ────────
+            # Must come first — never allow PENDING→LIVE on a closed window.
+            if clock.is_expired_unobserved():
+                if entry.status not in (MarketStatus.RESOLVED, MarketStatus.CLOSED):
+                    logger.info(
+                        "[%s] MARKET_EXPIRED_UNOBSERVED window_end=%.0f now=%.0f — skipping",
+                        cid, identity.window_end_ts, time.time(),
+                    )
+                    self._registry.mark_resolved(cid)
+                continue
+
+            # ── PENDING ──────────────────────────────────────────────────────
             if clock.is_before_open():
                 if entry.status != MarketStatus.PENDING:
                     self._registry.set_status(cid, MarketStatus.PENDING)

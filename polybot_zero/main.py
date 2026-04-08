@@ -39,6 +39,11 @@ def setup_logging(config: dict) -> None:
         format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S",
     )
+    # Suppress noisy third-party library loggers regardless of app level
+    for noisy in ("websockets", "websockets.client", "websockets.server",
+                  "websockets.protocol", "aiohttp", "aiohttp.client",
+                  "aiohttp.connector", "asyncio"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 def parse_args() -> argparse.Namespace:
