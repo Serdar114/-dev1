@@ -288,6 +288,12 @@ class MarketDiscovery:
     ) -> Optional[MarketIdentity]:
         """
         Parse one Gamma market object into MarketIdentity.
+
+        Window time rule for btc-updown-5m-* slugs:
+          window_start_ts = slug timestamp   (authoritative — startDate is creation time)
+          window_end_ts   = endDate if parseable and within 120s of slug+300, else slug+300
+          Duration check is a sanity guard only; slug encodes the truth.
+
         Returns None on any validation failure (caller logs details).
         """
         # ── Token IDs ────────────────────────────────────────────────────────
@@ -307,29 +313,40 @@ class MarketDiscovery:
             elif label in ("down", "no"):
                 down_id = tok
 
-        # Positional fallback when outcomes field absent or unmatched
+        # Positional fallback when outcomes absent or unmatched
         if up_id is None and down_id is None:
             up_id   = clob_ids[0]
             down_id = clob_ids[1]
+            logger.debug("[%s] token roles assigned positionally", slug)
 
         if not up_id or not down_id:
             return None
 
         # ── Window times ─────────────────────────────────────────────────────
-        start_ts: Optional[float] = None
-        end_ts:   Optional[float] = None
+        # slug timestamp is the 5m window start — startDate is creation time, not used
+        start_ts = float(window_ts)
 
-        start_ts = _parse_ts(item.get("gameStartTime")) or _parse_ts(item.get("startDate"))
-        end_ts   = _parse_ts(item.get("endDate"))
-
-        # Slug suffix fallback
-        if start_ts is None:
-            start_ts = float(window_ts)
-        if end_ts is None:
-            end_ts = float(window_ts + WINDOW_SECS)
+        # endDate is the real close time; sanity-check it is within 120s of slug+300
+        expected_end = float(window_ts + WINDOW_SECS)
+        raw_end = item.get("endDate") or item.get("endDateIso")
+        parsed_end = _parse_ts(raw_end)
+        if parsed_end is not None and abs(parsed_end - expected_end) <= 120:
+            end_ts = parsed_end
+        else:
+            if parsed_end is not None:
+                logger.debug(
+                    "[%s] endDate=%.0f deviates %.0fs from expected %.0f — using slug+300",
+                    slug, parsed_end, abs(parsed_end - expected_end), expected_end,
+                )
+            end_ts = expected_end
 
         duration = end_ts - start_ts
         if not (self._min_window <= duration <= self._max_window):
+            # This should not happen with slug-derived times; log if it does
+            logger.warning(
+                "[%s] duration=%.0f outside [%.0f,%.0f] start=%.0f end=%.0f",
+                slug, duration, self._min_window, self._max_window, start_ts, end_ts,
+            )
             return None
 
         # ── Identity ─────────────────────────────────────────────────────────
@@ -346,5 +363,5 @@ class MarketDiscovery:
             window_start_ts=start_ts,
             window_end_ts=end_ts,
             slug=item.get("slug") or slug,
-            raw_end_date=str(item.get("endDate") or ""),
+            raw_end_date=str(raw_end or ""),
         )

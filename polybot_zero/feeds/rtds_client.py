@@ -175,57 +175,85 @@ class RTDSClient:
         )
 
     async def _handle_message(self, raw: str) -> None:
+        # Empty frames arrive immediately after subscribe — ignore cleanly
+        if not raw or not raw.strip():
+            return
+
         try:
             msg = json.loads(raw)
-            topic = msg.get("topic", "")
-            payload = msg.get("payload", {})
-            symbol = (payload.get("symbol") or "").lower()
-
-            if topic == self._chainlink_topic and symbol == self._chainlink_symbol:
-                self._handle_chainlink(payload)
-            elif topic == self._binance_topic and symbol == self._binance_symbol:
-                self._handle_binance(payload)
-            else:
-                logger.debug("RTDS unhandled: topic=%s symbol=%s", topic, symbol)
-
         except json.JSONDecodeError as exc:
             logger.warning("RTDS JSON error: %s | raw=%r", exc, raw[:120])
+            return
+
+        try:
+            topic   = msg.get("topic", "")
+            payload = msg.get("payload") or {}
+            symbol  = (payload.get("symbol") or "").lower()
+
+            # Symbol drives classification — topic may mismatch in practice
+            if symbol == self._chainlink_symbol:        # "btc/usd"
+                self._ingest_price(payload, is_chainlink=True)
+            elif symbol == self._binance_symbol:        # "btcusdt"
+                self._ingest_price(payload, is_chainlink=False)
+            else:
+                logger.debug("RTDS unhandled: topic=%s symbol=%r", topic, symbol)
+
         except Exception as exc:
             logger.warning("RTDS message handler error: %s", exc)
 
-    def _handle_chainlink(self, payload: dict) -> None:
-        value = payload.get("value")
-        ts_ms = payload.get("timestamp_ms") or payload.get("timestamp")
-        if value is None:
-            logger.debug("Chainlink payload missing value: %r", payload)
-            return
-        try:
-            self._chainlink_raw_price = float(value)
-            self._chainlink_raw_ts = float(ts_ms) / 1000.0 if ts_ms else time.time()
-            logger.debug(
-                "Chainlink BTC/USD=%.2f ts=%.3f",
-                self._chainlink_raw_price,
-                self._chainlink_raw_ts,
-            )
-        except (TypeError, ValueError) as exc:
-            logger.warning("Chainlink value parse error: %s payload=%r", exc, payload)
+    def _extract_value_and_ts(self, payload: dict):
+        """
+        Extract (value, ts_unix) from payload.
 
-    def _handle_binance(self, payload: dict) -> None:
+        Supports two shapes:
+          single update:  {"value": 94000.0, "timestamp_ms": 1234567890000}
+          batch snapshot: {"data": [{"value":..., "timestamp_ms":...}, ...]}
+                          → take last item as the latest point
+        Returns (None, None) if nothing usable.
+        """
+        # Single value update
         value = payload.get("value")
         ts_ms = payload.get("timestamp_ms") or payload.get("timestamp")
+        if value is not None:
+            return value, ts_ms
+
+        # Batch / snapshot array
+        data_arr = payload.get("data")
+        if isinstance(data_arr, list) and data_arr:
+            last = data_arr[-1]
+            if isinstance(last, dict):
+                value = last.get("value")
+                ts_ms = last.get("timestamp_ms") or last.get("timestamp")
+                if value is not None:
+                    return value, ts_ms
+
+        return None, None
+
+    def _ingest_price(self, payload: dict, is_chainlink: bool) -> None:
+        value, ts_ms = self._extract_value_and_ts(payload)
         if value is None:
-            logger.debug("Binance payload missing value: %r", payload)
+            logger.debug(
+                "RTDS_%s payload has no value or data: %r",
+                "CHAINLINK" if is_chainlink else "BINANCE",
+                payload,
+            )
             return
         try:
-            self._binance_raw_price = float(value)
-            self._binance_raw_ts = float(ts_ms) / 1000.0 if ts_ms else time.time()
-            logger.debug(
-                "Binance BTC/USDT=%.2f ts=%.3f",
-                self._binance_raw_price,
-                self._binance_raw_ts,
-            )
+            price = float(value)
+            ts    = float(ts_ms) / 1000.0 if ts_ms else time.time()
+            if is_chainlink:
+                self._chainlink_raw_price = price
+                self._chainlink_raw_ts    = ts
+                logger.info("RTDS_CHAINLINK BTC/USD=%.2f ts=%.3f", price, ts)
+            else:
+                self._binance_raw_price = price
+                self._binance_raw_ts    = ts
+                logger.info("RTDS_BINANCE BTC/USDT=%.2f ts=%.3f", price, ts)
         except (TypeError, ValueError) as exc:
-            logger.warning("Binance value parse error: %s payload=%r", exc, payload)
+            logger.warning(
+                "RTDS_%s value parse error: %s payload=%r",
+                "CHAINLINK" if is_chainlink else "BINANCE", exc, payload,
+            )
 
     def chainlink_latest(self) -> Optional[ChainlinkPrice]:
         """
