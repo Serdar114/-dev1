@@ -4,6 +4,7 @@ mode: measurement_only
 
 discovery:
   clob_api_url: "https://clob.polymarket.com"
+  gamma_api_url: "https://gamma-api.polymarket.com"
   # Filter: question must contain one of these (case-insensitive)
   title_keywords: ["btc", "bitcoin"]
   # Window duration range to qualify as "5m" market
@@ -36,7 +37,7 @@ feeds:
 
   # CLOB WebSocket — order books only (separate service from RTDS)
   clob_ws:
-    url: "wss://ws-subscriptions-clob.polymarket.com/ws/"
+    url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     reconnect_delay_secs: 5
 
 metadata:

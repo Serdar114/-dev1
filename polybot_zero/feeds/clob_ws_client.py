@@ -36,7 +36,7 @@ from loggingx.schemas import OrderBookSnapshot, PriceLevel
 
 logger = logging.getLogger("polybot.clob_ws")
 
-CLOB_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/"
+CLOB_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 
 class CLOBWSClient:
@@ -141,9 +141,8 @@ class CLOBWSClient:
         if self._ws is None:
             return
         msg = json.dumps({
-            "type": "subscribe",
-            "channel": "market",
             "assets_ids": token_ids,
+            "type": "Market",
         })
         await self._ws.send(msg)
 

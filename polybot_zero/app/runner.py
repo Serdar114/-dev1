@@ -97,6 +97,7 @@ class Runner:
         disc_cfg = config.get("discovery", {})
         self._discovery = MarketDiscovery(
             clob_api_url=disc_cfg.get("clob_api_url", "https://clob.polymarket.com"),
+            gamma_api_url=disc_cfg.get("gamma_api_url", "https://gamma-api.polymarket.com"),
             title_keywords=disc_cfg.get("title_keywords", ["btc", "bitcoin"]),
             min_window_secs=disc_cfg.get("min_window_secs", 240),
             max_window_secs=disc_cfg.get("max_window_secs", 360),
@@ -135,7 +136,7 @@ class Runner:
         # CLOB WebSocket (order books only — separate service)
         clob_ws_cfg = feeds_cfg.get("clob_ws", {})
         self._clob_ws = CLOBWSClient(
-            ws_url=clob_ws_cfg.get("url", "wss://ws-subscriptions-clob.polymarket.com/ws/"),
+            ws_url=clob_ws_cfg.get("url", "wss://ws-subscriptions-clob.polymarket.com/ws/market"),
             reconnect_delay_secs=clob_ws_cfg.get("reconnect_delay_secs", 5),
             on_book_update=self._on_book_update,
         )
