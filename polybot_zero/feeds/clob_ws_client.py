@@ -7,9 +7,9 @@ Design:
   Maintains per-token order book snapshots.
   On reconnect, re-subscribes to all known token IDs.
 
-  WebSocket URL: wss://ws-subscriptions-clob.polymarket.com/ws/
+  WebSocket URL: wss://ws-subscriptions-clob.polymarket.com/ws/market
   Subscribe message:
-    {"type": "subscribe", "channel": "market", "assets_ids": ["token_id_1", ...]}
+    {"assets_ids": ["token_id_1", ...], "type": "Market"}
   Messages received:
     book update:  {"event_type": "book", "asset_id": "...", "bids": [...], "asks": [...]}
     price update: {"event_type": "price_change", ...}
@@ -117,34 +117,55 @@ class CLOBWSClient:
             logger.info("CLOB WS subscribed to %d token(s): %s", len(new_ids), list(new_ids)[:3])
 
     async def _connect_and_listen(self) -> None:
-        async with websockets.connect(
-            self._ws_url,
-            ping_interval=30,
-            ping_timeout=15,
-        ) as ws:
-            self._ws = ws
-            logger.info("CLOB WS connected")
+        logger.info("CLOB_WS_CONNECT url=%s", self._ws_url)
+        try:
+            async with websockets.connect(
+                self._ws_url,
+                ping_interval=30,
+                ping_timeout=15,
+            ) as ws:
+                self._ws = ws
+                logger.info("CLOB_WS_CONNECTED url=%s", self._ws_url)
 
-            all_ids = self._subscribed_ids | self._pending_subscribe
-            if all_ids:
-                await self._send_subscribe(list(all_ids))
-                self._subscribed_ids = all_ids.copy()
-                self._pending_subscribe.clear()
-                logger.info("CLOB WS re-subscribed to %d token(s) on reconnect", len(all_ids))
+                all_ids = self._subscribed_ids | self._pending_subscribe
+                if all_ids:
+                    await self._send_subscribe(list(all_ids))
+                    self._subscribed_ids = all_ids.copy()
+                    self._pending_subscribe.clear()
 
-            async for raw_msg in ws:
-                if not self._running:
-                    break
-                await self._handle_message(raw_msg)
+                async for raw_msg in ws:
+                    if not self._running:
+                        break
+                    await self._handle_message(raw_msg)
+
+        except Exception as exc:
+            logger.warning(
+                "CLOB_WS_CONNECT_FAILED url=%s error=%s",
+                self._ws_url, exc,
+            )
+            raise
 
     async def _send_subscribe(self, token_ids: List[str]) -> None:
         if self._ws is None:
             return
-        msg = json.dumps({
-            "assets_ids": token_ids,
-            "type": "Market",
-        })
-        await self._ws.send(msg)
+        payload = {"assets_ids": token_ids, "type": "Market"}
+        msg = json.dumps(payload)
+        logger.info(
+            "CLOB_WS_SUBSCRIBE url=%s payload=%s",
+            self._ws_url, msg,
+        )
+        try:
+            await self._ws.send(msg)
+            logger.info(
+                "CLOB_WS_SUBSCRIBED token_count=%d tokens=%s",
+                len(token_ids), [t[:12] for t in token_ids],
+            )
+        except Exception as exc:
+            logger.warning(
+                "CLOB_WS_SUBSCRIBE_FAILED url=%s payload=%s error=%s",
+                self._ws_url, msg, exc,
+            )
+            raise
 
     async def _handle_message(self, raw: str) -> None:
         try:
