@@ -19,12 +19,13 @@ import time
 # ─────────────────────────────────────────────
 
 class MarketStatus:
-    PENDING   = "PENDING"     # window not yet open
-    LIVE      = "LIVE"        # window is open, inside trading period
-    EXPIRING  = "EXPIRING"    # < 30s to close
-    CLOSED    = "CLOSED"      # window closed, awaiting resolution
-    RESOLVED  = "RESOLVED"    # resolution confirmed
-    UNKNOWN   = "UNKNOWN"     # status cannot be determined
+    PENDING              = "PENDING"              # window not yet open
+    LIVE                 = "LIVE"                 # window is open, inside trading period
+    EXPIRING             = "EXPIRING"             # < 30s to close
+    AWAITING_RESOLUTION  = "AWAITING_RESOLUTION"  # window closed; polling Polymarket for winner
+    CLOSED               = "CLOSED"               # window closed, awaiting resolution (legacy)
+    RESOLVED             = "RESOLVED"             # resolution confirmed
+    UNKNOWN              = "UNKNOWN"              # status cannot be determined
 
 
 class FreshnessState:
