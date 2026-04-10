@@ -38,7 +38,9 @@ Design:
 
 from __future__ import annotations
 import asyncio
+import json
 import logging
+import os
 import time
 from dataclasses import asdict
 from typing import Dict, List, Optional, Set
@@ -50,7 +52,6 @@ from discovery.market_discovery import MarketDiscovery
 from discovery.market_registry import MarketRegistry
 from metadata.market_metadata import MetadataFetcher
 from feeds.rtds_client import RTDSClient
-from truth.market_resolver import MarketResolver
 from feeds.clob_ws_client import CLOBWSClient
 from truth.chainlink_state import ChainlinkState
 from truth.window_clock import WindowClock
@@ -105,13 +106,12 @@ class Runner:
         )
         self._registry = MarketRegistry()
 
-        # Post-close Polymarket resolution poller (replaces local Chainlink settlement)
-        disc_cfg = config.get("discovery", {})
-        self._resolver = MarketResolver(
-            gamma_api_url=disc_cfg.get("gamma_api_url", "https://gamma-api.polymarket.com"),
-            poll_interval_secs=config.get("resolution", {}).get("poll_interval_secs", 10.0),
-            max_poll_secs=config.get("resolution", {}).get("max_poll_secs", 300.0),
+        # Backlog: path for unresolved window records (settled later by backfill.py)
+        log_cfg = config.get("logging", {})
+        self._backlog_path = os.path.join(
+            log_cfg.get("log_dir", "logs"), "backlog.jsonl"
         )
+        os.makedirs(os.path.dirname(self._backlog_path), exist_ok=True)
 
         # Metadata
         meta_cfg = config.get("metadata", {})
@@ -413,36 +413,29 @@ class Runner:
                 await self._clob_ws.subscribe({identity.up_token_id, identity.down_token_id})
 
             if clock.should_fire_close():
-                # ── Chainlink capture: diagnostic only, NOT used for settlement ──
+                # Chainlink close capture: diagnostic reference only
                 tracker.capture_close(chainlink)
-                # Record Chainlink coverage for cadence report
                 self._window_coverage.append({
-                    "condition_id": cid,
-                    "open_ok":      tracker.truth.chainlink_open_ok,
-                    "close_ok":     tracker.truth.chainlink_close_ok,
-                    "open_price":   tracker.truth.chainlink_open,
-                    "close_price":  tracker.truth.chainlink_close,
-                    "chainlink_outcome": tracker.truth.outcome,  # diagnostic only
+                    "condition_id":      cid,
+                    "open_ok":           tracker.truth.chainlink_open_ok,
+                    "close_ok":          tracker.truth.chainlink_close_ok,
+                    "open_price":        tracker.truth.chainlink_open,
+                    "close_price":       tracker.truth.chainlink_close,
+                    "chainlink_outcome": tracker.truth.outcome,
                 })
                 self._elog.log_window_close(
                     condition_id=cid,
                     window_start_ts=identity.window_start_ts,
                     chainlink_close=tracker.truth.chainlink_close,
                     chainlink_ok=tracker.truth.chainlink_close_ok,
-                    outcome=tracker.truth.outcome,   # diagnostic label only
+                    outcome=tracker.truth.outcome,
                     error=tracker.truth.close_capture_error,
                 )
-
-                # ── Settlement: poll Polymarket for canonical winner ──────────
-                self._registry.set_status(cid, MarketStatus.AWAITING_RESOLUTION)
-                logger.info(
-                    "[%s] AWAITING_RESOLUTION — polling Polymarket for winner",
-                    cid,
-                )
-                asyncio.create_task(
-                    self._poll_and_settle(cid, identity),
-                    name=f"resolve_{cid[:12]}",
-                )
+                # Persist backlog record; settlement done later by backfill.py
+                self._write_backlog(cid, identity, tracker, entry)
+                self._registry.set_status(cid, MarketStatus.AWAITING_BACKFILL)
+                logger.info("[%s] AWAITING_BACKFILL — record written to %s", cid, self._backlog_path)
+                self._n_windows_unresolved += 1   # will be corrected by backfill run
                 continue
 
             # Skip if market is closed/resolved/awaiting Polymarket settlement
@@ -515,50 +508,36 @@ class Runner:
                         if trade:
                             self._elog.log_paper_trade_open(asdict(trade))
 
-    async def _poll_and_settle(self, condition_id: str, identity) -> None:
+    def _write_backlog(self, condition_id: str, identity, tracker, entry) -> None:
         """
-        Poll Polymarket Gamma until resolved winner is available, then settle.
-        Runs as a background asyncio task spawned at window close.
-        Settlement source: Polymarket canonical winner, not local Chainlink.
+        Persist all fields needed for post-session backfill settlement.
+        Written as one JSON line to backlog.jsonl.
+        Settlement is performed later by: python tools/backfill.py
         """
+        hyps = self._window_hypotheticals.get(condition_id, [])
+        meta = entry.metadata
+        record = {
+            "status":             "awaiting_backfill",
+            "recorded_at":        time.time(),
+            "condition_id":       condition_id,
+            "slug":               getattr(identity, "slug", None),
+            "up_token_id":        identity.up_token_id,
+            "down_token_id":      identity.down_token_id,
+            "window_start_ts":    identity.window_start_ts,
+            "window_end_ts":      identity.window_end_ts,
+            "fee_rate":           meta.fee_rate   if meta else None,
+            "fee_source":         meta.fee_source if meta else None,
+            "chainlink_open":     tracker.truth.chainlink_open,
+            "chainlink_open_ok":  tracker.truth.chainlink_open_ok,
+            "chainlink_close":    tracker.truth.chainlink_close,
+            "chainlink_close_ok": tracker.truth.chainlink_close_ok,
+            "hypotheticals":      [asdict(h) for h in hyps],
+        }
         try:
-            outcome = await self._resolver.resolve(
-                condition_id=condition_id,
-                up_token_id=identity.up_token_id,
-                down_token_id=identity.down_token_id,
-                slug=getattr(identity, "slug", None),
-            )
-
-            logger.info(
-                "[%s] SETTLEMENT outcome=%s source=polymarket_winner",
-                condition_id, outcome,
-            )
-            self._elog.log_resolution(
-                condition_id=condition_id,
-                window_start_ts=identity.window_start_ts,
-                outcome=outcome,
-                chainlink_open=None,   # not used for canonical settlement
-                chainlink_close=None,
-            )
-
-            self._resolve_window(condition_id, outcome)
-
-            if is_paper_active(self.mode):
-                closed = self._paper_exec.close_all_for_market(condition_id, outcome)
-                for t in closed:
-                    self._elog.log_paper_trade_close(asdict(t))
-
-            if outcome == ResolutionOutcome.UNRESOLVED:
-                self._n_windows_unresolved += 1
-            else:
-                self._n_windows_resolved += 1
-
-            self._registry.mark_resolved(condition_id)
-
-        except asyncio.CancelledError:
-            logger.info("[%s] Resolution poll cancelled (shutdown)", condition_id)
-        except Exception as exc:
-            logger.error("[%s] Resolution poll error: %s", condition_id, exc)
+            with open(self._backlog_path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        except OSError as exc:
+            logger.error("Failed to write backlog for %s: %s", condition_id, exc)
 
     def _resolve_window(self, condition_id: str, outcome: str) -> None:
         hyps = self._window_hypotheticals.pop(condition_id, [])
