@@ -349,6 +349,33 @@ class MarketDiscovery:
             )
             return None
 
+        # ── Fee (pre-resolve from Gamma; MetadataFetcher uses this first) ───
+        gamma_fee_rate   = None
+        gamma_fee_source = None
+
+        fee_sched = item.get("feeSchedule")
+        if isinstance(fee_sched, dict):
+            rate_raw = fee_sched.get("rate")
+            if rate_raw is not None:
+                try:
+                    gamma_fee_rate   = float(rate_raw)
+                    gamma_fee_source = "gamma:feeSchedule.rate"
+                except (ValueError, TypeError):
+                    pass
+
+        if gamma_fee_rate is None:
+            # takerBaseFee preferred (feeSchedule.takerOnly=true for BTC 5m)
+            taker_raw = item.get("takerBaseFee")
+            maker_raw = item.get("makerBaseFee")
+            bps_raw   = taker_raw if taker_raw is not None else maker_raw
+            src_label = "takerBaseFee" if taker_raw is not None else "makerBaseFee"
+            if bps_raw is not None:
+                try:
+                    gamma_fee_rate   = float(bps_raw) / 10000.0
+                    gamma_fee_source = f"gamma:{src_label}"
+                except (ValueError, TypeError):
+                    pass
+
         # ── Identity ─────────────────────────────────────────────────────────
         condition_id = (
             item.get("conditionId") or item.get("condition_id")
@@ -364,4 +391,6 @@ class MarketDiscovery:
             window_end_ts=end_ts,
             slug=item.get("slug") or slug,
             raw_end_date=str(raw_end or ""),
+            gamma_fee_rate=gamma_fee_rate,
+            gamma_fee_source=gamma_fee_source,
         )

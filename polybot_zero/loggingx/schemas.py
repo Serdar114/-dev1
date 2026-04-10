@@ -114,6 +114,9 @@ class MarketIdentity:
     window_end_ts:   float  # UTC unix
     slug:           Optional[str] = None
     raw_end_date:   Optional[str] = None  # original string from API, for audit
+    # Fee data pre-resolved from Gamma discovery (decimal, e.g. 0.072)
+    gamma_fee_rate:   Optional[float] = None
+    gamma_fee_source: Optional[str]  = None
 
 
 @dataclass

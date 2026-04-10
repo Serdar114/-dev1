@@ -257,6 +257,8 @@ class Runner:
             condition_id=identity.condition_id,
             up_token_id=identity.up_token_id,
             down_token_id=identity.down_token_id,
+            gamma_fee_rate=getattr(identity, "gamma_fee_rate", None),
+            gamma_fee_source=getattr(identity, "gamma_fee_source", None),
         )
         self._registry.set_metadata(identity.condition_id, meta)
 

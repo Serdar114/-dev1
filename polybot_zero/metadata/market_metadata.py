@@ -70,6 +70,8 @@ class MetadataFetcher:
         condition_id: str,
         up_token_id: Optional[str] = None,
         down_token_id: Optional[str] = None,
+        gamma_fee_rate: Optional[float] = None,
+        gamma_fee_source: Optional[str] = None,
     ) -> MarketMetadata:
         """
         Fetch metadata for one market including per-token fee rates.
@@ -96,8 +98,12 @@ class MetadataFetcher:
                     data: Dict[str, Any] = await resp.json()
                     meta = self._parse_market(meta, data)
 
-                # Fetch fee rates per token_id
-                await self._fetch_fee_rates(session, meta, up_token_id, down_token_id)
+                # Fetch fee rates — Gamma data has precedence over /fee-rate endpoint
+                await self._fetch_fee_rates(
+                    session, meta, up_token_id, down_token_id,
+                    gamma_fee_rate=gamma_fee_rate,
+                    gamma_fee_source=gamma_fee_source,
+                )
 
         except asyncio.TimeoutError:
             meta.fetch_error = "timeout"
@@ -151,34 +157,43 @@ class MetadataFetcher:
         meta: MarketMetadata,
         up_token_id: Optional[str],
         down_token_id: Optional[str],
+        gamma_fee_rate: Optional[float] = None,
+        gamma_fee_source: Optional[str] = None,
     ) -> None:
         """
-        Fetch feeRateBps from /fee-rate?token_id for each token.
-        Sets meta.fee_rate_bps and meta.fee_source.
-        If tokens are None (not provided), fee provenance stays UNRESOLVED.
+        Resolve fee rate using precedence:
+          a) gamma feeSchedule.rate  (decimal from discovery)
+          b) gamma takerBaseFee / makerBaseFee  (bps/10000 from discovery)
+          c) /fee-rate?token_id endpoint base_fee
+          d) UNRESOLVED if all above missing
         """
-        if up_token_id is None and down_token_id is None:
-            logger.warning(
-                "[%s] No token IDs provided — cannot fetch fee rates",
-                meta.condition_id,
+        # ── Sources (a) and (b): pre-resolved from Gamma during discovery ────
+        if gamma_fee_rate is not None:
+            meta.fee_rate   = gamma_fee_rate
+            meta.fee_source = gamma_fee_source or "gamma"
+            logger.info(
+                "[%s] FEE_RESOLVED source=%s fee_rate=%.4f (%.1f bps)",
+                meta.condition_id, meta.fee_source,
+                gamma_fee_rate, gamma_fee_rate * 10000,
             )
+            return
+
+        # ── Source (c): /fee-rate?token_id endpoint ──────────────────────────
+        if up_token_id is None and down_token_id is None:
+            logger.warning("[%s] No token IDs — cannot fetch fee rates", meta.condition_id)
             meta.fee_rate = None
             meta.fee_source = None
             return
 
-        up_bps = await self._fetch_one_fee_rate(session, up_token_id) if up_token_id else None
+        up_bps   = await self._fetch_one_fee_rate(session, up_token_id)   if up_token_id   else None
         down_bps = await self._fetch_one_fee_rate(session, down_token_id) if down_token_id else None
 
         if up_bps is None and down_bps is None:
-            logger.warning(
-                "[%s] fee-rate fetch failed for both tokens — UNRESOLVED",
-                meta.condition_id,
-            )
+            logger.warning("[%s] fee-rate fetch failed for both tokens — UNRESOLVED", meta.condition_id)
             meta.fee_rate = None
             meta.fee_source = None
             return
 
-        # Warn on mismatch; use the higher for conservative fee estimation
         if up_bps is not None and down_bps is not None and up_bps != down_bps:
             logger.warning(
                 "[%s] Fee rate mismatch: up_bps=%d down_bps=%d — using higher",
@@ -188,11 +203,11 @@ class MetadataFetcher:
         else:
             bps = up_bps if up_bps is not None else down_bps
 
-        meta.fee_rate = bps / 10000.0
-        meta.fee_source = f"fee_rate_endpoint:token"
+        meta.fee_rate   = bps / 10000.0
+        meta.fee_source = "clob:/fee-rate:base_fee"
         logger.info(
-            "[%s] fee_rate_bps=%d (%.4f) from /fee-rate endpoint",
-            meta.condition_id, bps, meta.fee_rate,
+            "[%s] FEE_RESOLVED source=%s fee_rate=%.4f (%.1f bps)",
+            meta.condition_id, meta.fee_source, meta.fee_rate, float(bps),
         )
 
     async def _fetch_one_fee_rate(self, session, token_id: str) -> Optional[int]:
