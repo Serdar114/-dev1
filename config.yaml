@@ -1,0 +1,60 @@
+# polybot_zero configuration
+# ALL truth-critical fields must be explicitly set.
+# Fallback fields are marked and tracked in provenance.
+
+polymarket:
+  gamma_base: "https://gamma-api.polymarket.com"
+  clob_base: "https://clob.polymarket.com"
+  market_ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+  # Try these prefixes in order when building slugs
+  slug_prefixes:
+    - "btc-up-down-5m"
+    - "btc-updown-5m"
+  window_seconds: 300
+  # Fallback search tag if exact slug not found
+  search_tag: "btc"
+  search_limit: 20
+
+chainlink:
+  polygon_rpc: "https://polygon-rpc.com"
+  # BTC/USD aggregator on Polygon Mainnet (AggregatorV3Interface)
+  btc_usd_address: "0xc907E116054Ad103354f2D350FD2514433D57F6F"
+  decimals: 8
+  poll_interval_seconds: 5
+  # If oracle updatedAt is older than this, mark STALE => no-trade
+  max_age_seconds: 120
+  # Sanity range: reject if price outside this window
+  price_min: 10000.0
+  price_max: 500000.0
+
+binance:
+  symbol: "BTCUSDT"
+  ws_url: "wss://stream.binance.com:9443/ws/btcusdt@bookTicker"
+  rest_fallback_url: "https://api.binance.com/api/v3/ticker/bookTicker?symbol=BTCUSDT"
+  # If last update older than this, mark stale (display only, never canonical truth)
+  max_age_seconds: 30
+
+measurement:
+  log_dir: "logs"
+  log_file: "logs/measurement.jsonl"
+  # Minimum seconds remaining in window to consider a hypothetical entry
+  min_secs_to_expiry: 60
+  # If |basis_pct| exceeds this, log basis_unstable (still records, does not trade)
+  basis_warn_pct: 0.5
+  # If pair_sum (best_ask_up + best_ask_down) outside this range, log pair_sum_bad
+  pair_sum_min: 0.98
+  pair_sum_max: 1.06
+  # If spread for either side > this, log spread_wide
+  max_spread: 0.05
+
+paper:
+  enabled: false
+  max_per_window: 1
+  max_open_positions: 1
+  # Fee rate used ONLY if canonical fee unavailable. Provenance marked "config_default".
+  default_taker_fee_rate: 0.02
+  # Minimum hypothetical edge (net expected payoff per unit) to consider entry
+  min_edge: 0.01
+
+modes:
+  default: "measurement"
