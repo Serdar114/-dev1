@@ -188,6 +188,10 @@ class Runner:
         self._n_hypothetical_entries  = 0
         self._n_chainlink_stale       = 0
 
+        # Chainlink freshness transition tracking (log on state change only)
+        self._chainlink_was_fresh: Optional[bool] = None
+        self._last_freshness_log_ts: float = 0.0
+
         # Per-window hypothetical tracking
         self._window_hypotheticals: Dict[str, list] = {}
 
@@ -295,16 +299,50 @@ class Runner:
         """Process one tick for all tracked markets."""
         chainlink = self._chainlink_state.latest()
         binance   = self._rtds.binance_latest()
+        now       = time.time()
 
-        # Log Chainlink gap/stale events
-        if chainlink is None or chainlink.freshness != FreshnessState.FRESH:
+        # ── Chainlink freshness — log on transition only, plus 60s heartbeat ─
+        chainlink_is_fresh = (
+            chainlink is not None and chainlink.freshness == FreshnessState.FRESH
+        )
+        if not chainlink_is_fresh:
             self._n_chainlink_stale += 1
-            self._elog.log_chainlink_stale(
-                last_updated_at=chainlink.updated_at if chainlink else None,
-                age_secs=chainlink.age_secs() if chainlink else None,
-            )
-        elif self._chainlink_state.gap_flag:
-            logger.debug("Chainlink gap_flag=True (silent > threshold)")
+
+        if self._chainlink_was_fresh is None:
+            # First tick: initialise silently; emit one INFO if already fresh
+            if chainlink_is_fresh:
+                logger.info(
+                    "Chainlink ready: price=%.2f freshness=FRESH",
+                    chainlink.price_usd,
+                )
+            self._chainlink_was_fresh = chainlink_is_fresh
+        elif chainlink_is_fresh != self._chainlink_was_fresh:
+            if chainlink_is_fresh:
+                logger.info(
+                    "Chainlink STALE → FRESH price=%.2f",
+                    chainlink.price_usd,
+                )
+            else:
+                state_str = chainlink.freshness if chainlink else FreshnessState.MISSING
+                age = chainlink.age_secs() if chainlink else None
+                logger.warning("Chainlink FRESH → %s age=%.1fs", state_str, age or -1)
+                self._elog.log_chainlink_stale(
+                    last_updated_at=chainlink.updated_at if chainlink else None,
+                    age_secs=age,
+                )
+            self._chainlink_was_fresh = chainlink_is_fresh
+
+        # Periodic heartbeat (every 60s)
+        if now - self._last_freshness_log_ts >= 60.0:
+            self._last_freshness_log_ts = now
+            if chainlink:
+                logger.info(
+                    "Chainlink heartbeat: price=%.2f age=%.1fs freshness=%s gap=%s",
+                    chainlink.price_usd, chainlink.age_secs(),
+                    chainlink.freshness, self._chainlink_state.gap_flag,
+                )
+            else:
+                logger.info("Chainlink heartbeat: no data yet")
 
         for entry in self._registry.all_markets():
             cid = entry.condition_id

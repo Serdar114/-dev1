@@ -167,7 +167,7 @@ class MarketDiscovery:
                 identity = await self._gamma_lookup(session, slug, window_ts)
                 if identity and identity.condition_id not in found:
                     found[identity.condition_id] = identity
-                    logger.info(
+                    logger.debug(
                         "SLUG_HIT slug=%s condition_id=%s "
                         "up_token=%s down_token=%s window=[%.0f,%.0f]",
                         slug, identity.condition_id,
@@ -184,7 +184,10 @@ class MarketDiscovery:
                 slugs_tried, self._gamma_base,
             )
 
-        logger.info("Discovery: %d market(s) found this cycle", len(found))
+        if found:
+            logger.info("Discovery: %d market(s) found this cycle", len(found))
+        else:
+            logger.debug("Discovery: 0 markets found this cycle")
         return list(found.values())
 
     async def _gamma_lookup(

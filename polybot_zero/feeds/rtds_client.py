@@ -95,11 +95,13 @@ class RTDSClient:
         self._ping_interval   = ping_interval_secs
 
         self._chainlink_raw_price: Optional[float] = None
-        self._chainlink_raw_ts: Optional[float] = None    # unix seconds
+        self._chainlink_raw_ts: Optional[float] = None      # oracle round timestamp (for audit)
+        self._chainlink_last_seen_wall: Optional[float] = None  # wall-clock at message receipt
         self._chainlink_update_count: int = 0
 
         self._binance_raw_price: Optional[float] = None
         self._binance_raw_ts: Optional[float] = None
+        self._binance_last_seen_wall: Optional[float] = None
         self._binance_update_count: int = 0
 
         self._running = False
@@ -244,21 +246,23 @@ class RTDSClient:
             )
             return
         try:
-            price = float(value)
-            ts    = float(ts_ms) / 1000.0 if ts_ms else time.time()
+            price    = float(value)
+            ts       = float(ts_ms) / 1000.0 if ts_ms else time.time()
+            wall_now = time.time()
             if is_chainlink:
-                self._chainlink_raw_price = price
-                self._chainlink_raw_ts    = ts
-                self._chainlink_update_count += 1
-                # INFO on first update only; subsequent updates are DEBUG
+                self._chainlink_raw_price      = price
+                self._chainlink_raw_ts         = ts          # oracle round timestamp
+                self._chainlink_last_seen_wall = wall_now    # wall-clock for freshness
+                self._chainlink_update_count  += 1
                 if self._chainlink_update_count == 1:
                     logger.info("RTDS_CHAINLINK first update BTC/USD=%.2f ts=%.3f", price, ts)
                 else:
                     logger.debug("RTDS_CHAINLINK BTC/USD=%.2f ts=%.3f", price, ts)
             else:
-                self._binance_raw_price = price
-                self._binance_raw_ts    = ts
-                self._binance_update_count += 1
+                self._binance_raw_price      = price
+                self._binance_raw_ts         = ts
+                self._binance_last_seen_wall = wall_now
+                self._binance_update_count  += 1
                 if self._binance_update_count == 1:
                     logger.info("RTDS_BINANCE first update BTC/USDT=%.2f ts=%.3f", price, ts)
                 else:
@@ -273,18 +277,22 @@ class RTDSClient:
         """
         Return latest Chainlink price with freshness computed at read time.
         Returns None if no data received yet.
+
+        Freshness is based on wall-clock receipt time, NOT the oracle round timestamp.
+        Oracle rounds occur every ~15 min; RTDS streams them continuously.
+        We care whether the RTDS stream is alive, not whether the oracle has recently settled.
         """
-        if self._chainlink_raw_price is None or self._chainlink_raw_ts is None:
+        if self._chainlink_raw_price is None or self._chainlink_last_seen_wall is None:
             return None
 
         freshness = check_freshness(
-            last_updated_ts=self._chainlink_raw_ts,
+            last_updated_ts=self._chainlink_last_seen_wall,  # wall-clock receipt time
             max_age_secs=self._chainlink_staleness,
         )
         return ChainlinkPrice(
             price_usd=self._chainlink_raw_price,
-            round_id=0,          # RTDS does not expose round IDs
-            updated_at=self._chainlink_raw_ts,
+            round_id=0,                          # RTDS does not expose round IDs
+            updated_at=self._chainlink_raw_ts,   # oracle round timestamp (audit only)
             fetched_at=time.time(),
             freshness=freshness,
             source="rtds_chainlink_btcusd",
@@ -313,8 +321,8 @@ class RTDSClient:
         )
 
     def chainlink_last_ts(self) -> Optional[float]:
-        """Return unix timestamp of last Chainlink update, or None."""
-        return self._chainlink_raw_ts
+        """Return wall-clock time of last Chainlink message receipt, or None."""
+        return self._chainlink_last_seen_wall
 
     def is_chainlink_fresh(self) -> bool:
         p = self.chainlink_latest()

@@ -63,8 +63,12 @@ class CLOBWSClient:
         self._on_book_update = on_book_update
 
         self._books: Dict[str, OrderBookSnapshot] = {}
-        self._subscribed_ids: Set[str] = set()
-        self._pending_subscribe: Set[str] = set()
+        # _all_known_ids: superset of every token ID ever requested — persists across reconnects
+        # _conn_subscribed: what the CURRENT connection has subscribed — cleared on disconnect
+        # _connected: True only after the initial subscribe is sent on the current connection
+        self._all_known_ids: Set[str] = set()
+        self._conn_subscribed: Set[str] = set()
+        self._connected = False
         self._ws = None
         self._running = False
 
@@ -87,7 +91,8 @@ class CLOBWSClient:
                     exc, self._reconnect_delay,
                 )
                 self._ws = None
-                self._subscribed_ids.clear()
+                self._connected = False
+                self._conn_subscribed.clear()   # connection-local state only; _all_known_ids kept
                 await asyncio.sleep(self._reconnect_delay)
 
     async def stop(self) -> None:
@@ -101,20 +106,23 @@ class CLOBWSClient:
     async def subscribe(self, token_ids: Set[str]) -> None:
         """
         Subscribe to order book updates for a set of token IDs.
-        If connected, sends subscribe message immediately.
-        If not connected, queues for next connection.
+
+        New IDs are added to _all_known_ids (persists across reconnects).
+        If currently connected, only the truly new IDs are sent to the server.
+        If not connected, IDs are queued in _all_known_ids and sent on next connect.
+        Never sends duplicate subscribe for IDs already subscribed on this connection.
         """
-        new_ids = token_ids - self._subscribed_ids
+        new_ids = token_ids - self._all_known_ids
+        self._all_known_ids.update(token_ids)
         if not new_ids:
-            return
+            return  # nothing new; no send needed
 
-        self._pending_subscribe.update(new_ids)
-
-        if self._ws is not None:
-            await self._send_subscribe(list(new_ids))
-            self._subscribed_ids.update(new_ids)
-            self._pending_subscribe -= new_ids
-            logger.info("CLOB WS subscribed to %d token(s): %s", len(new_ids), list(new_ids)[:3])
+        if self._connected:
+            unsent = new_ids - self._conn_subscribed
+            if unsent:
+                await self._send_subscribe(list(unsent))
+                self._conn_subscribed.update(unsent)
+                logger.info("CLOB WS subscribed %d new token(s): %s", len(unsent), [t[:12] for t in unsent])
 
     async def _connect_and_listen(self) -> None:
         logger.info("CLOB_WS_CONNECT url=%s", self._ws_url)
@@ -127,11 +135,13 @@ class CLOBWSClient:
                 self._ws = ws
                 logger.info("CLOB_WS_CONNECTED url=%s", self._ws_url)
 
-                all_ids = self._subscribed_ids | self._pending_subscribe
-                if all_ids:
-                    await self._send_subscribe(list(all_ids))
-                    self._subscribed_ids = all_ids.copy()
-                    self._pending_subscribe.clear()
+                # Subscribe all known IDs on this fresh connection.
+                # _connected is set AFTER send to prevent concurrent subscribe()
+                # calls from racing and sending duplicate payloads.
+                if self._all_known_ids:
+                    await self._send_subscribe(list(self._all_known_ids))
+                    self._conn_subscribed = self._all_known_ids.copy()
+                self._connected = True
 
                 async for raw_msg in ws:
                     if not self._running:
@@ -139,11 +149,11 @@ class CLOBWSClient:
                     await self._handle_message(raw_msg)
 
         except Exception as exc:
-            logger.warning(
-                "CLOB_WS_CONNECT_FAILED url=%s error=%s",
-                self._ws_url, exc,
-            )
+            logger.warning("CLOB_WS_CONNECT_FAILED url=%s error=%s", self._ws_url, exc)
             raise
+        finally:
+            self._connected = False
+            self._conn_subscribed.clear()
 
     async def _send_subscribe(self, token_ids: List[str]) -> None:
         if self._ws is None:

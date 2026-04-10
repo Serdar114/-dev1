@@ -31,13 +31,12 @@ class MarketEntry:
         self.status_updated_at: float = time.time()
 
     def set_status(self, new_status: str) -> None:
+        if self.status == new_status:
+            return  # no-op: already in this state; suppress duplicate log
         old = self.status
         self.status = new_status
         self.status_updated_at = time.time()
-        logger.info(
-            "[%s] Status: %s → %s",
-            self.identity.condition_id, old, new_status,
-        )
+        logger.info("[%s] Status: %s → %s", self.identity.condition_id, old, new_status)
 
     @property
     def condition_id(self) -> str:
