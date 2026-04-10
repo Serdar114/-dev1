@@ -98,6 +98,7 @@ class RTDSClient:
         self._chainlink_raw_ts: Optional[float] = None      # oracle round timestamp (for audit)
         self._chainlink_last_seen_wall: Optional[float] = None  # wall-clock at message receipt
         self._chainlink_update_count: int = 0
+        self._chainlink_gaps: list = []                     # inter-update wall-clock gaps (secs)
 
         self._binance_raw_price: Optional[float] = None
         self._binance_raw_ts: Optional[float] = None
@@ -250,14 +251,22 @@ class RTDSClient:
             ts       = float(ts_ms) / 1000.0 if ts_ms else time.time()
             wall_now = time.time()
             if is_chainlink:
+                # Record inter-update gap before overwriting last_seen_wall
+                if self._chainlink_last_seen_wall is not None:
+                    gap = wall_now - self._chainlink_last_seen_wall
+                    self._chainlink_gaps.append(gap)
+                else:
+                    gap = 0.0
+
                 self._chainlink_raw_price      = price
                 self._chainlink_raw_ts         = ts          # oracle round timestamp
                 self._chainlink_last_seen_wall = wall_now    # wall-clock for freshness
                 self._chainlink_update_count  += 1
-                if self._chainlink_update_count == 1:
-                    logger.info("RTDS_CHAINLINK first update BTC/USD=%.2f ts=%.3f", price, ts)
-                else:
-                    logger.debug("RTDS_CHAINLINK BTC/USD=%.2f ts=%.3f", price, ts)
+                # Log every chainlink update at INFO (cadence observation)
+                logger.info(
+                    "RTDS_CHAINLINK BTC/USD=%.2f oracle_ts=%.3f gap=%.2fs n=%d",
+                    price, ts, gap, self._chainlink_update_count,
+                )
             else:
                 self._binance_raw_price      = price
                 self._binance_raw_ts         = ts
@@ -327,6 +336,27 @@ class RTDSClient:
     def is_chainlink_fresh(self) -> bool:
         p = self.chainlink_latest()
         return p is not None and p.freshness == FreshnessState.FRESH
+
+    def chainlink_cadence_summary(self) -> dict:
+        """
+        Return cadence stats over the full run.
+        Used by runner at shutdown for the CHAINLINK_CADENCE_SUMMARY log.
+        """
+        count = self._chainlink_update_count
+        gaps  = self._chainlink_gaps
+        if not gaps:
+            return {"count": count, "n_gaps": 0}
+
+        s = sorted(gaps)
+        n = len(s)
+        median = s[n // 2] if n % 2 == 1 else (s[n // 2 - 1] + s[n // 2]) / 2.0
+        return {
+            "count":          count,
+            "n_gaps":         n,
+            "min_gap_secs":   round(s[0],   2),
+            "median_gap_secs": round(median, 2),
+            "max_gap_secs":   round(s[-1],  2),
+        }
 
     # Legacy alias — runner.py calls .latest()
     def latest(self) -> Optional[ChainlinkPrice]:

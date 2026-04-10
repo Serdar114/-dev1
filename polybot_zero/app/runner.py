@@ -195,6 +195,9 @@ class Runner:
         # Per-window hypothetical tracking
         self._window_hypotheticals: Dict[str, list] = {}
 
+        # Per-window chainlink coverage for cadence report
+        self._window_coverage: list = []   # [{condition_id, open_ok, close_ok}]
+
     async def run(self) -> None:
         self._elog.log_system_start(self.config)
         logger.info("Runner starting — mode=%s", self.mode)
@@ -403,6 +406,15 @@ class Runner:
             if clock.should_fire_close():
                 tracker.capture_close(chainlink)
                 outcome = tracker.truth.outcome
+                # Record per-window Chainlink coverage for cadence report
+                self._window_coverage.append({
+                    "condition_id": cid,
+                    "open_ok":      tracker.truth.chainlink_open_ok,
+                    "close_ok":     tracker.truth.chainlink_close_ok,
+                    "open_price":   tracker.truth.chainlink_open,
+                    "close_price":  tracker.truth.chainlink_close,
+                    "outcome":      outcome,
+                })
 
                 self._elog.log_window_close(
                     condition_id=cid,
@@ -548,3 +560,37 @@ class Runner:
 
         self._elog.log("VERDICT", verdict)
         logger.info("Edge table:\n%s", self._edge_report.print_table(rows))
+
+        self._print_chainlink_cadence()
+
+    def _print_chainlink_cadence(self) -> None:
+        """Print Chainlink cadence observation summary."""
+        cad = self._rtds.chainlink_cadence_summary()
+        n_windows = len(self._window_coverage)
+        n_both_ok = sum(1 for w in self._window_coverage if w["open_ok"] and w["close_ok"])
+        n_open_ok = sum(1 for w in self._window_coverage if w["open_ok"])
+        n_close_ok = sum(1 for w in self._window_coverage if w["close_ok"])
+
+        print("\n" + "=" * 60)
+        print("CHAINLINK CADENCE SUMMARY")
+        print("=" * 60)
+        print(f"Total updates received : {cad.get('count', 0)}")
+        if cad.get("n_gaps", 0) > 0:
+            print(f"Inter-update gaps      : min={cad['min_gap_secs']:.2f}s  "
+                  f"median={cad['median_gap_secs']:.2f}s  "
+                  f"max={cad['max_gap_secs']:.2f}s  "
+                  f"(n={cad['n_gaps']})")
+        else:
+            print("Inter-update gaps      : insufficient data (0-1 updates)")
+        print(f"Windows resolved       : {n_windows}")
+        if n_windows:
+            print(f"  open captured ok     : {n_open_ok}/{n_windows}")
+            print(f"  close captured ok    : {n_close_ok}/{n_windows}")
+            print(f"  both open+close ok   : {n_both_ok}/{n_windows}")
+            for w in self._window_coverage:
+                print(
+                    f"  {w['condition_id'][:16]}  "
+                    f"open_ok={w['open_ok']}  close_ok={w['close_ok']}  "
+                    f"outcome={w['outcome']}"
+                )
+        print("=" * 60)

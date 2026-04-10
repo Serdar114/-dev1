@@ -9,7 +9,7 @@ Design:
 
   WebSocket URL: wss://ws-subscriptions-clob.polymarket.com/ws/market
   Subscribe message:
-    {"assets_ids": ["token_id_1", ...], "type": "Market"}
+    {"assets_ids": ["token_id_1", ...], "type": "market"}
   Messages received:
     book update:  {"event_type": "book", "asset_id": "...", "bids": [...], "asks": [...]}
     price update: {"event_type": "price_change", ...}
@@ -158,7 +158,7 @@ class CLOBWSClient:
     async def _send_subscribe(self, token_ids: List[str]) -> None:
         if self._ws is None:
             return
-        payload = {"assets_ids": token_ids, "type": "Market"}
+        payload = {"assets_ids": token_ids, "type": "market"}
         msg = json.dumps(payload)
         logger.info(
             "CLOB_WS_SUBSCRIBE url=%s payload=%s",
