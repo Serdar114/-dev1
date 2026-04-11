@@ -24,17 +24,17 @@ from state import MarketMetadata
 # ---------------------------------------------------------------------------
 
 def test_canonical_fee_used_when_available():
-    meta = MarketMetadata(taker_fee_rate=0.02, fee_provenance="gamma_fee_schedule",
+    meta = MarketMetadata(taker_fee_rate=0.02, fee_provenance="canonical_market_object",
                           fee_schedule_present=True)
     econ = compute_economics(entry_price=0.50, metadata=meta, fallback_fee_rate=0.99)
     assert econ.fee_rate == 0.02
-    assert econ.fee_provenance == "gamma_fee_schedule"
+    assert econ.fee_provenance == "canonical_market_object"
 
 
 def test_fallback_fee_used_when_metadata_none():
     econ = compute_economics(entry_price=0.50, metadata=None, fallback_fee_rate=0.02)
     assert econ.fee_rate == 0.02
-    assert econ.fee_provenance == "config_default"
+    assert econ.fee_provenance == "fallback_config"
 
 
 def test_fallback_fee_used_when_fee_missing_in_metadata():
@@ -44,9 +44,9 @@ def test_fallback_fee_used_when_fee_missing_in_metadata():
     assert econ.fee_provenance == "missing"
 
 
-def test_provenance_config_default_not_canonical():
+def test_provenance_fallback_not_canonical():
     econ = compute_economics(entry_price=0.50, metadata=None, fallback_fee_rate=0.02)
-    assert econ.fee_provenance not in ("canonical", "gamma_fee_schedule", "clob_response")
+    assert econ.fee_provenance not in ("canonical_market_object", "missing")
 
 
 # ---------------------------------------------------------------------------
@@ -55,14 +55,14 @@ def test_provenance_config_default_not_canonical():
 
 def test_fee_per_unit_at_mid_price():
     """At p=0.50, fee_per_unit = 0.02 * 0.25 = 0.005 (not flat 0.02)."""
-    meta = MarketMetadata(taker_fee_rate=0.02, fee_provenance="gamma_fee_schedule")
+    meta = MarketMetadata(taker_fee_rate=0.02, fee_provenance="canonical_market_object")
     econ = compute_economics(entry_price=0.50, metadata=meta, fallback_fee_rate=0.0)
     assert abs(econ.fee_per_unit - 0.005) < 1e-9
 
 
 def test_fee_per_unit_lower_at_extreme_price():
     """At p=0.10, fee = 0.02 * 0.09 = 0.0018 — much lower than at p=0.50."""
-    meta = MarketMetadata(taker_fee_rate=0.02, fee_provenance="gamma_fee_schedule")
+    meta = MarketMetadata(taker_fee_rate=0.02, fee_provenance="canonical_market_object")
     econ_mid = compute_economics(entry_price=0.50, metadata=meta, fallback_fee_rate=0.0)
     econ_low = compute_economics(entry_price=0.10, metadata=meta, fallback_fee_rate=0.0)
     assert econ_low.fee_per_unit < econ_mid.fee_per_unit
@@ -70,7 +70,7 @@ def test_fee_per_unit_lower_at_extreme_price():
 
 def test_fee_maximised_at_p_half():
     """p=0.50 is where fee_per_unit = rate/4 (global maximum of p*(1-p))."""
-    meta = MarketMetadata(taker_fee_rate=0.02, fee_provenance="gamma_fee_schedule")
+    meta = MarketMetadata(taker_fee_rate=0.02, fee_provenance="canonical_market_object")
     prices = [0.10, 0.25, 0.40, 0.50, 0.60, 0.75, 0.90]
     fees = [compute_economics(p, meta, 0.0).fee_per_unit for p in prices]
     max_idx = fees.index(max(fees))
@@ -82,7 +82,7 @@ def test_fee_maximised_at_p_half():
 # ---------------------------------------------------------------------------
 
 def test_net_payoff_formula_at_mid():
-    meta = MarketMetadata(taker_fee_rate=0.02, fee_provenance="gamma_fee_schedule")
+    meta = MarketMetadata(taker_fee_rate=0.02, fee_provenance="canonical_market_object")
     econ = compute_economics(entry_price=0.50, metadata=meta, fallback_fee_rate=0.0)
     # fee_per_unit = 0.005
     assert abs(econ.net_payoff_if_win  - 0.495) < 1e-7
@@ -91,14 +91,14 @@ def test_net_payoff_formula_at_mid():
 
 def test_net_lose_includes_fee():
     """net_payoff_if_lose must be -(p + fee_per_unit), not just -p."""
-    meta = MarketMetadata(taker_fee_rate=0.02, fee_provenance="gamma_fee_schedule")
+    meta = MarketMetadata(taker_fee_rate=0.02, fee_provenance="canonical_market_object")
     econ = compute_economics(entry_price=0.50, metadata=meta, fallback_fee_rate=0.0)
     assert econ.net_payoff_if_lose < -0.50  # strictly worse than -p alone
 
 
 def test_net_payoff_formula_at_low_price():
     """p=0.10, rate=0.02: fee=0.0018, net_win=0.8982, net_lose=-0.1018."""
-    meta = MarketMetadata(taker_fee_rate=0.02, fee_provenance="gamma_fee_schedule")
+    meta = MarketMetadata(taker_fee_rate=0.02, fee_provenance="canonical_market_object")
     econ = compute_economics(entry_price=0.10, metadata=meta, fallback_fee_rate=0.0)
     expected_fee = 0.02 * 0.10 * 0.90
     assert abs(econ.fee_per_unit - expected_fee) < 1e-9
@@ -112,7 +112,7 @@ def test_net_win_always_positive_for_valid_prices():
     for any 0 < p < 1 and 0 < rate < 1.
     This differs from the flat model where high prices gave negative net_win.
     """
-    meta = MarketMetadata(taker_fee_rate=0.02, fee_provenance="gamma_fee_schedule")
+    meta = MarketMetadata(taker_fee_rate=0.02, fee_provenance="canonical_market_object")
     for p in [0.05, 0.10, 0.50, 0.90, 0.95, 0.99]:
         econ = compute_economics(entry_price=p, metadata=meta, fallback_fee_rate=0.0)
         assert econ.net_payoff_if_win > 0, f"net_win negative at p={p}"

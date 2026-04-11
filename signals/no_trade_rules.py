@@ -56,10 +56,10 @@ def evaluate(state: SystemState, config: dict) -> List[str]:
             reasons.append("min_order_size_missing")
         if meta.taker_fee_rate is None:
             reasons.append("fee_rate_missing")
-        elif meta.fee_provenance not in ("canonical", "config_default"):
-            reasons.append(f"fee_provenance_unknown:{meta.fee_provenance}")
-        # Note: "config_default" fee is allowed but flagged in the hypothetical entry log.
-        # "canonical" is preferred. "missing" blocks.
+        elif meta.fee_provenance == "missing":
+            reasons.append("fee_provenance_missing")
+        # Note: "fallback_config" is allowed but flagged in the hypothetical entry log.
+        # "canonical_market_object" is preferred. "missing" blocks.
 
     # -----------------------------------------------------------------------
     # 3. Orderbook availability

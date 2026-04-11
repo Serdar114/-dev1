@@ -42,7 +42,7 @@ class FillEconomics:
     entry_price: float
     fee_rate: float
     fee_per_unit: float        # feeRate * p * (1 - p) — the actual fee charged
-    fee_provenance: str        # "gamma_fee_schedule" | "clob_response" | "config_default" | "missing"
+    fee_provenance: str        # "canonical_market_object" | "fallback_config" | "missing"
     net_payoff_if_win: float   # 1 - p - fee_per_unit
     net_payoff_if_lose: float  # -(p + fee_per_unit)
     size_usdc: float
@@ -68,7 +68,7 @@ def compute_economics(
         fee_provenance = metadata.fee_provenance
     else:
         fee_rate = fallback_fee_rate
-        fee_provenance = "config_default" if metadata is None else "missing"
+        fee_provenance = "fallback_config" if metadata is None else "missing"
 
     # Official formula: fee is price-dependent, not flat
     fee_per_unit = fee_rate * entry_price * (1.0 - entry_price)

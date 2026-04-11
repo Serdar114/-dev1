@@ -101,6 +101,23 @@ class Runner:
             config_summary=f"chainlink_max_age={self._config['chainlink']['max_age_seconds']}s",
         ))
 
+        # Log startup readiness requirements.
+        # System stays DEGRADED until BOTH conditions are true:
+        #   1. RTDS connected and delivering oracle-timestamped observations
+        #   2. Gamma feeSchedule.rate parsed (fee_provenance == "canonical_market_object")
+        # This is enforced by system_status_label() on every tick.
+        rtds_url = self._config.get("rtds", {}).get("ws_url", "wss://ws-live-data.polymarket.com")
+        fallback_fee = float(self._config.get("paper", {}).get("default_taker_fee_rate", 0.072))
+        log.info(
+            "Startup readiness: DEGRADED until RTDS(%s) connected AND canonical feeSchedule parsed. "
+            "Fallback fee=%.4f (fallback_config). TRUTH-TIGHT requires fee_provenance=canonical_market_object.",
+            rtds_url, fallback_fee,
+        )
+        with self._state._lock:
+            self._state.push_lifecycle(
+                f"startup: DEGRADED until rtds_connected + fee_provenance=canonical_market_object"
+            )
+
         # Launch background threads
         # RTDS starts first — it is the primary Chainlink source
         self._rtds.start()

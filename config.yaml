@@ -33,8 +33,8 @@ chainlink:
 # IMPORTANT: Verify ws_url and subscription_msg against your working sample
 # before expecting this to produce live readings.
 rtds:
-  # WebSocket endpoint — VERIFY against your working sample
-  ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+  # WebSocket endpoint — official Polymarket Real-Time Data Service
+  ws_url: "wss://ws-live-data.polymarket.com"
   # Subscription message sent on connect — VERIFY field names against working sample
   subscription_msg: '{"type": "Asset", "assets": ["BTC-USD"]}'
   # Field names in incoming price events — adjust to match actual RTDS messages
@@ -68,8 +68,9 @@ paper:
   enabled: false
   max_per_window: 1
   max_open_positions: 1
-  # Fee rate used ONLY if canonical fee unavailable. Provenance marked "config_default".
-  default_taker_fee_rate: 0.02
+  # Fee rate used ONLY if canonical fee unavailable. Provenance marked "fallback_config".
+  # Polymarket crypto market taker rate = 720 basis points = 0.072
+  default_taker_fee_rate: 0.072
   # Minimum hypothetical edge (net expected payoff per unit) to consider entry
   min_edge: 0.01
 

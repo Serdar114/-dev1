@@ -57,7 +57,7 @@ class RtdsChainlinkClient:
         rtds_cfg = config.get("rtds", {})
         self._ws_url: str = rtds_cfg.get(
             "ws_url",
-            "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+            "wss://ws-live-data.polymarket.com",
         )
         # Subscription message sent on connect. Verify against working sample.
         self._sub_msg: str = rtds_cfg.get(
@@ -142,7 +142,7 @@ class RtdsChainlinkClient:
     # -----------------------------------------------------------------------
 
     def _on_open(self, ws) -> None:
-        log.info("RTDS Chainlink connected, subscribing: %s", self._sub_msg)
+        log.info("RTDS Chainlink connected: url=%s sub=%s", self._ws_url, self._sub_msg)
         ws.send(self._sub_msg)
         self._last_heartbeat = time.time()
 

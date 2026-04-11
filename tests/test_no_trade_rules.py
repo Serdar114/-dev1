@@ -78,7 +78,7 @@ def _clean_state(window_secs_remaining=120) -> SystemState:
         min_order_size=5.0,
         min_order_size_provenance="canonical",
         taker_fee_rate=0.02,
-        fee_provenance="canonical",
+        fee_provenance="canonical_market_object",
     )
 
     # Orderbook: both sides with tight spread, good pair sum

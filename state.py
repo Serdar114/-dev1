@@ -108,11 +108,12 @@ class MarketMetadata:
     min_order_size: Optional[float] = None
     min_order_size_provenance: str = "missing"  # "canonical" | "missing"
     taker_fee_rate: Optional[float] = None
-    # fee_provenance: "gamma_fee_schedule" > "clob_response" > "config_default" > "missing"
+    # fee_provenance: "canonical_market_object" > "fallback_config" > "missing"
     fee_provenance: str = "missing"
     fee_schedule_present: bool = False          # True only when feeSchedule object found
     fees_enabled: Optional[bool] = None         # from feesEnabled field in Gamma
-    accepting_orders: Optional[bool] = None     # from enable_order_book / accepting_orders
+    accepting_orders: Optional[bool] = None     # from acceptingOrders in Gamma
+    ready: Optional[bool] = None               # from ready field in Gamma market object
     fetched_at: Optional[float] = None
     raw_clob_response: Optional[dict] = None    # stored for audit
 
@@ -125,7 +126,7 @@ class MarketMetadata:
 
     def readiness_label(self) -> str:
         if self.is_complete():
-            if self.fee_provenance == "canonical":
+            if self.fee_provenance == "canonical_market_object":
                 return "READY"
             return "READY_FEE_FALLBACK"
         missing = []

@@ -1,18 +1,23 @@
 """
 metadata/market_metadata.py — CLOB + Gamma metadata fetching.
 
-PATCH 4 — corrected fee/metadata source hierarchy.
-
 Source priority for fee rate:
-  1. Gamma feeSchedule.takerBaseFee   → provenance "gamma_fee_schedule" (best)
-  2. CLOB market response fee fields  → provenance "clob_response"
-  3. config default_taker_fee_rate    → provenance "config_default" (flagged, not blocked)
+  1. Gamma feeSchedule.rate           → provenance "canonical_market_object" (best)
+  2. CLOB market response fee fields  → provenance "canonical_market_object"
+  3. config default_taker_fee_rate    → provenance "fallback_config" (flagged, not blocked)
   4. None                             → provenance "missing" (no-trade block)
+
+Field name reference (official Gamma market object):
+  orderPriceMinTickSize  — tick size
+  orderMinSize           — minimum order size
+  acceptingOrders        — market is accepting orders
+  ready                  — market is ready to trade
 
 New fields tracked per-record:
   fee_schedule_present   — True only when a feeSchedule object was found
   fees_enabled           — from feesEnabled in Gamma response
-  accepting_orders       — from enable_order_book / accepting_orders in CLOB
+  accepting_orders       — from acceptingOrders in Gamma / enable_order_book in CLOB
+  ready                  — from ready in Gamma market object
 
 No-trade if:
   tick_size is None, min_order_size is None, or fee provenance == "missing"
@@ -68,28 +73,44 @@ class MarketMetadataFetcher:
             meta.raw_clob_response = clob_data
             meta.fetched_at = time.time()
 
-            # --- tick_size (CLOB is canonical source) ---
-            raw_tick = clob_data.get("minimum_tick_size") or clob_data.get("tick_size")
+            # --- tick_size: prefer Gamma orderPriceMinTickSize, fall back to CLOB ---
+            raw_tick = (
+                (gamma_data or {}).get("orderPriceMinTickSize")
+                or clob_data.get("minimum_tick_size")
+                or clob_data.get("tick_size")
+            )
             if raw_tick is not None:
                 try:
                     meta.tick_size = float(raw_tick)
-                    meta.tick_size_provenance = "canonical"
+                    meta.tick_size_provenance = "canonical_market_object"
                 except (TypeError, ValueError):
                     log.warning("Could not parse tick_size: %s", raw_tick)
 
-            # --- min_order_size (CLOB is canonical source) ---
-            raw_min = clob_data.get("minimum_order_size") or clob_data.get("min_order_size")
+            # --- min_order_size: prefer Gamma orderMinSize, fall back to CLOB ---
+            raw_min = (
+                (gamma_data or {}).get("orderMinSize")
+                or clob_data.get("minimum_order_size")
+                or clob_data.get("min_order_size")
+            )
             if raw_min is not None:
                 try:
                     meta.min_order_size = float(raw_min)
-                    meta.min_order_size_provenance = "canonical"
+                    meta.min_order_size_provenance = "canonical_market_object"
                 except (TypeError, ValueError):
                     log.warning("Could not parse min_order_size: %s", raw_min)
 
-            # --- accepting_orders ---
-            raw_active = clob_data.get("enable_order_book") or clob_data.get("accepting_orders")
+            # --- accepting_orders: prefer Gamma acceptingOrders, fall back to CLOB ---
+            raw_active = (
+                (gamma_data or {}).get("acceptingOrders")
+                if gamma_data is not None and "acceptingOrders" in gamma_data
+                else clob_data.get("enable_order_book") or clob_data.get("accepting_orders")
+            )
             if raw_active is not None:
                 meta.accepting_orders = bool(raw_active)
+
+            # --- ready (Gamma only) ---
+            if gamma_data is not None and "ready" in gamma_data:
+                meta.ready = bool(gamma_data["ready"])
 
             # --- fee: try sources in priority order ---
             # Priority 1: Gamma feeSchedule (most canonical)
@@ -99,9 +120,9 @@ class MarketMetadataFetcher:
                 meta.fees_enabled = fees_enabled
                 if gamma_fee is not None:
                     meta.taker_fee_rate = gamma_fee
-                    meta.fee_provenance = "gamma_fee_schedule"
+                    meta.fee_provenance = "canonical_market_object"
                     log.info(
-                        "Fee from Gamma feeSchedule for %s: %.6f",
+                        "Fee from Gamma feeSchedule.rate for %s: %.6f",
                         condition_id, gamma_fee,
                     )
 
@@ -110,7 +131,7 @@ class MarketMetadataFetcher:
                 clob_fee = _extract_fee_from_clob(clob_data)
                 if clob_fee is not None:
                     meta.taker_fee_rate = clob_fee
-                    meta.fee_provenance = "clob_response"
+                    meta.fee_provenance = "canonical_market_object"
                     log.info(
                         "Fee from CLOB response for %s: %.6f",
                         condition_id, clob_fee,
@@ -119,9 +140,9 @@ class MarketMetadataFetcher:
             # Priority 3: config default (fallback — provenance clearly marked)
             if meta.taker_fee_rate is None:
                 meta.taker_fee_rate = taker_fee_rate_fallback
-                meta.fee_provenance = "config_default"
+                meta.fee_provenance = "fallback_config"
                 log.info(
-                    "Fee not in Gamma or CLOB for %s; config_default=%.4f",
+                    "Fee not in Gamma or CLOB for %s; fallback_config=%.4f",
                     condition_id, taker_fee_rate_fallback,
                 )
 
@@ -150,10 +171,10 @@ class MarketMetadataFetcher:
                 meta.fees_enabled = fees_enabled
                 if gamma_fee is not None:
                     meta.taker_fee_rate = gamma_fee
-                    meta.fee_provenance = "gamma_fee_schedule"
+                    meta.fee_provenance = "canonical_market_object"
             if meta.taker_fee_rate is None:
                 meta.taker_fee_rate = taker_fee_rate_fallback
-                meta.fee_provenance = "config_default"
+                meta.fee_provenance = "fallback_config"
             meta.fetched_at = time.time()
             return meta
 
@@ -163,9 +184,12 @@ def _extract_fee_from_gamma(data: dict) -> tuple:
     Extract taker fee rate from a Gamma market object.
     Returns (fee_rate_decimal, schedule_present, fees_enabled).
 
-    feeSchedule.takerBaseFee may be:
-      - Integer basis points (e.g. 200 → 0.02)
-      - Decimal already (e.g. 0.02)
+    Official feeSchedule fields:
+      rate      — taker fee integer (e.g. 720 for 7.2%)
+      exponent  — scale divisor exponent (e.g. 4 → divide by 10^4)
+                  If absent, heuristic: value > 1 → divide by 10000.
+
+    Example: rate=720, exponent=4 → 720 / 10000 = 0.072 (crypto market rate)
     """
     fees_enabled: Optional[bool] = None
     raw_enabled = data.get("feesEnabled")
@@ -176,22 +200,40 @@ def _extract_fee_from_gamma(data: dict) -> tuple:
     if schedule is None or not isinstance(schedule, dict):
         return None, False, fees_enabled
 
-    raw_taker = schedule.get("takerBaseFee") or schedule.get("takerFee") or schedule.get("taker")
-    if raw_taker is None:
-        return None, True, fees_enabled  # schedule present but no taker fee field
+    log.debug("Gamma feeSchedule raw: %s", schedule)
+
+    # Primary field: rate. Fall back to legacy names.
+    raw_rate = (
+        schedule.get("rate")
+        or schedule.get("takerBaseFee")
+        or schedule.get("takerFee")
+        or schedule.get("taker")
+    )
+    if raw_rate is None:
+        return None, True, fees_enabled  # schedule present but no rate field
 
     try:
-        val = float(raw_taker)
-        # Normalise: if > 1, assume basis points
-        if val > 1.0:
+        val = float(raw_rate)
+        raw_exp = schedule.get("exponent")
+        if raw_exp is not None:
+            try:
+                exp = int(raw_exp)
+                val = val / (10 ** exp)
+            except (TypeError, ValueError):
+                # exponent unparseable — fall through to heuristic
+                if val > 1.0:
+                    val = val / 10000.0
+        elif val > 1.0:
+            # Heuristic: large integer → basis points with 10^4 divisor
             val = val / 10000.0
-        # Sanity: 0 to 10%
-        if 0.0 <= val <= 0.10:
+
+        # Sanity: 0 to 15% (crypto markets can be up to ~10%)
+        if 0.0 <= val <= 0.15:
             return val, True, fees_enabled
-        log.warning("Gamma feeSchedule takerBaseFee out of range: %s", raw_taker)
+        log.warning("Gamma feeSchedule rate out of range after normalization: raw=%s → %.6f", raw_rate, val)
         return None, True, fees_enabled
     except (TypeError, ValueError):
-        log.warning("Could not parse Gamma feeSchedule takerBaseFee: %s", raw_taker)
+        log.warning("Could not parse Gamma feeSchedule rate: %s", raw_rate)
         return None, True, fees_enabled
 
 
