@@ -88,6 +88,12 @@ class ChainlinkClient:
         self._stop_event = threading.Event()
         self._contract = None
         self._w3 = None
+        # Rate-limit: only log polygon_rpc warnings/updates when they change or on interval
+        self._last_warn_logged: float = 0.0        # last error/warning log time
+        self._last_logged_price: Optional[float] = None  # last price emitted to event log
+        self._last_logged_round: Optional[int] = None    # last round emitted
+        _WARN_INTERVAL = 300.0   # re-log polygon_rpc warnings at most once per 5 min
+        self._warn_interval = _WARN_INTERVAL
 
     def _log(self, event) -> None:
         if self._logger:
@@ -108,6 +114,7 @@ class ChainlinkClient:
             return False
 
     def _fetch_once(self) -> None:
+        now = time.time()
         try:
             if self._contract is None:
                 if not self._init_web3():
@@ -127,7 +134,7 @@ class ChainlinkClient:
                 ))
                 return
 
-            now = time.time()
+            now = time.time()  # reassign for precise fetch timestamp
             with self._lock:
                 self._price = price
                 self._oracle_updated_at = updated_at
@@ -139,19 +146,26 @@ class ChainlinkClient:
             if self._buffer is not None:
                 self._buffer.record(updated_at, price, now, "polygon_rpc")
 
-            self._log(ChainlinkUpdateEvent(
-                price=price,
-                oracle_updated_at=updated_at,
-                age_seconds=now - updated_at,
-                round_id=round_id,
-            ))
+            # Only emit event log when round or price changes (avoid 5s spam)
+            if round_id != self._last_logged_round or price != self._last_logged_price:
+                self._log(ChainlinkUpdateEvent(
+                    price=price,
+                    oracle_updated_at=updated_at,
+                    age_seconds=now - updated_at,
+                    round_id=round_id,
+                ))
+                self._last_logged_round = round_id
+                self._last_logged_price = price
 
         except Exception as exc:
             err = str(exc)
-            log.warning("Chainlink fetch error: %s", err)
+            # Rate-limit: only warn once per 5 minutes to avoid spam when RTDS is primary
+            if now - self._last_warn_logged >= self._warn_interval:
+                log.warning("polygon_rpc fetch error (audit path): %s", err)
+                self._log(ChainlinkErrorEvent(error=f"polygon_rpc:{err}"))
+                self._last_warn_logged = now
             with self._lock:
                 self._last_error = err
-            self._log(ChainlinkErrorEvent(error=err))
 
     def run(self) -> None:
         """Background polling loop. Run in a daemon thread."""

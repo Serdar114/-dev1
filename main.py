@@ -37,6 +37,21 @@ def setup_logging(log_dir: str) -> None:
             logging.StreamHandler(sys.stderr),
         ],
     )
+    # Suppress chatty third-party internals — keep WARNING+ only
+    for noisy in (
+        "websocket",
+        "websocket.client",
+        "urllib3",
+        "urllib3.connectionpool",
+        "requests.packages.urllib3",
+        "web3",
+        "web3.providers",
+        "web3.providers.rpc",
+        "web3.middleware",
+        "web3.RequestManager",
+        "asyncio",
+    ):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 def main() -> None:
