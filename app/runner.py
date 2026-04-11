@@ -178,7 +178,7 @@ class Runner:
             return
 
         # Fetch metadata — pass raw Gamma response so fee can be sourced from feeSchedule
-        fallback_fee = float(self._config.get("paper", {}).get("default_taker_fee_rate", 0.02))
+        fallback_fee = float(self._config.get("paper", {}).get("default_taker_fee_rate", 0.072))
         metadata = self._metadata_fetcher.fetch(
             new_market.condition_id,
             fallback_fee,
@@ -253,6 +253,9 @@ class Runner:
             chainlink_age_at_resolution=resolution.oracle_age_at_resolution,
             outcome=resolution.outcome,
             status=resolution.status,
+            close_capture_timestamp=resolution.close_capture_timestamp,
+            close_capture_source=resolution.close_capture_source,
+            seconds_before_window_end=resolution.seconds_before_window_end,
         ))
         log.info(
             "Resolution window=%d status=%s outcome=%s",
@@ -321,7 +324,7 @@ class Runner:
             ))
 
         # Record hypothetical entries when no-trade rules pass
-        fallback_fee = float(self._config.get("paper", {}).get("default_taker_fee_rate", 0.02))
+        fallback_fee = float(self._config.get("paper", {}).get("default_taker_fee_rate", 0.072))
         if not reasons and window_id != self._last_hypo_window:
             hypo_events = record_both_sides(features, meta, fallback_fee, window_id)
             for ev in hypo_events:

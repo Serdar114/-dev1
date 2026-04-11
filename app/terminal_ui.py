@@ -302,20 +302,26 @@ def _render(stdscr, snap: dict, config: dict) -> None:
 
     # ── Row 14-15: Hypothetical entries ────────────────────────────────────
     if not no_trade and meta and meta.taker_fee_rate:
-        fee = meta.taker_fee_rate
+        fee_rate = meta.taker_fee_rate
         fprov = meta.fee_provenance
         if up_ba:
-            net_win = 1.0 - up_ba[0] - fee
-            net_lose = -up_ba[0]
+            p = up_ba[0]
+            fee_pu = fee_rate * p * (1.0 - p)   # official formula: rate * p * (1-p)
+            net_win = 1.0 - p - fee_pu
+            net_lose = -(p + fee_pu)
             safe_add(row, 0,
-                f" HYPO UP  @ {up_ba[0]:.4f}  win={net_win:+.4f}  lose={net_lose:+.4f}  fee={fee*100:.2f}%({fprov})",
+                f" HYPO UP  @ {p:.4f}  win={net_win:+.4f}  lose={net_lose:+.4f}"
+                f"  fee_pu={fee_pu:.5f}  rate={fee_rate*100:.2f}%({fprov})",
                 _color(_C_WHITE))
         row += 1
         if dn_ba:
-            net_win = 1.0 - dn_ba[0] - fee
-            net_lose = -dn_ba[0]
+            p = dn_ba[0]
+            fee_pu = fee_rate * p * (1.0 - p)
+            net_win = 1.0 - p - fee_pu
+            net_lose = -(p + fee_pu)
             safe_add(row, 0,
-                f" HYPO DN  @ {dn_ba[0]:.4f}  win={net_win:+.4f}  lose={net_lose:+.4f}  fee={fee*100:.2f}%({fprov})",
+                f" HYPO DN  @ {p:.4f}  win={net_win:+.4f}  lose={net_lose:+.4f}"
+                f"  fee_pu={fee_pu:.5f}  rate={fee_rate*100:.2f}%({fprov})",
                 _color(_C_WHITE))
         row += 1
     else:

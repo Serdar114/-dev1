@@ -179,9 +179,11 @@ class HypotheticalEntryEvent(BaseEvent):
     entry_price: float = 0.0     # best ask for that side (taker)
     entry_size_usdc: float = 1.0
     fee_rate: float = 0.0
+    fee_per_unit: float = 0.0            # fee_rate * p * (1 - p)  — actual fee charged
+    effective_cost_per_unit: float = 0.0 # entry_price + fee_per_unit
     fee_provenance: str = ""
-    net_payoff_if_win: float = 0.0   # (1 - entry_price - fee_rate) per unit
-    net_payoff_if_lose: float = 0.0  # (-entry_price) per unit
+    net_payoff_if_win: float = 0.0   # 1 - entry_price - fee_per_unit
+    net_payoff_if_lose: float = 0.0  # -(entry_price + fee_per_unit)
     chainlink_price: Optional[float] = None
     binance_mid: Optional[float] = None
     basis_pct: Optional[float] = None
@@ -201,7 +203,10 @@ class ResolutionEvent(BaseEvent):
     price_at_end: Optional[float] = None
     chainlink_age_at_resolution: Optional[float] = None
     outcome: Optional[str] = None   # "Up" | "Down" | None
-    status: str = ""                # "resolved_canonical" | "stale" | "missing"
+    status: str = ""                # "resolved_canonical" | "resolved_snapshot_fallback" | "buffer_miss" | ...
+    close_capture_timestamp: Optional[float] = None   # oracle_updated_at of the captured close observation
+    close_capture_source: str = ""                    # "buffer_polygon_rpc" | "buffer_rtds" | ""
+    seconds_before_window_end: Optional[float] = None # how far before window_end the close was captured
 
 
 # ---------------------------------------------------------------------------

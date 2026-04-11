@@ -20,7 +20,7 @@ Message timestamp vs oracle timestamp:
   - Resolution NEVER uses a "rtds_msg_ts" observation as canonical close truth.
 
 Keepalive:
-  - Sends a JSON ping every rtds.heartbeat_interval_seconds (default 20s)
+  - Sends a JSON ping every rtds.heartbeat_interval_seconds (default 5s)
   - websocket-client handles TCP-level ping/pong automatically
 """
 from __future__ import annotations
@@ -67,7 +67,7 @@ class RtdsChainlinkClient:
         self._price_field: str = rtds_cfg.get("price_field", "price")
         self._oracle_ts_field: str = rtds_cfg.get("oracle_ts_field", "oracle_updated_at")
         self._msg_ts_field: str = rtds_cfg.get("msg_ts_field", "timestamp")
-        self._heartbeat_interval: float = float(rtds_cfg.get("heartbeat_interval_seconds", 20))
+        self._heartbeat_interval: float = float(rtds_cfg.get("heartbeat_interval_seconds", 5))
         self._price_min: float = float(config.get("chainlink", {}).get("price_min", 10000.0))
         self._price_max: float = float(config.get("chainlink", {}).get("price_max", 500000.0))
 
@@ -142,7 +142,7 @@ class RtdsChainlinkClient:
     # -----------------------------------------------------------------------
 
     def _on_open(self, ws) -> None:
-        log.info("RTDS Chainlink connected: url=%s sub=%s", self._ws_url, self._sub_msg)
+        log.info("RTDS connected: url=%s  subscribe=%s", self._ws_url, self._sub_msg)
         ws.send(self._sub_msg)
         self._last_heartbeat = time.time()
 
@@ -166,8 +166,27 @@ class RtdsChainlinkClient:
                 pass
 
     def _handle_event(self, event: dict) -> None:
-        """Parse a price event from RTDS. Extract price and oracle timestamp."""
-        raw_price = event.get(self._price_field)
+        """Parse an RTDS price event.
+
+        Expected shape:
+          {"type": "...", "payload": {"symbol": "BTC-USD", "value": <price>, "timestamp": <unix_ts>}}
+
+        Fields used:
+          payload.symbol    — filter: must contain "BTC" (case-insensitive)
+          payload.value     — price
+          payload.timestamp — oracle contract timestamp (canonical); source="rtds"
+                              If absent, source="rtds_msg_ts" (not eligible for resolution)
+        """
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            return
+
+        # Symbol filter: drop anything that isn't a BTC feed
+        symbol = str(payload.get("symbol", "")).upper()
+        if symbol and "BTC" not in symbol:
+            return
+
+        raw_price = payload.get("value")
         if raw_price is None:
             return
 
@@ -182,29 +201,13 @@ class RtdsChainlinkClient:
 
         now = time.time()
 
-        # Prefer oracle updatedAt; fall back to message timestamp; fall back to now
-        raw_oracle_ts = event.get(self._oracle_ts_field)
-        raw_msg_ts = event.get(self._msg_ts_field)
-
-        if raw_oracle_ts is not None:
+        raw_ts = payload.get("timestamp")
+        if raw_ts is not None:
             try:
-                oracle_ts = float(raw_oracle_ts)
-                # Sanity: oracle ts should be a unix second in plausible range
-                if oracle_ts > 1_000_000_000:
-                    source = _SRC_RTDS_ORACLE
-                else:
-                    # Might be milliseconds
-                    oracle_ts = oracle_ts / 1000.0
-                    source = _SRC_RTDS_ORACLE
-            except (TypeError, ValueError):
-                oracle_ts = now
-                source = _SRC_RTDS_MSG_TS
-        elif raw_msg_ts is not None:
-            try:
-                oracle_ts = float(raw_msg_ts)
-                if oracle_ts > 1_600_000_000_000:  # milliseconds
+                oracle_ts = float(raw_ts)
+                if oracle_ts > 1_600_000_000_000:  # milliseconds → seconds
                     oracle_ts /= 1000.0
-                source = _SRC_RTDS_MSG_TS
+                source = _SRC_RTDS_ORACLE
             except (TypeError, ValueError):
                 oracle_ts = now
                 source = _SRC_RTDS_MSG_TS
