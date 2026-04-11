@@ -406,6 +406,7 @@ class PaperTrader:
                 net_pnl = round(gross_pnl - pos.fee_total, 4)
 
                 pos.resolved = True
+                pos.resolution_blocked = False  # clear any prior retry-block flag
                 pos.btc_close = truth.btc_close_binance
                 pos.winning_side = winning_side
                 pos.result = f"win_{winning_side}"

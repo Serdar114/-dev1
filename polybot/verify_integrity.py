@@ -8,7 +8,7 @@ Usage:
 Checks:
   1.  max 1 trade_opened per trade_id
   2.  max 1 trade_resolved per trade_id
-  3.  same window_ts cannot have both trade_opened and trade_resolution_blocked
+  3.  no trade_id appears in trade_resolution_blocked AFTER it has been trade_resolved
   4.  run_id present in all key events
   5.  pid present in all key events
   6.  bot_start has fee_rate + fee_source + fee_exponent + fee_exponent_source
@@ -90,14 +90,34 @@ def run_checks(events: list[dict]) -> int:
                  f"{len(dupes_r)} duplicate(s): {list(dupes_r.keys())[:3]}" if dupes_r else ""):
         failures += 1
 
-    # ── 3. No blocked+opened contradiction per window_ts ──────────────────────
-    print("\n=== 3. No blocked+opened contradiction per window_ts ===")
-    opened_windows  = {e.get("window_ts") for e in opened}
-    blocked_windows = {e.get("window") for e in blocked}
-    contradictions = opened_windows & blocked_windows
-    if not check("No window_ts in both trade_opened and trade_resolution_blocked",
-                 not contradictions,
-                 f"contradicting windows: {contradictions}" if contradictions else ""):
+    # ── 3. No trade_id blocked AFTER it was already resolved ──────────────────
+    # A resolved trade_id must never appear in a trade_resolution_blocked event
+    # with a later timestamp.  (opened→blocked→resolved is valid; resolved→blocked
+    # is not, and would mean the _resolved_ids guard in paper_trader failed.)
+    # NOTE: the old check (window_ts cross-comparison) was a false positive:
+    # trade_opened.window_ts == trade_resolution_blocked.window is the *normal*
+    # lifecycle when resolution retries fail — same window, different lifecycle phase.
+    print("\n=== 3. No trade_id re-blocked after trade_resolved ===")
+    resolved_ts_by_id: dict[str, str] = {}
+    for e in resolved:
+        tid = e.get("trade_id", "")
+        ts = e.get("ts", "")
+        if tid and ts:
+            if tid not in resolved_ts_by_id or ts > resolved_ts_by_id[tid]:
+                resolved_ts_by_id[tid] = ts
+
+    post_resolve_blocks: list[str] = []
+    for e in blocked:
+        tid = e.get("trade_id", "")
+        ts = e.get("ts", "")
+        if tid and ts and tid in resolved_ts_by_id:
+            if ts > resolved_ts_by_id[tid]:
+                post_resolve_blocks.append(tid)
+
+    if not check("No trade_id appears in trade_resolution_blocked after trade_resolved",
+                 not post_resolve_blocks,
+                 f"{len(post_resolve_blocks)} trade(s) re-blocked post-resolve: "
+                 f"{post_resolve_blocks[:3]}" if post_resolve_blocks else ""):
         failures += 1
 
     # ── 4. run_id in all key events ────────────────────────────────────────────
