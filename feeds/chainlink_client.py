@@ -67,7 +67,7 @@ class ChainlinkClient:
     Use .snapshot() for a thread-safe read.
     """
 
-    def __init__(self, config: dict, event_logger=None) -> None:
+    def __init__(self, config: dict, buffer=None, event_logger=None) -> None:
         cl_cfg = config["chainlink"]
         self._rpc_url: str = cl_cfg["polygon_rpc"]
         self._address: str = cl_cfg["btc_usd_address"]
@@ -75,6 +75,7 @@ class ChainlinkClient:
         self._poll_interval: float = float(cl_cfg.get("poll_interval_seconds", 5))
         self._price_min: float = float(cl_cfg.get("price_min", 10000.0))
         self._price_max: float = float(cl_cfg.get("price_max", 500000.0))
+        self._buffer = buffer      # ChainlinkBuffer — receives every valid observation
         self._logger = event_logger
 
         self._lock = threading.Lock()
@@ -134,6 +135,10 @@ class ChainlinkClient:
                 self._round_id = round_id
                 self._last_error = None
 
+            # Record in buffer so resolution can find close-capture observation
+            if self._buffer is not None:
+                self._buffer.record(updated_at, price, now, "polygon_rpc")
+
             self._log(ChainlinkUpdateEvent(
                 price=price,
                 oracle_updated_at=updated_at,
@@ -181,3 +186,4 @@ class ChainlinkClient:
             state.chainlink.oracle_updated_at = snap.oracle_updated_at
             state.chainlink.fetched_at = snap.fetched_at
             state.chainlink.round_id = snap.round_id
+            state.chainlink.source = "polygon_rpc"

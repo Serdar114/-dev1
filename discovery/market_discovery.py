@@ -91,6 +91,7 @@ def _market_from_gamma(record: Dict) -> Optional[MarketRecord]:
             window_start=window_start,
             window_end=window_start + 300,
             discovered_at=time.time(),
+            raw_gamma_response=record,  # preserved for fee/metadata extraction
         )
     except Exception as exc:
         log.error("Failed to parse market record: %s | record=%s", exc, record)

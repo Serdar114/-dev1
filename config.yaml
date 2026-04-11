@@ -23,9 +23,26 @@ chainlink:
   poll_interval_seconds: 5
   # If oracle updatedAt is older than this, mark STALE => no-trade
   max_age_seconds: 120
+  # If RTDS has no reading younger than this, fall back to Polygon RPC for live state
+  rtds_fallback_age_seconds: 30
   # Sanity range: reject if price outside this window
   price_min: 10000.0
   price_max: 500000.0
+
+# RTDS — Polymarket Real-Time Data Service for Chainlink BTC/USD (PRIMARY feed)
+# IMPORTANT: Verify ws_url and subscription_msg against your working sample
+# before expecting this to produce live readings.
+rtds:
+  # WebSocket endpoint — VERIFY against your working sample
+  ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+  # Subscription message sent on connect — VERIFY field names against working sample
+  subscription_msg: '{"type": "Asset", "assets": ["BTC-USD"]}'
+  # Field names in incoming price events — adjust to match actual RTDS messages
+  price_field: "price"
+  oracle_ts_field: "oracle_updated_at"   # oracle contract timestamp (preferred)
+  msg_ts_field: "timestamp"              # message timestamp (fallback)
+  # Send a JSON ping every N seconds to keep connection alive
+  heartbeat_interval_seconds: 20
 
 binance:
   symbol: "BTCUSDT"

@@ -98,6 +98,11 @@ def _take_snapshot(state: SystemState) -> dict:
         events = list(state.lifecycle_events[-8:])
         mode = state.mode
 
+    # System status computed under lock
+    cl_max_age = float(config.get("chainlink", {}).get("max_age_seconds", 120))
+    buf_depth = getattr(state, "_buffer_depth_snapshot", 0)
+    status_label, status_blocking = state.system_status_label(cl_max_age, buf_depth)
+
     return {
         "market": market,
         "meta": meta,
@@ -110,6 +115,8 @@ def _take_snapshot(state: SystemState) -> dict:
         "events": events,
         "mode": mode,
         "now": time.time(),
+        "status_label": status_label,
+        "status_blocking": status_blocking,
     }
 
 
@@ -139,11 +146,27 @@ def _render(stdscr, snap: dict, config: dict) -> None:
     no_trade = snap["no_trade"]
     events = snap["events"]
     mode = snap["mode"].upper()
+    status_label = snap.get("status_label", "MEASUREMENT SCAFFOLD")
+    status_blocking = snap.get("status_blocking", [])
 
-    # ── Row 0: Header ──────────────────────────────────────────────────────
-    slug = market.slug if market else "SEARCHING..."
-    header = f" POLYBOT {mode} | {slug[:50]}"
-    safe_add(row, 0, header.ljust(max_x - 1), _color(_C_CYAN) | curses.A_BOLD)
+    # ── Row 0: System status header ─────────────────────────────────────────
+    # Shows TRUTH-TIGHT / DEGRADED / MEASUREMENT SCAFFOLD based on live truth quality
+    if status_label == "TRUTH-TIGHT":
+        status_color = _color(_C_GREEN) | curses.A_BOLD
+    elif status_label == "DEGRADED":
+        status_color = _color(_C_YELLOW) | curses.A_BOLD
+    else:
+        status_color = _color(_C_RED) | curses.A_BOLD
+
+    slug = market.slug if market else "no market"
+    status_line = f" [{status_label}] {mode} | {slug[:45]}"
+    safe_add(row, 0, status_line.ljust(max_x - 1), status_color)
+    row += 1
+
+    # Show blocking reasons if not TRUTH-TIGHT
+    if status_blocking:
+        blocking_str = " BLOCKING: " + "  ".join(status_blocking[:4])
+        safe_add(row, 0, blocking_str[:max_x - 1], _color(_C_YELLOW))
     row += 1
 
     # ── Row 1: Window ──────────────────────────────────────────────────────

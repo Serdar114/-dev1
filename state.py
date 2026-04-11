@@ -29,6 +29,11 @@ class ChainlinkFeed:
     round_id: Optional[int] = None
     # Last error string for diagnostics
     last_error: Optional[str] = None
+    # Which feed produced this reading: "rtds" | "rtds_msg_ts" | "polygon_rpc" | "none"
+    # "rtds" = oracle timestamp from RTDS (canonical for close capture)
+    # "rtds_msg_ts" = RTDS message receipt time used as ts (not canonical for close capture)
+    # "polygon_rpc" = polled latestRoundData directly (audit / fallback)
+    source: str = "none"
 
     def age_seconds(self) -> Optional[float]:
         """Age of oracle data (oracle_updated_at -> now). None if never fetched."""
@@ -87,6 +92,7 @@ class MarketRecord:
     window_end: int = 0         # window_start + 300
     discovery_source: str = ""  # "gamma_slug_current" | "gamma_slug_prev" | "gamma_search"
     discovered_at: float = field(default_factory=time.time)
+    raw_gamma_response: Optional[dict] = None   # raw Gamma API response for metadata extraction
 
 
 # ---------------------------------------------------------------------------
@@ -95,14 +101,18 @@ class MarketRecord:
 
 @dataclass
 class MarketMetadata:
-    """CLOB-fetched metadata with explicit provenance for each critical field."""
+    """CLOB + Gamma metadata with explicit provenance for each critical field."""
     condition_id: str = ""
     tick_size: Optional[float] = None
     tick_size_provenance: str = "missing"       # "canonical" | "missing"
     min_order_size: Optional[float] = None
     min_order_size_provenance: str = "missing"  # "canonical" | "missing"
     taker_fee_rate: Optional[float] = None
-    fee_provenance: str = "missing"             # "canonical" | "config_default" | "missing"
+    # fee_provenance: "gamma_fee_schedule" > "clob_response" > "config_default" > "missing"
+    fee_provenance: str = "missing"
+    fee_schedule_present: bool = False          # True only when feeSchedule object found
+    fees_enabled: Optional[bool] = None         # from feesEnabled field in Gamma
+    accepting_orders: Optional[bool] = None     # from enable_order_book / accepting_orders
     fetched_at: Optional[float] = None
     raw_clob_response: Optional[dict] = None    # stored for audit
 
@@ -301,3 +311,47 @@ class SystemState:
         self.lifecycle_events.append(entry)
         if len(self.lifecycle_events) > 20:
             self.lifecycle_events.pop(0)
+
+    def system_status_label(self, cl_max_age: float, buffer_depth: int = 0) -> tuple:
+        """
+        Returns (label, blocking_reasons).
+        label: "TRUTH-TIGHT" | "DEGRADED" | "MEASUREMENT SCAFFOLD"
+
+        TRUTH-TIGHT requires ALL of:
+          - Chainlink source is "rtds" (not polygon_rpc or rtds_msg_ts)
+          - Chainlink oracle is fresh
+          - Close-capture buffer has >= 1 observation
+          - fee_schedule_present (canonical feeSchedule found in Gamma response)
+          - tick_size_provenance == "canonical"
+          - min_order_size_provenance == "canonical"
+        """
+        blocking = []
+
+        src = self.chainlink.source
+        if src != "rtds":
+            blocking.append(f"chainlink_src:{src}")
+
+        cl_age = self.chainlink.age_seconds()
+        if cl_age is None:
+            blocking.append("chainlink_missing")
+        elif cl_age > cl_max_age:
+            blocking.append(f"chainlink_stale:{cl_age:.0f}s")
+
+        if buffer_depth == 0:
+            blocking.append("close_capture_buffer_empty")
+
+        if self.metadata is None:
+            blocking.append("metadata_missing")
+        else:
+            if not self.metadata.fee_schedule_present:
+                blocking.append("fee_schedule_not_found")
+            if self.metadata.tick_size_provenance != "canonical":
+                blocking.append("tick_not_canonical")
+            if self.metadata.min_order_size_provenance != "canonical":
+                blocking.append("min_size_not_canonical")
+
+        if not blocking:
+            return "TRUTH-TIGHT", []
+        if self.market is None:
+            return "MEASUREMENT SCAFFOLD", blocking
+        return "DEGRADED", blocking

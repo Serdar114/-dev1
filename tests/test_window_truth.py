@@ -98,6 +98,7 @@ def _make_chainlink_client(price, oracle_age_seconds):
 
 
 def test_resolution_up_when_price_rises():
+    """Without buffer, falls back to live snapshot (resolved_snapshot_fallback)."""
     cl = _make_chainlink_client(price=65000.0, oracle_age_seconds=10)
     res = resolve_window(
         window_start=1700000000,
@@ -105,7 +106,7 @@ def test_resolution_up_when_price_rises():
         chainlink=cl,
         max_oracle_age=120,
     )
-    assert res.status == "resolved_canonical"
+    assert res.status == "resolved_snapshot_fallback"
     assert res.outcome == "Up"
 
 
@@ -117,7 +118,7 @@ def test_resolution_down_when_price_falls():
         chainlink=cl,
         max_oracle_age=120,
     )
-    assert res.status == "resolved_canonical"
+    assert res.status == "resolved_snapshot_fallback"
     assert res.outcome == "Down"
 
 
@@ -167,3 +168,94 @@ def test_resolution_equal_price_undefined():
     )
     assert res.status == "equal_price"
     assert res.outcome is None
+
+
+# ---------------------------------------------------------------------------
+# Buffer-based close capture (PATCH 2)
+# ---------------------------------------------------------------------------
+
+def test_buffer_resolution_canonical_up():
+    """Buffer observation before window_end gives resolved_canonical status."""
+    from truth.chainlink_buffer import ChainlinkBuffer
+    buf = ChainlinkBuffer()
+    window_start = 1700000000
+    window_end = window_start + 300
+    # Record an observation that is 10s before window_end
+    buf.record(oracle_updated_at=window_end - 10, price=65000.0, fetched_at=time.time(), source="polygon_rpc")
+
+    cl = _make_chainlink_client(price=65000.0, oracle_age_seconds=5)
+    res = resolve_window(
+        window_start=window_start,
+        price_at_start=64000.0,
+        chainlink=cl,
+        max_oracle_age=120,
+        buffer=buf,
+    )
+    assert res.status == "resolved_canonical"
+    assert res.outcome == "Up"
+    assert res.close_capture_source == "buffer_polygon_rpc"
+    assert res.seconds_before_window_end is not None
+    assert 9 <= res.seconds_before_window_end <= 11
+
+
+def test_buffer_resolution_canonical_down():
+    from truth.chainlink_buffer import ChainlinkBuffer
+    buf = ChainlinkBuffer()
+    window_start = 1700000000
+    window_end = window_start + 300
+    buf.record(oracle_updated_at=window_end - 5, price=63000.0, fetched_at=time.time(), source="rtds")
+
+    cl = _make_chainlink_client(price=63000.0, oracle_age_seconds=5)
+    res = resolve_window(
+        window_start=window_start,
+        price_at_start=64000.0,
+        chainlink=cl,
+        max_oracle_age=120,
+        buffer=buf,
+    )
+    assert res.status == "resolved_canonical"
+    assert res.outcome == "Down"
+
+
+def test_buffer_miss_when_no_observation_before_window_end():
+    """If buffer has no observation at or before window_end, status is buffer_miss."""
+    from truth.chainlink_buffer import ChainlinkBuffer
+    buf = ChainlinkBuffer()
+    window_start = 1700000000
+    window_end = window_start + 300
+    # Record only AFTER window_end
+    buf.record(oracle_updated_at=window_end + 5, price=65000.0, fetched_at=time.time(), source="rtds")
+
+    cl = _make_chainlink_client(price=65000.0, oracle_age_seconds=5)
+    res = resolve_window(
+        window_start=window_start,
+        price_at_start=64000.0,
+        chainlink=cl,
+        max_oracle_age=120,
+        buffer=buf,
+    )
+    assert res.status == "buffer_miss"
+    assert res.outcome is None
+
+
+def test_buffer_picks_most_recent_before_close():
+    """Buffer should use the observation closest to window_end, not the oldest."""
+    from truth.chainlink_buffer import ChainlinkBuffer
+    buf = ChainlinkBuffer()
+    window_start = 1700000000
+    window_end = window_start + 300
+    buf.record(oracle_updated_at=window_end - 120, price=64500.0, fetched_at=time.time(), source="rtds")
+    buf.record(oracle_updated_at=window_end - 15, price=65200.0, fetched_at=time.time(), source="rtds")  # newer, should win
+
+    cl = _make_chainlink_client(price=65200.0, oracle_age_seconds=5)
+    res = resolve_window(
+        window_start=window_start,
+        price_at_start=64000.0,
+        chainlink=cl,
+        max_oracle_age=120,
+        buffer=buf,
+    )
+    assert res.status == "resolved_canonical"
+    assert res.price_at_end == 65200.0  # the more recent observation
+    assert res.seconds_before_window_end is not None
+    assert res.seconds_before_window_end <= 16

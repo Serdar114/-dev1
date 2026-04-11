@@ -30,6 +30,7 @@ from discovery.market_registry import MarketRegistry
 from feeds.binance_client import BinanceClient
 from feeds.chainlink_client import ChainlinkClient
 from feeds.market_ws_client import MarketWsClient
+from feeds.rtds_chainlink_client import RtdsChainlinkClient
 from loggingx.event_logger import EventLogger
 from loggingx.schemas import (
     NoTradeEvent,
@@ -44,6 +45,7 @@ from paper.paper_executor import PaperExecutor
 from signals.feature_builder import build as build_features
 from signals.no_trade_rules import evaluate as eval_no_trade
 from state import MarketRecord, SystemState, WindowState
+from truth.chainlink_buffer import ChainlinkBuffer
 from truth.resolution_truth import resolve_window
 from truth.window_clock import current_window_start, window_bounds
 
@@ -62,10 +64,16 @@ class Runner:
         self._state = SystemState(mode=config.get("modes", {}).get("default", "measurement"))
         self._event_logger = EventLogger(config["measurement"]["log_file"])
 
-        # Component instances
-        self._chainlink = ChainlinkClient(config, self._event_logger)
+        # Close-capture buffer: receives every Chainlink observation; used for resolution
+        self._buffer = ChainlinkBuffer(max_entries=180)
+
+        # Feeds
+        # RTDS = primary Chainlink source; polygon_rpc = audit / fallback
+        self._rtds = RtdsChainlinkClient(config, self._buffer, self._event_logger)
+        self._chainlink = ChainlinkClient(config, self._buffer, self._event_logger)
         self._binance = BinanceClient(config, self._event_logger)
         self._market_ws = MarketWsClient(config, self._event_logger)
+
         self._discovery = MarketDiscovery(config, self._event_logger)
         self._registry = MarketRegistry()
         self._metadata_fetcher = MarketMetadataFetcher(config, self._event_logger)
@@ -94,6 +102,9 @@ class Runner:
         ))
 
         # Launch background threads
+        # RTDS starts first — it is the primary Chainlink source
+        self._rtds.start()
+        # Polygon RPC runs as audit/fallback; also populates buffer
         self._chainlink.start()
         self._binance.start()
         t_disc = threading.Thread(target=self._discovery_loop, daemon=True, name="discovery")
@@ -109,6 +120,7 @@ class Runner:
 
     def stop(self) -> None:
         self._stop_event.set()
+        self._rtds.stop()
         self._chainlink.stop()
         self._binance.stop()
         self._market_ws.stop()
@@ -148,9 +160,13 @@ class Runner:
             self._registry.clear()
             return
 
-        # Fetch metadata
+        # Fetch metadata — pass raw Gamma response so fee can be sourced from feeSchedule
         fallback_fee = float(self._config.get("paper", {}).get("default_taker_fee_rate", 0.02))
-        metadata = self._metadata_fetcher.fetch(new_market.condition_id, fallback_fee)
+        metadata = self._metadata_fetcher.fetch(
+            new_market.condition_id,
+            fallback_fee,
+            gamma_data=new_market.raw_gamma_response,
+        )
 
         # Seed initial orderbook from REST before WS connects
         fetch_and_seed(
@@ -163,9 +179,15 @@ class Runner:
         # Subscribe market WebSocket
         self._market_ws.subscribe(new_market.up_token_id, new_market.down_token_id)
 
-        # Record window entry price (Chainlink snapshot at window open)
+        # Record window entry price: prefer RTDS snapshot, fall back to Polygon RPC
+        rtds_snap = self._rtds.snapshot()
         cl_snap = self._chainlink.snapshot()
-        self._window_entry_price = cl_snap.price  # May be None — tracked explicitly
+        if rtds_snap.price is not None:
+            self._window_entry_price = rtds_snap.price
+        elif cl_snap.price is not None:
+            self._window_entry_price = cl_snap.price
+        else:
+            self._window_entry_price = None  # explicitly None — tracked in resolution
 
         # Update window clock
         ws, we = window_bounds()
@@ -204,6 +226,7 @@ class Runner:
             price_at_start=self._window_entry_price,
             chainlink=self._chainlink,
             max_oracle_age=max_age,
+            buffer=self._buffer,
         )
         self._event_logger.log(ResolutionEvent(
             window_id=market.window_start,
@@ -248,8 +271,14 @@ class Runner:
         Single tick: inject feed state, evaluate no-trade rules,
         record hypotheticals, update state for display.
         """
-        # Inject feed snapshots into state
-        self._chainlink.inject_state(self._state)
+        # Inject feed snapshots into state.
+        # RTDS is primary Chainlink source; Polygon RPC only writes if RTDS has no fresh data.
+        rtds_max_age = float(self._config["chainlink"].get("rtds_fallback_age_seconds", 30))
+        if self._rtds.is_healthy(rtds_max_age):
+            self._rtds.inject_state(self._state)
+        else:
+            # RTDS unhealthy or not yet connected — use Polygon RPC as fallback
+            self._chainlink.inject_state(self._state)
         self._binance.inject_state(self._state)
         self._market_ws.inject_state(self._state)
 
