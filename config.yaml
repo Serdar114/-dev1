@@ -35,11 +35,12 @@ chainlink:
 rtds:
   # WebSocket endpoint — official Polymarket Real-Time Data Service
   ws_url: "wss://ws-live-data.polymarket.com"
-  # Official subscribe payload for wss://ws-live-data.polymarket.com
-  subscription_msg: '{"type": "subscribe", "channel": "oracle", "assets": ["BTC-USD"]}'
-  # Incoming price event path: event.payload.value / event.payload.timestamp / event.payload.symbol
-  # (top-level price/oracle_updated_at fields are NOT the RTDS shape)
-  # Send a JSON ping every N seconds to keep connection alive
+  # Official subscribe payload — topic=crypto_prices_chainlink, filters btc/usd
+  # Message shape: event.topic == "crypto_prices_chainlink"
+  #                event.payload.symbol == "btc/usd"
+  #                event.payload.value  == price
+  #                event.payload.timestamp == oracle unix ts
+  # Heartbeat: send string "PING" every heartbeat_interval_seconds
   heartbeat_interval_seconds: 5
 
 binance:

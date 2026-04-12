@@ -1,27 +1,23 @@
 """
 feeds/rtds_chainlink_client.py — Polymarket RTDS Chainlink price feed (PRIMARY).
 
-Connects to the Polymarket Real-Time Data Service WebSocket.
+Connects to wss://ws-live-data.polymarket.com.
 This is the PRIMARY Chainlink source. Polygon RPC becomes audit/fallback only.
 
-IMPORTANT — VERIFY BEFORE RUNNING:
-  The RTDS endpoint and subscription message format must be confirmed against
-  your working sample. Edit config.yaml keys:
-    rtds.ws_url
-    rtds.subscription_msg
-    rtds.price_field
-    rtds.oracle_ts_field
-  before expecting this to produce valid readings.
+Subscribe payload sent on connect:
+  {"action":"subscribe","subscriptions":[{"topic":"crypto_prices_chainlink","type":"*","filters":"{\\"symbol\\":\\"btc/usd\\"}"}]}
 
-Message timestamp vs oracle timestamp:
-  - oracle_updated_at: the timestamp from the Chainlink contract (canonical)
-  - If the RTDS message does not include the oracle's updatedAt, we note the
-    source as "rtds_msg_ts" and track this explicitly in state.
-  - Resolution NEVER uses a "rtds_msg_ts" observation as canonical close truth.
+Message shape expected:
+  event["topic"]             == "crypto_prices_chainlink"
+  event["payload"]["symbol"] == "btc/usd"
+  event["payload"]["value"]  == price (float or string)
+  event["payload"]["timestamp"] == oracle unix timestamp
 
-Keepalive:
-  - Sends a JSON ping every rtds.heartbeat_interval_seconds (default 5s)
-  - websocket-client handles TCP-level ping/pong automatically
+Keepalive: send string "PING" every heartbeat_interval_seconds (default 5s).
+
+Resolution eligibility:
+  source="rtds"         → oracle timestamp from payload; eligible for close capture
+  source="rtds_msg_ts"  → no oracle ts in payload; NOT eligible for close capture
 """
 from __future__ import annotations
 
@@ -53,20 +49,24 @@ class RtdsChainlinkClient:
     Sets source="rtds" or "rtds_msg_ts" on each write.
     """
 
+    # Official subscribe payload — hardcoded to prevent misconfiguration
+    _SUBSCRIBE_MSG: str = json.dumps({
+        "action": "subscribe",
+        "subscriptions": [
+            {
+                "topic": "crypto_prices_chainlink",
+                "type": "*",
+                "filters": '{"symbol":"btc/usd"}',
+            }
+        ],
+    })
+
     def __init__(self, config: dict, buffer=None, event_logger=None) -> None:
         rtds_cfg = config.get("rtds", {})
         self._ws_url: str = rtds_cfg.get(
             "ws_url",
             "wss://ws-live-data.polymarket.com",
         )
-        # Subscription message sent on connect. Verify against working sample.
-        self._sub_msg: str = rtds_cfg.get(
-            "subscription_msg",
-            json.dumps({"type": "Asset", "assets": ["BTC-USD"]}),
-        )
-        self._price_field: str = rtds_cfg.get("price_field", "price")
-        self._oracle_ts_field: str = rtds_cfg.get("oracle_ts_field", "oracle_updated_at")
-        self._msg_ts_field: str = rtds_cfg.get("msg_ts_field", "timestamp")
         self._heartbeat_interval: float = float(rtds_cfg.get("heartbeat_interval_seconds", 5))
         self._price_min: float = float(config.get("chainlink", {}).get("price_min", 10000.0))
         self._price_max: float = float(config.get("chainlink", {}).get("price_max", 500000.0))
@@ -142,8 +142,8 @@ class RtdsChainlinkClient:
     # -----------------------------------------------------------------------
 
     def _on_open(self, ws) -> None:
-        log.info("RTDS connected: url=%s  subscribe=%s", self._ws_url, self._sub_msg)
-        ws.send(self._sub_msg)
+        log.info("RTDS connected: url=%s  subscribe=%s", self._ws_url, self._SUBSCRIBE_MSG)
+        ws.send(self._SUBSCRIBE_MSG)
         self._last_heartbeat = time.time()
 
     def _on_message(self, ws, raw: str) -> None:
@@ -156,34 +156,35 @@ class RtdsChainlinkClient:
         for event in events:
             self._handle_event(event)
 
-        # Application-level heartbeat
+        # Application-level heartbeat — send literal "PING" string
         now = time.time()
         if now - self._last_heartbeat >= self._heartbeat_interval:
             try:
-                ws.send(json.dumps({"type": "ping"}))
+                ws.send("PING")
                 self._last_heartbeat = now
             except Exception:
                 pass
 
     def _handle_event(self, event: dict) -> None:
-        """Parse an RTDS price event.
+        """Parse an RTDS crypto_prices_chainlink event.
 
-        Expected shape:
-          {"type": "...", "payload": {"symbol": "BTC-USD", "value": <price>, "timestamp": <unix_ts>}}
-
-        Fields used:
-          payload.symbol    — filter: must contain "BTC" (case-insensitive)
-          payload.value     — price
-          payload.timestamp — oracle contract timestamp (canonical); source="rtds"
-                              If absent, source="rtds_msg_ts" (not eligible for resolution)
+        Official shape:
+          event["topic"]             == "crypto_prices_chainlink"
+          event["payload"]["symbol"] == "btc/usd"
+          event["payload"]["value"]  == price
+          event["payload"]["timestamp"] == oracle unix timestamp (seconds or ms)
         """
+        # Only handle the Chainlink crypto price topic
+        if event.get("topic") != "crypto_prices_chainlink":
+            return
+
         payload = event.get("payload")
         if not isinstance(payload, dict):
             return
 
-        # Symbol filter: drop anything that isn't a BTC feed
-        symbol = str(payload.get("symbol", "")).upper()
-        if symbol and "BTC" not in symbol:
+        # Symbol filter: must be btc/usd
+        symbol = str(payload.get("symbol", "")).lower().strip()
+        if symbol != "btc/usd":
             return
 
         raw_price = payload.get("value")

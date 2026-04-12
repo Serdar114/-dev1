@@ -13,7 +13,7 @@ Gamma field names used:
   orderMinSize           — minimum order size
   acceptingOrders        — market accepting orders
   ready                  — market ready to trade
-  feeSchedule.rate       — taker fee (exponent field gives scale)
+  feeSchedule.rate       — taker fee integer (>1 → divide by 10000)
   feesEnabled            — fees active flag
 
 fee_provenance:
@@ -180,12 +180,10 @@ def _extract_fee_from_gamma(data: dict) -> tuple:
     Extract taker fee rate from a Gamma market object.
     Returns (fee_rate_decimal, schedule_present, fees_enabled).
 
-    Official feeSchedule fields:
-      rate      — taker fee integer (e.g. 720 for 7.2%)
-      exponent  — scale divisor exponent (e.g. 4 → divide by 10^4)
-                  If absent, heuristic: value > 1 → divide by 10000.
-
-    Example: rate=720, exponent=4 → 720 / 10000 = 0.072 (crypto market rate)
+    Normalization: exponent field is NOT used (observed to cause over-division).
+    Heuristic only: if rate > 1, treat as integer basis points → divide by 10000.
+    Example: rate=720 → 720/10000 = 0.072 (Polymarket crypto taker rate)
+    Audit line: log.info shows raw_rate and normalized value.
     """
     fees_enabled: Optional[bool] = None
     raw_enabled = data.get("feesEnabled")
@@ -196,8 +194,6 @@ def _extract_fee_from_gamma(data: dict) -> tuple:
     if schedule is None or not isinstance(schedule, dict):
         return None, False, fees_enabled
 
-    log.debug("Gamma feeSchedule raw: %s", schedule)
-
     # Primary field: rate. Fall back to legacy names.
     raw_rate = (
         schedule.get("rate")
@@ -206,27 +202,22 @@ def _extract_fee_from_gamma(data: dict) -> tuple:
         or schedule.get("taker")
     )
     if raw_rate is None:
+        log.info("Gamma feeSchedule present but no rate field: %s", schedule)
         return None, True, fees_enabled  # schedule present but no rate field
 
     try:
         val = float(raw_rate)
-        raw_exp = schedule.get("exponent")
-        if raw_exp is not None:
-            try:
-                exp = int(raw_exp)
-                val = val / (10 ** exp)
-            except (TypeError, ValueError):
-                # exponent unparseable — fall through to heuristic
-                if val > 1.0:
-                    val = val / 10000.0
-        elif val > 1.0:
-            # Heuristic: large integer → basis points with 10^4 divisor
+        # Normalization: do NOT use the exponent field — Gamma's exponent has been
+        # observed to cause over-division (e.g. rate=720, exponent=5 → 0.0072 instead
+        # of 0.072). Use heuristic only: if val > 1, it's an integer bps value → /10000.
+        if val > 1.0:
             val = val / 10000.0
 
-        # Sanity: 0 to 15% (crypto markets can be up to ~10%)
+        # Sanity: 0% to 15% covers all known Polymarket fee tiers
         if 0.0 <= val <= 0.15:
+            log.info("Gamma feeSchedule: raw_rate=%s → normalized=%.4f (%.2f%%)", raw_rate, val, val * 100)
             return val, True, fees_enabled
-        log.warning("Gamma feeSchedule rate out of range after normalization: raw=%s → %.6f", raw_rate, val)
+        log.warning("Gamma feeSchedule rate out of range: raw=%s → %.6f", raw_rate, val)
         return None, True, fees_enabled
     except (TypeError, ValueError):
         log.warning("Could not parse Gamma feeSchedule rate: %s", raw_rate)
