@@ -68,8 +68,9 @@ class MarketMetadataFetcher:
         if gamma_data is not None:
             _apply_gamma_fields(meta, gamma_data)
 
-        # ── Step 2: Try CLOB only if we're still missing critical trading fields ─
-        if meta.tick_size is None or meta.min_order_size is None:
+        # ── Step 2: Try CLOB only if Gamma left any critical field empty ────────
+        # This is a secondary fallback. CLOB 404 is expected and handled silently.
+        if meta.tick_size is None or meta.min_order_size is None or meta.taker_fee_rate is None:
             clob_data = _try_clob_fetch(self._clob_base, condition_id)
             if clob_data is not None:
                 meta.raw_clob_response = clob_data

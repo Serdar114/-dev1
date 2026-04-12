@@ -101,12 +101,18 @@ class MarketRecord:
 
 @dataclass
 class MarketMetadata:
-    """CLOB + Gamma metadata with explicit provenance for each critical field."""
+    """Gamma-first metadata with explicit provenance for each critical field.
+
+    Provenance enum:
+      "canonical_market_object"  — from Gamma or CLOB market object
+      "fallback_config"          — from config default (no canonical source found)
+      "missing"                  — no value found anywhere (no-trade block)
+    """
     condition_id: str = ""
     tick_size: Optional[float] = None
-    tick_size_provenance: str = "missing"       # "canonical" | "missing"
+    tick_size_provenance: str = "missing"       # "canonical_market_object" | "missing"
     min_order_size: Optional[float] = None
-    min_order_size_provenance: str = "missing"  # "canonical" | "missing"
+    min_order_size_provenance: str = "missing"  # "canonical_market_object" | "missing"
     taker_fee_rate: Optional[float] = None
     # fee_provenance: "canonical_market_object" > "fallback_config" > "missing"
     fee_provenance: str = "missing"
@@ -323,8 +329,8 @@ class SystemState:
           - Chainlink oracle is fresh
           - Close-capture buffer has >= 1 observation
           - fee_schedule_present (canonical feeSchedule found in Gamma response)
-          - tick_size_provenance == "canonical"
-          - min_order_size_provenance == "canonical"
+          - tick_size_provenance == "canonical_market_object"
+          - min_order_size_provenance == "canonical_market_object"
         """
         blocking = []
 
@@ -346,9 +352,9 @@ class SystemState:
         else:
             if not self.metadata.fee_schedule_present:
                 blocking.append("fee_schedule_not_found")
-            if self.metadata.tick_size_provenance != "canonical":
+            if self.metadata.tick_size_provenance != "canonical_market_object":
                 blocking.append("tick_not_canonical")
-            if self.metadata.min_order_size_provenance != "canonical":
+            if self.metadata.min_order_size_provenance != "canonical_market_object":
                 blocking.append("min_size_not_canonical")
 
         if not blocking:
