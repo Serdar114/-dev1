@@ -159,10 +159,11 @@ class ChainlinkClient:
 
         except Exception as exc:
             err = str(exc)
-            # Rate-limit: only warn once per 5 minutes to avoid spam when RTDS is primary
+            # Log at DEBUG — polygon_rpc is the audit/fallback path.
+            # When RTDS is primary and healthy, these errors are noise.
+            # Rate-limit even at DEBUG to keep log files clean.
             if now - self._last_warn_logged >= self._warn_interval:
-                log.warning("polygon_rpc fetch error (audit path): %s", err)
-                self._log(ChainlinkErrorEvent(error=f"polygon_rpc:{err}"))
+                log.debug("polygon_rpc fetch error (audit path): %s", err)
                 self._last_warn_logged = now
             with self._lock:
                 self._last_error = err

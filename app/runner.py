@@ -84,6 +84,8 @@ class Runner:
         # Tracks Chainlink price at start of current window for resolution
         self._window_entry_price: Optional[float] = None
         self._last_hypo_window: int = 0
+        # Tracks last window for which readiness summary was logged (once per window)
+        self._last_readiness_window: int = 0
 
     @property
     def state(self) -> SystemState:
@@ -316,6 +318,11 @@ class Runner:
             meta = self._state.metadata
             window_id = self._state.window.start
 
+        # One readiness summary per window at INFO — shows what's blocking hypo entries
+        if window_id != self._last_readiness_window and window_id != 0:
+            self._last_readiness_window = window_id
+            self._log_window_readiness(window_id, reasons, features, meta)
+
         # Log no-trade tick (throttled: only log when reasons change)
         if reasons:
             self._event_logger.log(NoTradeEvent(
@@ -363,3 +370,22 @@ class Runner:
             except Exception as exc:
                 log.error("Tick error: %s", exc)
             time.sleep(1.0)
+
+    def _log_window_readiness(self, window_id: int, reasons: list, features, meta) -> None:
+        """Emit one INFO line per window summarising measurement readiness."""
+        cl_s = "ok" if features.chainlink_price is not None else "MISSING"
+        meta_s = meta.readiness_label() if meta is not None else "MISSING"
+        up_s = "ok" if features.up_best_ask is not None else "MISSING"
+        dn_s = "ok" if features.dn_best_ask is not None else "MISSING"
+        ps = features.pair_sum_ask
+        ps_s = f"{ps:.4f}" if ps is not None else "unavail"
+        if reasons:
+            status_s = "BLOCKED:" + ",".join(reasons[:2])
+            if len(reasons) > 2:
+                status_s += f"(+{len(reasons)-2})"
+        else:
+            status_s = "ELIGIBLE"
+        log.info(
+            "window=%d cl=%s meta=%s up=%s dn=%s pair_sum=%s | hypo=%s",
+            window_id, cl_s, meta_s, up_s, dn_s, ps_s, status_s,
+        )

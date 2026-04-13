@@ -215,9 +215,9 @@ def _extract_fee_from_gamma(data: dict) -> tuple:
 
         # Sanity: 0% to 15% covers all known Polymarket fee tiers
         if 0.0 <= val <= 0.15:
-            log.info("Gamma feeSchedule: raw_rate=%s → normalized=%.4f (%.2f%%)", raw_rate, val, val * 100)
+            log.info("Gamma feeSchedule: raw_rate=%s -> normalized=%.4f (%.2f%%)", raw_rate, val, val * 100)
             return val, True, fees_enabled
-        log.warning("Gamma feeSchedule rate out of range: raw=%s → %.6f", raw_rate, val)
+        log.warning("Gamma feeSchedule rate out of range: raw=%s -> %.6f", raw_rate, val)
         return None, True, fees_enabled
     except (TypeError, ValueError):
         log.warning("Could not parse Gamma feeSchedule rate: %s", raw_rate)
