@@ -68,12 +68,17 @@ class _WindowTracker:
         self._pair_sum_max: Optional[float] = None
         self._spread_up_min: Optional[float] = None
         self._spread_dn_min: Optional[float] = None
+        # Edge detection: state captured at the moment of minimum pair_sum
+        self._edge_up_price: Optional[float] = None
+        self._edge_dn_price: Optional[float] = None
+        self._edge_secs_into_window: Optional[float] = None
+        self._edge_net_cost: Optional[float] = None  # pair_sum + both-side fees at best moment
 
     def reset(self) -> None:
         with self._lock:
             self._reset_unlocked()
 
-    def update(self, features, reasons: list) -> None:
+    def update(self, features, reasons: list, fee_rate: Optional[float] = None) -> None:
         with self._lock:
             if features.chainlink_price is not None:
                 self._had_valid_chainlink = True
@@ -85,6 +90,25 @@ class _WindowTracker:
             if ps is not None:
                 if self._pair_sum_min is None or ps < self._pair_sum_min:
                     self._pair_sum_min = ps
+                    # Capture best-entry state at this new minimum
+                    self._edge_up_price = features.up_best_ask
+                    self._edge_dn_price = features.dn_best_ask
+                    wid = features.window_id
+                    self._edge_secs_into_window = (
+                        features.ts - wid if (wid and wid > 0) else None
+                    )
+                    # Net cost after fee: pair_sum + fee(up) + fee(dn)
+                    # fee per unit = fee_rate * p * (1 - p)  (Polymarket taker formula)
+                    if (fee_rate is not None
+                            and features.up_best_ask is not None
+                            and features.dn_best_ask is not None):
+                        up_p = features.up_best_ask
+                        dn_p = features.dn_best_ask
+                        fee_total = (fee_rate * up_p * (1 - up_p)
+                                     + fee_rate * dn_p * (1 - dn_p))
+                        self._edge_net_cost = up_p + dn_p + fee_total
+                    else:
+                        self._edge_net_cost = None
                 if self._pair_sum_max is None or ps > self._pair_sum_max:
                     self._pair_sum_max = ps
             us = features.up_spread
@@ -118,6 +142,40 @@ class _WindowTracker:
                 "yes" if self._had_valid_books else "no",
                 "yes" if self._hypo_recorded else "no",
                 dom, ps_range, sup, sdn,
+            )
+
+    def log_edge_summary(self, window_id: int) -> None:
+        """Emit one EDGE line per resolved window: best entry moment and edge classification."""
+        with self._lock:
+            ps = self._pair_sum_min
+            if ps is None:
+                return  # no orderbook data collected this window
+
+            # Classify window by pre-fee pair_sum minimum
+            if ps < 1.00:
+                classification = "TRADEABLE"
+            elif ps <= 1.02:
+                classification = "NEUTRAL"
+            else:
+                classification = "DEAD"
+
+            up_s = f"{self._edge_up_price:.4f}" if self._edge_up_price is not None else "n/a"
+            dn_s = f"{self._edge_dn_price:.4f}" if self._edge_dn_price is not None else "n/a"
+
+            net = self._edge_net_cost
+            if net is not None:
+                edge_s = f"{net:.4f}({'yes' if net < 1.0 else 'no'})"
+            else:
+                edge_s = "n/a"
+
+            t = self._edge_secs_into_window
+            t_s = f"{t:.0f}s" if t is not None else "n/a"
+
+            log.info(
+                "EDGE window=%d class=%s min_pair_sum=%.4f "
+                "best_up=%s best_dn=%s edge_after_fee=%s time_in_window=%s",
+                window_id, classification, ps,
+                up_s, dn_s, edge_s, t_s,
             )
 
 
@@ -349,6 +407,7 @@ class Runner:
         else:
             self._paper.mark_unresolved(market.window_start)
         self._window_tracker.log_summary(market.window_start)
+        self._window_tracker.log_edge_summary(market.window_start)
 
     # -----------------------------------------------------------------------
     # Tick loop (runs in main thread when no UI)
@@ -390,8 +449,14 @@ class Runner:
             meta = self._state.metadata
             window_id = self._state.window.start
 
-        # Accumulate per-window stats for end-of-window tradeability summary
-        self._window_tracker.update(features, reasons)
+        # Accumulate per-window stats for end-of-window tradeability / edge summary
+        fallback_fee = float(self._config.get("paper", {}).get("default_taker_fee_rate", 0.072))
+        fee_rate = (
+            meta.taker_fee_rate
+            if (meta is not None and meta.taker_fee_rate is not None)
+            else fallback_fee
+        )
+        self._window_tracker.update(features, reasons, fee_rate=fee_rate)
 
         # One readiness summary per window at INFO — shows what's blocking hypo entries
         if window_id != self._last_readiness_window and window_id != 0:
