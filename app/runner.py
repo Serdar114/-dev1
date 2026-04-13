@@ -52,6 +52,75 @@ from truth.window_clock import current_window_start, window_bounds
 log = logging.getLogger(__name__)
 
 
+class _WindowTracker:
+    """Accumulates per-window observability stats for the end-of-window tradeability summary."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._reset_unlocked()
+
+    def _reset_unlocked(self) -> None:
+        self._had_valid_chainlink: bool = False
+        self._had_valid_books: bool = False
+        self._hypo_recorded: bool = False
+        self._reason_counts: dict = {}
+        self._pair_sum_min: Optional[float] = None
+        self._pair_sum_max: Optional[float] = None
+        self._spread_up_min: Optional[float] = None
+        self._spread_dn_min: Optional[float] = None
+
+    def reset(self) -> None:
+        with self._lock:
+            self._reset_unlocked()
+
+    def update(self, features, reasons: list) -> None:
+        with self._lock:
+            if features.chainlink_price is not None:
+                self._had_valid_chainlink = True
+            if features.up_best_ask is not None and features.dn_best_ask is not None:
+                self._had_valid_books = True
+            for r in reasons:
+                self._reason_counts[r] = self._reason_counts.get(r, 0) + 1
+            ps = features.pair_sum_ask
+            if ps is not None:
+                if self._pair_sum_min is None or ps < self._pair_sum_min:
+                    self._pair_sum_min = ps
+                if self._pair_sum_max is None or ps > self._pair_sum_max:
+                    self._pair_sum_max = ps
+            us = features.up_spread
+            if us is not None and (self._spread_up_min is None or us < self._spread_up_min):
+                self._spread_up_min = us
+            ds = features.dn_spread
+            if ds is not None and (self._spread_dn_min is None or ds < self._spread_dn_min):
+                self._spread_dn_min = ds
+
+    def mark_hypo(self) -> None:
+        with self._lock:
+            self._hypo_recorded = True
+
+    def log_summary(self, window_id: int) -> None:
+        with self._lock:
+            dom = (
+                max(self._reason_counts, key=self._reason_counts.get)
+                if self._reason_counts else "none"
+            )
+            ps_range = (
+                f"[{self._pair_sum_min:.4f},{self._pair_sum_max:.4f}]"
+                if self._pair_sum_min is not None else "n/a"
+            )
+            sup = f"{self._spread_up_min:.4f}" if self._spread_up_min is not None else "n/a"
+            sdn = f"{self._spread_dn_min:.4f}" if self._spread_dn_min is not None else "n/a"
+            log.info(
+                "TRADEABILITY window=%d cl=%s books=%s hypo=%s "
+                "block=%s pair_sum=%s spread_up_min=%s spread_dn_min=%s",
+                window_id,
+                "yes" if self._had_valid_chainlink else "no",
+                "yes" if self._had_valid_books else "no",
+                "yes" if self._hypo_recorded else "no",
+                dom, ps_range, sup, sdn,
+            )
+
+
 class Runner:
     """
     Coordinates all runtime components.
@@ -86,6 +155,7 @@ class Runner:
         self._last_hypo_window: int = 0
         # Tracks last window for which readiness summary was logged (once per window)
         self._last_readiness_window: int = 0
+        self._window_tracker = _WindowTracker()
 
     @property
     def state(self) -> SystemState:
@@ -168,6 +238,7 @@ class Runner:
         prev_market = self._registry.get()
         if prev_market and self._window_entry_price is not None:
             self._resolve_previous_window(prev_market)
+        self._window_tracker.reset()
 
         # Discover new market
         new_market = self._discovery.discover()
@@ -277,6 +348,7 @@ class Runner:
             )
         else:
             self._paper.mark_unresolved(market.window_start)
+        self._window_tracker.log_summary(market.window_start)
 
     # -----------------------------------------------------------------------
     # Tick loop (runs in main thread when no UI)
@@ -318,6 +390,9 @@ class Runner:
             meta = self._state.metadata
             window_id = self._state.window.start
 
+        # Accumulate per-window stats for end-of-window tradeability summary
+        self._window_tracker.update(features, reasons)
+
         # One readiness summary per window at INFO — shows what's blocking hypo entries
         if window_id != self._last_readiness_window and window_id != 0:
             self._last_readiness_window = window_id
@@ -337,6 +412,7 @@ class Runner:
             for ev in hypo_events:
                 self._event_logger.log(ev)
             if hypo_events:
+                self._window_tracker.mark_hypo()
                 self._last_hypo_window = window_id
                 with self._state._lock:
                     side = hypo_events[0].side

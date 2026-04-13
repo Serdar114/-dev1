@@ -168,6 +168,15 @@ class MarketWsClient:
                 #   "bids"/"asks"   (CLOB WS documented format)
                 buys = event.get("bids") or event.get("buys", [])
                 sells = event.get("asks") or event.get("sells", [])
+                # Regression guard: a snapshot with 0 asks while we already hold a
+                # valid ask side is structurally suspicious (malformed or half-populated
+                # WS event). Preserve the current book rather than wipe it.
+                if book.snapshot_received and len(book.asks) > 0 and len(sells) == 0:
+                    log.warning(
+                        "book_snapshot_rejected side=%s incoming_asks=0 current_asks=%d reason=suspicious_empty",
+                        book.outcome, len(book.asks),
+                    )
+                    return
                 is_first = not book.snapshot_received
                 prev_asks = len(book.asks)
                 book.apply_snapshot(buys, sells)
