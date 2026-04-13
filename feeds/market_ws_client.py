@@ -100,14 +100,19 @@ class MarketWsClient:
             return copy.copy(self._up_book), copy.copy(self._down_book)
 
     def inject_state(self, state) -> None:
-        """Write current orderbooks into SystemState."""
+        """Write current orderbooks into SystemState.
+        Only overwrites a side if the WS has confirmed a snapshot.
+        This preserves the REST seed until WS takes over.
+        """
         with self._lock:
             import copy
             up = copy.copy(self._up_book)
             dn = copy.copy(self._down_book)
         with state._lock:
-            state.up_book = up
-            state.down_book = dn
+            if up.snapshot_received:
+                state.up_book = up
+            if dn.snapshot_received:
+                state.down_book = dn
 
     # -----------------------------------------------------------------------
     # Internal WebSocket machinery
@@ -158,9 +163,25 @@ class MarketWsClient:
                 return  # unknown asset
 
             if etype == "book":
-                buys = event.get("buys", [])
-                sells = event.get("sells", [])
+                # Support both Polymarket WS field variants:
+                #   "buys"/"sells"  (some WS versions)
+                #   "bids"/"asks"   (CLOB WS documented format)
+                buys = event.get("bids") or event.get("buys", [])
+                sells = event.get("asks") or event.get("sells", [])
+                is_first = not book.snapshot_received
+                prev_asks = len(book.asks)
                 book.apply_snapshot(buys, sells)
+                side_label = "up" if asset_id == up_id else "dn"
+                if is_first:
+                    log.info(
+                        "market_ws %s_ws_snapshot(first) asks=%d bids=%d",
+                        side_label, len(book.asks), len(book.bids),
+                    )
+                if prev_asks > 0 and len(book.asks) == 0:
+                    log.warning(
+                        "book_regressed side=%s from asks=%d to asks=0 reason=snapshot",
+                        book.outcome, prev_asks,
+                    )
                 ba = book.best_ask()
                 bb = book.best_bid()
                 self._log(OrderbookSnapshotEvent(
@@ -174,7 +195,13 @@ class MarketWsClient:
 
             elif etype == "price_change":
                 changes = event.get("changes", [])
+                prev_asks = len(book.asks)
                 book.apply_delta(changes)
+                if prev_asks > 0 and len(book.asks) == 0:
+                    log.warning(
+                        "book_regressed side=%s from asks=%d to asks=0 reason=delta",
+                        book.outcome, prev_asks,
+                    )
 
     def _on_error(self, ws, error) -> None:
         log.warning("Market WS error: %s", error)

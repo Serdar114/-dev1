@@ -50,6 +50,11 @@ def fetch_and_seed(clob_base: str, up_token_id: str, down_token_id: str, state) 
     """
     up_book = fetch_initial_book(clob_base, up_token_id, "Up")
     dn_book = fetch_initial_book(clob_base, down_token_id, "Down")
+    log.info(
+        "REST seed: up_seed asks=%d bids=%d, down_seed asks=%d bids=%d",
+        len(up_book.asks) if up_book else 0, len(up_book.bids) if up_book else 0,
+        len(dn_book.asks) if dn_book else 0, len(dn_book.bids) if dn_book else 0,
+    )
     with state._lock:
         if up_book:
             state.up_book = up_book
