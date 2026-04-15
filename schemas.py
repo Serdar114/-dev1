@@ -128,8 +128,52 @@ class ExternalPriceSnapshot:
     price: Optional[float]
     source_ts: Optional[int]    # exchange timestamp if available
     data_age_ms: Optional[int]  # ts_local - source_ts
-    source: str                 # e.g. "binance_ws", "binance_rest"
+    source: str                 # e.g. "binance_ws", "binance_rest", "chainlink_eth_mainnet"
     symbol: str = "BTCUSDT"
+
+
+# ---------------------------------------------------------------------------
+# Dual-source price snapshot — Binance + Chainlink together
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DualPriceSnapshot:
+    """
+    Combined BTC reference price from two independent sources over Polymarket RTDS.
+
+    Both streams arrive on a single WS connection (wss://ws-live-data.polymarket.com):
+      Binance   (channel: crypto_prices)           — live spot; observer/reference only
+      Chainlink (channel: crypto_prices_chainlink) — aggregator; settlement truth for btc-updown-*
+
+    If either source has not yet delivered a price, its fields are None and
+    the *_stale flag is True. The caller must never substitute a hardcoded
+    default for a missing price.
+
+    basis_bps = (binance_price - chainlink_price) / chainlink_price * 10_000
+      positive → Binance spot above Chainlink aggregator
+      negative → Binance spot below Chainlink aggregator
+
+    lag_ms = binance_source_ts - chainlink_source_ts
+      positive → Binance timestamp more recent than Chainlink timestamp
+      None     → either source_ts is missing
+    """
+    ts_local: int
+
+    # Binance (polymarket_rtds_binance)
+    binance_price: Optional[float]
+    binance_source_ts: Optional[int]    # exchange event time, epoch ms
+    binance_data_age_ms: Optional[int]  # ts_local - binance_local_ts
+    binance_stale: bool
+
+    # Chainlink (polymarket_rtds_chainlink)
+    chainlink_price: Optional[float]
+    chainlink_source_ts: Optional[int]   # source-reported timestamp, epoch ms
+    chainlink_data_age_ms: Optional[int] # ts_local - chainlink ref ts
+    chainlink_stale: bool
+
+    # Derived
+    basis_bps: Optional[float]  # None if either price is missing
+    lag_ms: Optional[int]       # None if either source_ts is missing
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +232,14 @@ class JoinedObservation:
     # Which market family this observation belongs to
     # "15m" = primary execution lane | "5m" = observer/regime/gate lane
     family_label: Optional[str] = None
+
+    # Dual-source price fields (from DualPriceSnapshot via Polymarket RTDS)
+    external_btc_price_binance: Optional[float] = None
+    external_btc_price_chainlink: Optional[float] = None
+    external_basis_bps: Optional[float] = None   # (binance-chainlink)/chainlink*10000
+    external_lag_ms: Optional[int] = None         # binance_source_ts - chainlink_source_ts
+    stale_binance: bool = False
+    stale_chainlink: bool = False
 
 
 # ---------------------------------------------------------------------------

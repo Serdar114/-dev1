@@ -186,11 +186,14 @@ def _build_observation(
 ) -> JoinedObservation:
     ts_local = _now_ms()
 
-    # External price
-    ext_snap = rtds.latest()
-    ext_price = ext_snap.price if ext_snap else None
-    ext_age = ext_snap.data_age_ms if ext_snap else None
-    stale_external = _is_stale(ext_snap.ts_local if ext_snap else None, STALE_EXTERNAL_MS)
+    # Dual external price (Binance + Chainlink via Polymarket RTDS)
+    dual = rtds.latest_dual()
+
+    # external_btc_price / external_data_age_ms / stale_external remain Binance-based
+    # for backward compat with existing gate-flag semantics
+    ext_price  = dual.binance_price if dual else None
+    ext_age    = dual.binance_data_age_ms if dual else None
+    stale_external = dual.binance_stale if dual else True
 
     # Book state
     up_snap = ws_client.get_snapshot(up_token_id) if (ws_client and up_token_id) else None
@@ -271,6 +274,13 @@ def _build_observation(
         tick_unknown=tick_unknown,
         min_size_unknown=min_size_unknown,
         family_label=family_label or (market.family_label if market else None),
+        # Dual-source price fields from Polymarket RTDS
+        external_btc_price_binance=dual.binance_price if dual else None,
+        external_btc_price_chainlink=dual.chainlink_price if dual else None,
+        external_basis_bps=dual.basis_bps if dual else None,
+        external_lag_ms=dual.lag_ms if dual else None,
+        stale_binance=dual.binance_stale if dual else True,
+        stale_chainlink=dual.chainlink_stale if dual else True,
     )
 
 
