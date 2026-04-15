@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -39,11 +39,35 @@ CACHE_TTL_S = 60
 # Minimum fields required for a market record to be usable
 REQUIRED_FIELDS = {"id"}
 
-# BTC keyword filters (case-insensitive substring match on question/slug)
-BTC_KEYWORDS = ["btc", "bitcoin"]
+# ---------------------------------------------------------------------------
+# Strict family scope — only these two slug-prefix families are allowed.
+# Everything else is excluded unconditionally, regardless of BTC content.
+# ---------------------------------------------------------------------------
 
-# Short-horizon max duration in seconds (e.g. ≤ 2 hours)
-SHORT_HORIZON_MAX_S = 7200
+# Primary execution family
+SLUG_PREFIX_15M = "btc-updown-15m-"
+# Observer / regime / gate family
+SLUG_PREFIX_5M  = "btc-updown-5m-"
+ALLOWED_PREFIXES = (SLUG_PREFIX_15M, SLUG_PREFIX_5M)
+
+# Slug substrings that are unconditionally excluded (generic price-target markets).
+# These should never appear under btc-updown-* but are listed defensively.
+EXCLUDED_SLUG_SUBSTRINGS: List[str] = [
+    "will-btc-be-above",
+    "will-btc-be-below",
+    "bitcoin-above",
+    "bitcoin-below",
+    "btc-above",
+    "btc-below",
+    "price-target",
+    "will-bitcoin",
+    "bitcoin-price",
+    "btc-price",
+]
+
+# Resolution reference for all qualifying markets.
+# External spot price is observer-only; Chainlink BTC/USD is the settlement truth.
+RESOLUTION_REFERENCE = "chainlink_btc_usd"
 
 # HTTP timeout
 HTTP_TIMEOUT_S = 10
@@ -298,24 +322,52 @@ def _normalise_market(raw: Dict[str, Any]) -> Optional[MarketRecord]:
     )
 
 
-def _is_btc_market(m: MarketRecord) -> bool:
-    """Heuristic: does the question/slug mention BTC or bitcoin?"""
-    text = " ".join(filter(None, [m.question, m.market_slug, m.event_slug])).lower()
-    return any(kw in text for kw in BTC_KEYWORDS)
+def _detect_family(m: MarketRecord) -> Optional[str]:
+    """
+    Return "15m", "5m", or None.
+
+    Match is slug-prefix ONLY.
+      - btc-updown-15m-* → "15m"  (primary execution family)
+      - btc-updown-5m-*  → "5m"   (observer / regime / gate family)
+      - anything else    → None   (excluded unconditionally)
+
+    Generic BTC markets (will-btc-be-above-*, price-target, etc.) are
+    explicitly blocked by EXCLUDED_SLUG_SUBSTRINGS even if they somehow
+    matched a prefix check (defensive).
+    """
+    slug = (m.market_slug or "").lower()
+    event_slug = (m.event_slug or "").lower()
+
+    # Hard-exclude generic price-target / above-below markets first
+    for pat in EXCLUDED_SLUG_SUBSTRINGS:
+        if pat in slug or pat in event_slug:
+            return None
+
+    # Primary match: market_slug prefix
+    if slug.startswith(SLUG_PREFIX_15M):
+        return "15m"
+    if slug.startswith(SLUG_PREFIX_5M):
+        return "5m"
+
+    # Fallback: some Gamma records expose the family prefix on event_slug only
+    if event_slug.startswith(SLUG_PREFIX_15M):
+        return "15m"
+    if event_slug.startswith(SLUG_PREFIX_5M):
+        return "5m"
+
+    return None
 
 
-def _is_short_horizon(m: MarketRecord, now_ms: int) -> bool:
-    """True if market ends within SHORT_HORIZON_MAX_S from now."""
+def _is_not_expired(m: MarketRecord, now_ms: int) -> bool:
+    """
+    True if the market window has not already closed.
+    For btc-updown-* families the slug guarantees duration; this check only
+    gates out windows that have already resolved.
+    """
     end = m.end_time or m.resolution_time
     if end is None:
-        return False
-    duration_s = (end - now_ms) / 1000
-    # Accept markets already close to expiry OR very short windows from start
-    if m.start_time is not None:
-        total_s = (end - m.start_time) / 1000
-        return 0 < total_s <= SHORT_HORIZON_MAX_S
-    # Fallback: must end within the threshold from now
-    return 0 < duration_s <= SHORT_HORIZON_MAX_S
+        return True  # unknown end — do not exclude; anomaly logged elsewhere
+    return end > now_ms
 
 
 def _is_accepting_orders(m: MarketRecord) -> bool:
@@ -422,9 +474,16 @@ def _fetch_all_active_btc_candidates() -> List[Dict[str, Any]]:
 
 def list_candidate_btc_markets() -> List[MarketRecord]:
     """
-    Fetch, parse, and return all currently active BTC short-horizon markets.
-    Includes both accepted candidates and excluded markets (with reasons).
-    Never silently drops records — every rejection is logged.
+    Fetch, parse, and return markets that belong to the two allowed families.
+
+    Allowed:  btc-updown-15m-*  (family_label="15m")
+              btc-updown-5m-*   (family_label="5m")
+    Excluded: everything else — including all generic will-btc-be-above-*,
+              bitcoin-above, price-target markets, and any BTC market that
+              does not match the strict slug-prefix contract.
+
+    Returns all records (candidates + excluded) with .excluded / .exclusion_reason set.
+    Never silently drops — every rejection is recorded.
     """
     now_ms = _now_ms()
     raw_list = _fetch_all_active_btc_candidates()
@@ -439,21 +498,29 @@ def list_candidate_btc_markets() -> List[MarketRecord]:
             parse_failures += 1
             continue
 
-        # Filter: must look like a BTC market
-        if not _is_btc_market(m):
+        # Filter 1: strict family slug-prefix match
+        family = _detect_family(m)
+        if family is None:
             m.excluded = True
-            m.exclusion_reason = "not_btc_market"
+            m.exclusion_reason = (
+                f"not_in_allowed_family (slug={m.market_slug!r}); "
+                "only btc-updown-15m-* and btc-updown-5m-* are accepted"
+            )
             excluded.append(m)
             continue
 
-        # Filter: must be short-horizon
-        if not _is_short_horizon(m, now_ms):
+        # Stamp family and resolution reference on qualifying records
+        m.family_label = family
+        m.resolution_reference = RESOLUTION_REFERENCE
+
+        # Filter 2: market window must not have already closed
+        if not _is_not_expired(m, now_ms):
             m.excluded = True
-            m.exclusion_reason = f"not_short_horizon (end_time={m.end_time})"
+            m.exclusion_reason = f"already_expired (end_time={m.end_time})"
             excluded.append(m)
             continue
 
-        # Filter: must have tokens
+        # Filter 3: must have tokens
         if not m.tokens:
             m.excluded = True
             m.exclusion_reason = "no_tokens"
@@ -469,75 +536,108 @@ def list_candidate_btc_markets() -> List[MarketRecord]:
             level="warning",
         )
 
+    by_family = {"15m": sum(1 for m in candidates if m.family_label == "15m"),
+                 "5m":  sum(1 for m in candidates if m.family_label == "5m")}
     log.log_system_event(
         "gamma_candidates",
         detail=(
-            f"candidates={len(candidates)} excluded={len(excluded)} "
-            f"parse_failures={parse_failures} total_raw={len(raw_list)}"
+            f"candidates={len(candidates)} (15m={by_family['15m']} 5m={by_family['5m']}) "
+            f"excluded={len(excluded)} parse_failures={parse_failures} total_raw={len(raw_list)}"
         ),
     )
-    return candidates + excluded  # return all; caller can filter by .excluded
+    return candidates + excluded  # caller filters by .excluded
 
 
-def select_front_short_horizon_btc_market(now_ts: int) -> Optional[MarketRecord]:
+def _select_front_from_family(
+    candidates: List[MarketRecord],
+    excluded: List[MarketRecord],
+    family: str,
+) -> Optional[MarketRecord]:
     """
-    From current candidates, select the single best short-horizon BTC market.
-
-    Selection priority:
-      1. accepting_orders == True
-      2. active == True, closed == False
-      3. earliest end_time (front expiry)
-      4. has at least 2 tokens
-      5. both tick_size and token_ids are present
-
-    Returns the selected market (with .selected = True) or None.
-    Logs the full candidate list and selection rationale.
+    Internal: select the front (earliest end_time, accepting_orders first) market
+    from a pre-filtered list of candidates for a given family label.
     """
-    all_markets = list_candidate_btc_markets()
-    candidates = [m for m in all_markets if not m.excluded]
-    excluded = [m for m in all_markets if m.excluded]
+    pool = [m for m in candidates if m.family_label == family]
 
-    # Sort: accepting_orders first, then earliest end_time
     def sort_key(m: MarketRecord):
         accepting = 0 if _is_accepting_orders(m) else 1
         end = m.end_time or m.resolution_time or int(9e15)
         return (accepting, end)
 
-    candidates_sorted = sorted(candidates, key=sort_key)
-
-    selected: Optional[MarketRecord] = None
-    for m in candidates_sorted:
+    for m in sorted(pool, key=sort_key):
         if len(m.tokens) < 2:
             m.excluded = True
             m.exclusion_reason = "fewer_than_2_tokens"
             excluded.append(m)
             continue
-        # Good enough to select
         m.selected = True
-        selected = m
-        break
+        return m
 
-    # Update cache
+    return None
+
+
+def select_markets_by_family(now_ts: int) -> Dict[str, Optional[MarketRecord]]:
+    """
+    Discover and select the front market for each allowed family.
+
+    Returns:
+      {
+        "15m": MarketRecord | None,   # primary execution lane
+        "5m":  MarketRecord | None,   # observer / regime / gate lane
+      }
+
+    Selection priority within each family:
+      1. accepting_orders == True
+      2. earliest end_time (front expiry)
+      3. at least 2 tokens
+
+    Logs a market_selection event for each family.
+    Updates the module-level cache.
+    """
+    all_markets = list_candidate_btc_markets()
+    candidates = [m for m in all_markets if not m.excluded]
+    excluded   = [m for m in all_markets if m.excluded]
+
+    result: Dict[str, Optional[MarketRecord]] = {"15m": None, "5m": None}
+
+    for family in ("15m", "5m"):
+        sel = _select_front_from_family(candidates, excluded, family)
+        result[family] = sel
+
+        log.log_market_selection(
+            selected_market=sel,
+            candidates=[m for m in candidates if m.family_label == family and not m.excluded],
+            excluded=excluded,
+        )
+        if sel is None:
+            log.log_system_event(
+                "no_market_selected",
+                detail=f"no accepting market found for family={family}",
+                level="warning",
+                extra={"family": family},
+            )
+        else:
+            log.log_system_event(
+                "market_selected",
+                detail=f"family={family} slug={sel.market_slug} end={sel.end_time}",
+                extra={"family": family, "market_slug": sel.market_slug,
+                       "end_time": sel.end_time, "token_ids": [t.token_id for t in sel.tokens]},
+            )
+
     with _cache_lock:
         global _cache_markets, _cache_ts
         _cache_markets = all_markets
         _cache_ts = time.time()
 
-    # Log the selection event
-    log.log_market_selection(
-        selected_market=selected,
-        candidates=[m for m in candidates_sorted if not m.excluded],
-        excluded=excluded,
-    )
+    return result
 
-    if selected is None:
-        log.log_system_event(
-            "no_market_selected",
-            detail="no accepting short-horizon BTC market found",
-            level="warning",
-        )
 
-    return selected
+def select_front_short_horizon_btc_market(now_ts: int) -> Optional[MarketRecord]:
+    """
+    Backward-compatible wrapper: returns the front 15m market only.
+    Prefer select_markets_by_family() for dual-lane operation.
+    """
+    return select_markets_by_family(now_ts).get("15m")
 
 
 def refresh_market_cache() -> None:

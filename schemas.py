@@ -76,6 +76,16 @@ class MarketRecord:
     min_incentive_size: Optional[float] = None
     max_incentive_spread: Optional[float] = None
 
+    # Family classification — set by discovery layer, never by normaliser
+    # "15m" = primary execution family (btc-updown-15m-*)
+    # "5m"  = observer/regime/gate family (btc-updown-5m-*)
+    # None  = not yet classified or excluded
+    family_label: Optional[str] = None
+
+    # Resolution reference — explicit for all qualifying markets
+    # External spot price is observer-only; settlement truth is Chainlink
+    resolution_reference: str = "chainlink_btc_usd"
+
     # Raw preservation for unknown fields
     raw_fields: Dict[str, Any] = field(default_factory=dict)
 
@@ -174,6 +184,10 @@ class JoinedObservation:
     fee_unknown: bool = False
     tick_unknown: bool = False
     min_size_unknown: bool = False
+
+    # Which market family this observation belongs to
+    # "15m" = primary execution lane | "5m" = observer/regime/gate lane
+    family_label: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

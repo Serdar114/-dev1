@@ -30,7 +30,7 @@ import signal
 import sys
 import threading
 import time
-from typing import Optional
+from typing import Dict, Optional
 
 import logger as log
 from schemas import ExecutionRecord, FeeContext, JoinedObservation, MarketRecord
@@ -72,30 +72,19 @@ def _is_stale(last_ms: Optional[int], threshold_ms: int) -> bool:
 # Market setup
 # ---------------------------------------------------------------------------
 
-def _setup_market(now_ts: int):
-    """
-    Discover and return the selected market plus fee context.
-    Returns (market, fee_context) or (None, None).
-    """
-    market = gamma_api.select_front_short_horizon_btc_market(now_ts)
-    if market is None:
-        log.log_system_event(
-            "no_market_available",
-            detail="no accepting short-horizon BTC market found; will retry",
-            level="warning",
-        )
-        return None, None
-
-    # Fetch tick size and fee rate from CLOB REST for each token
+def _enrich_and_build_fee_context(market: MarketRecord) -> FeeContext:
+    """Fetch CLOB tick/fee metadata and merge into the market record in-place."""
     if market.tokens:
         primary_token = market.tokens[0].token_id
         meta = clob_rest.enrich_book_with_meta(primary_token, market.condition_id)
         log.log_system_event(
             "clob_meta_fetched",
-            detail=f"tick={meta['tick_size']} fee={meta['fee_rate']} ({meta['fee_status']})",
-            extra=meta,
+            detail=(
+                f"family={market.family_label} tick={meta['tick_size']} "
+                f"fee={meta['fee_rate']} ({meta['fee_status']})"
+            ),
+            extra={**meta, "family": market.family_label},
         )
-        # Merge CLOB-discovered values back if market object lacked them
         if market.minimum_tick_size is None and meta["tick_size"] is not None:
             market.minimum_tick_size = meta["tick_size"]
         if market.fee_rate_bps is None and meta["fee_rate"] is not None:
@@ -103,24 +92,54 @@ def _setup_market(now_ts: int):
         if market.fees_enabled is None and meta["fees_enabled"] is not None:
             market.fees_enabled = meta["fees_enabled"]
 
-    fee_context = FeeContext(
+    return FeeContext(
         fees_enabled=market.fees_enabled,
         fee_schedule_source="gamma_market_object_plus_clob_rest",
         fee_rate_lookup_value=market.fee_rate_bps,
         fee_rate_lookup_units="bps",
         fee_lookup_ts=_now_ms(),
         fee_lookup_status="ok" if market.fee_rate_bps is not None else "unknown",
-        fee_formula_version=None,  # not yet discoverable; will populate if found
+        fee_formula_version=None,
     )
 
-    # Log full market snapshot with fee context
-    log.log_market_snapshot(market, fee_context)
 
-    # Write future execution schema stub (no order data in Day 1-2)
+def _setup_all_markets(now_ts: int) -> Dict[str, tuple]:
+    """
+    Discover and enrich both market families.
+
+    Returns:
+      {
+        "15m": (MarketRecord | None, FeeContext | None),
+        "5m":  (MarketRecord | None, FeeContext | None),
+      }
+
+    15m = primary execution family (btc-updown-15m-*)
+    5m  = observer / regime / gate family (btc-updown-5m-*)
+    """
+    markets_by_family = gamma_api.select_markets_by_family(now_ts)
+    result: Dict[str, tuple] = {}
+
+    for family in ("15m", "5m"):
+        market = markets_by_family.get(family)
+        if market is None:
+            log.log_system_event(
+                "no_market_available",
+                detail=f"family={family}: no accepting market found; will retry",
+                level="warning",
+                extra={"family": family},
+            )
+            result[family] = (None, None)
+            continue
+
+        fee_ctx = _enrich_and_build_fee_context(market)
+        log.log_market_snapshot(market, fee_ctx)
+        result[family] = (market, fee_ctx)
+
+    # Write future execution schema stub once per refresh (no order data Day 1-2)
     stub = ExecutionRecord(ts_local=_now_ms())
     log.log_future_execution_schema_stub(stub)
 
-    return market, fee_context
+    return result
 
 
 def _token_side_labels(market: MarketRecord):
@@ -163,6 +182,7 @@ def _build_observation(
     up_token_id: Optional[str],
     down_token_id: Optional[str],
     fee_context: Optional[FeeContext],
+    family_label: Optional[str] = None,
 ) -> JoinedObservation:
     ts_local = _now_ms()
 
@@ -250,6 +270,7 @@ def _build_observation(
         fee_unknown=fee_unknown,
         tick_unknown=tick_unknown,
         min_size_unknown=min_size_unknown,
+        family_label=family_label or (market.family_label if market else None),
     )
 
 
@@ -265,15 +286,28 @@ def run() -> None:
         "run_duration_s": RUN_DURATION_S,
         "observation_interval_s": OBSERVATION_INTERVAL_S,
         "market_refresh_interval_s": MARKET_REFRESH_INTERVAL_S,
+        "families": ["15m (primary execution)", "5m (observer/regime/gate)"],
         "log_dir": os.environ.get("LOG_DIR", "logs"),
     })
 
-    # ---- State ----
-    market: Optional[MarketRecord] = None
-    fee_context = None
-    ws_client: Optional[ClobWsClient] = None
-    up_token_id: Optional[str] = None
-    down_token_id: Optional[str] = None
+    # ---- Dual-lane state: one slot per family ----
+    # "15m" = primary execution family (btc-updown-15m-*)
+    # "5m"  = observer / regime / gate family (btc-updown-5m-*)
+    obs_lock = threading.Lock()
+    _obs_state: Dict[str, dict] = {
+        "15m": {
+            "market": None, "ws_client": None, "fee_context": None,
+            "up_token_id": None, "down_token_id": None,
+        },
+        "5m": {
+            "market": None, "ws_client": None, "fee_context": None,
+            "up_token_id": None, "down_token_id": None,
+        },
+    }
+    # Local copies for coordination loop (no lock needed there, updated atomically)
+    _live_markets: Dict[str, Optional[MarketRecord]] = {"15m": None, "5m": None}
+    _live_ws: Dict[str, Optional[ClobWsClient]] = {"15m": None, "5m": None}
+    _live_fee: Dict[str, Optional[FeeContext]] = {"15m": None, "5m": None}
 
     last_market_refresh = 0.0
     last_liveness_check = 0.0
@@ -295,16 +329,9 @@ def run() -> None:
     signal.signal(signal.SIGTERM, _on_signal)
 
     # ---- Strict 2-second observation timer ----
-    # Use a separate thread with a tight loop to ensure 2s cadence is not
-    # distorted by market refresh or other blocking operations.
-    obs_lock = threading.Lock()
-    _obs_state = {
-        "market": None,
-        "ws_client": None,
-        "fee_context": None,
-        "up_token_id": None,
-        "down_token_id": None,
-    }
+    # Dedicated thread with next_tick arithmetic prevents cadence drift.
+    # Emits TWO records per tick: one for 15m lane, one for 5m lane.
+    # Both go to joined_observation.jsonl with family_label set.
 
     def _observation_loop():
         next_tick = time.time() + OBSERVATION_INTERVAL_S
@@ -316,17 +343,23 @@ def run() -> None:
             next_tick += OBSERVATION_INTERVAL_S
 
             with obs_lock:
-                m = _obs_state["market"]
-                wsc = _obs_state["ws_client"]
-                fc = _obs_state["fee_context"]
-                up_t = _obs_state["up_token_id"]
-                dn_t = _obs_state["down_token_id"]
+                snap_15m = dict(_obs_state["15m"])
+                snap_5m  = dict(_obs_state["5m"])
 
-            try:
-                obs = _build_observation(m, wsc, rtds, up_t, dn_t, fc)
-                log.log_joined_observation(obs)
-            except Exception as exc:
-                log.log_exception("observation_loop", exc)
+            for lane, snap in (("15m", snap_15m), ("5m", snap_5m)):
+                try:
+                    obs = _build_observation(
+                        market=snap["market"],
+                        ws_client=snap["ws_client"],
+                        rtds=rtds,
+                        up_token_id=snap["up_token_id"],
+                        down_token_id=snap["down_token_id"],
+                        fee_context=snap["fee_context"],
+                        family_label=lane,
+                    )
+                    log.log_joined_observation(obs)
+                except Exception as exc:
+                    log.log_exception(f"observation_loop.{lane}", exc)
 
     obs_thread = threading.Thread(target=_observation_loop, daemon=True, name="obs_loop")
     obs_thread.start()
@@ -336,69 +369,86 @@ def run() -> None:
         while not shutdown_flag.is_set() and time.time() < end_time:
             now = time.time()
 
-            # Market refresh
+            # Market refresh — discover both families each cycle
             if now - last_market_refresh >= MARKET_REFRESH_INTERVAL_S:
                 last_market_refresh = now
-                new_market, new_fee_ctx = _setup_market(_now_ms())
+                setup = _setup_all_markets(_now_ms())
 
-                if new_market is not None:
-                    new_up, new_dn, side_labels = _token_side_labels(new_market)
-                    token_ids = [t.token_id for t in new_market.tokens]
+                for family in ("15m", "5m"):
+                    new_market, new_fee_ctx = setup[family]
 
-                    # If token ids changed (new market window or first run), restart WS
-                    old_token_ids = sorted([t.token_id for t in market.tokens] if market else [])
-                    if sorted(token_ids) != old_token_ids:
-                        if ws_client is not None:
-                            ws_client.stop()
-                        ws_client = ClobWsClient(
-                            token_ids=token_ids,
-                            side_labels=side_labels,
-                            market_slug=new_market.market_slug,
-                        )
-                        ws_client.start()
-                        log.log_system_event(
-                            "clob_ws_restarted",
-                            detail=f"new token_ids={token_ids}",
-                        )
+                    if new_market is not None:
+                        new_up, new_dn, side_labels = _token_side_labels(new_market)
+                        token_ids = [t.token_id for t in new_market.tokens]
 
-                    with obs_lock:
-                        _obs_state["market"] = new_market
-                        _obs_state["ws_client"] = ws_client
-                        _obs_state["fee_context"] = new_fee_ctx
-                        _obs_state["up_token_id"] = new_up
-                        _obs_state["down_token_id"] = new_dn
+                        # Restart WS only if token ids changed for this lane
+                        old_market = _live_markets.get(family)
+                        old_ids = sorted([t.token_id for t in old_market.tokens] if old_market else [])
+                        if sorted(token_ids) != old_ids:
+                            old_ws = _live_ws.get(family)
+                            if old_ws is not None:
+                                old_ws.stop()
+                            new_ws = ClobWsClient(
+                                token_ids=token_ids,
+                                side_labels=side_labels,
+                                market_slug=new_market.market_slug,
+                            )
+                            new_ws.start()
+                            _live_ws[family] = new_ws
+                            log.log_system_event(
+                                "clob_ws_restarted",
+                                detail=f"family={family} new token_ids={token_ids}",
+                                extra={"family": family},
+                            )
+                        else:
+                            new_ws = _live_ws.get(family)
 
-                    market = new_market
-                    fee_context = new_fee_ctx
-                    up_token_id = new_up
-                    down_token_id = new_dn
+                        _live_markets[family] = new_market
+                        _live_fee[family] = new_fee_ctx
 
-            # Liveness checks
+                        with obs_lock:
+                            _obs_state[family]["market"] = new_market
+                            _obs_state[family]["ws_client"] = new_ws
+                            _obs_state[family]["fee_context"] = new_fee_ctx
+                            _obs_state[family]["up_token_id"] = new_up
+                            _obs_state[family]["down_token_id"] = new_dn
+
+            # Liveness checks for both lanes
             if now - last_liveness_check >= LIVENESS_CHECK_INTERVAL_S:
                 last_liveness_check = now
                 rtds.check_liveness()
-                if ws_client:
-                    ws_client.check_liveness()
+                for family in ("15m", "5m"):
+                    ws = _live_ws.get(family)
+                    if ws:
+                        ws.check_liveness()
 
-            # Periodic book snapshots to books.jsonl
-            if now - last_book_log >= BOOK_LOG_INTERVAL_S and ws_client:
+            # Periodic book snapshots to books.jsonl (both lanes)
+            if now - last_book_log >= BOOK_LOG_INTERVAL_S:
                 last_book_log = now
-                for snap in ws_client.get_all_snapshots().values():
-                    log.log_book_snapshot(snap)
+                for family in ("15m", "5m"):
+                    ws = _live_ws.get(family)
+                    if ws:
+                        for snap in ws.get_all_snapshots().values():
+                            log.log_book_snapshot(snap)
 
-            # Periodic full market metadata re-log
-            if now - last_market_snapshot_log >= MARKET_SNAPSHOT_LOG_INTERVAL_S and market:
+            # Periodic full market metadata re-log (both lanes)
+            if now - last_market_snapshot_log >= MARKET_SNAPSHOT_LOG_INTERVAL_S:
                 last_market_snapshot_log = now
-                log.log_market_snapshot(market, fee_context)
+                for family in ("15m", "5m"):
+                    m = _live_markets.get(family)
+                    if m:
+                        log.log_market_snapshot(m, _live_fee.get(family))
 
-            time.sleep(0.1)  # short sleep so main loop isn't a busy-wait
+            time.sleep(0.1)
 
     except Exception as exc:
         log.log_exception("main_loop", exc)
     finally:
         shutdown_flag.set()
-        if ws_client:
-            ws_client.stop()
+        for family in ("15m", "5m"):
+            ws = _live_ws.get(family)
+            if ws:
+                ws.stop()
         rtds.stop()
         log.log_shutdown(reason="run_complete" if time.time() >= end_time else "shutdown_signal")
 
