@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import requests
 
@@ -71,6 +71,18 @@ RESOLUTION_REFERENCE = "chainlink_btc_usd"
 
 # HTTP timeout
 HTTP_TIMEOUT_S = 10
+
+# ---------------------------------------------------------------------------
+# Rejection reason codes — used in every discovery log record
+# ---------------------------------------------------------------------------
+
+REASON_NO_SLUG_MATCH       = "no_slug_match"        # slug/event_slug doesn't match allowed prefixes
+REASON_TIMING_REJECTED     = "timing_rejected"       # end_time already past
+REASON_TOKEN_PARSE_FAILED  = "token_parse_failed"    # token extraction returned empty list
+REASON_FEWER_THAN_2_TOKENS = "fewer_than_2_tokens"   # selection layer: need Up+Down pair
+REASON_STATE_REJECTED      = "state_rejected"        # accepting_orders=False AND active=False
+REASON_UNKNOWN_SHAPE       = "unknown_shape"         # raw dict missing required id field
+REASON_SELECTION_EXCEPTION = "selection_exception"   # exception during selection logic
 
 # ---------------------------------------------------------------------------
 # Module-level cache
@@ -378,14 +390,28 @@ def _is_accepting_orders(m: MarketRecord) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# API fetch with pagination
+# API fetch helpers
 # ---------------------------------------------------------------------------
+
+def _unwrap_response(data: Any, context: str) -> List[Dict[str, Any]]:
+    """Unwrap Gamma API response — handles bare list or {"data": [...]} wrapper."""
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        inner = data.get("data") or data.get("markets") or data.get("results")
+        if isinstance(inner, list):
+            return inner
+        log.log_parse_anomaly(context, "response_root", list(data.keys()), "dict without known list key")
+        return []
+    log.log_parse_anomaly(context, "response_root", type(data).__name__, "unexpected root type")
+    return []
+
 
 def _fetch_markets_page(params: Dict[str, Any]) -> List[Dict[str, Any]]:
     try:
         resp = requests.get(MARKETS_ENDPOINT, params=params, timeout=HTTP_TIMEOUT_S)
         resp.raise_for_status()
-        data = resp.json()
+        return _unwrap_response(resp.json(), "gamma_api.markets")
     except requests.RequestException as exc:
         log.log_exception("gamma_api._fetch_markets_page", exc, {"params": params})
         return []
@@ -393,79 +419,199 @@ def _fetch_markets_page(params: Dict[str, Any]) -> List[Dict[str, Any]]:
         log.log_exception("gamma_api._fetch_markets_page.json_decode", exc)
         return []
 
-    # Gamma may return list directly or {"data": [...]}
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict) and "data" in data:
-        inner = data["data"]
-        if isinstance(inner, list):
-            return inner
-        log.log_parse_anomaly("gamma_api", "data", type(inner).__name__, "expected list under 'data'")
+
+def _fetch_events_page(params: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Fetch one page from the /events endpoint."""
+    try:
+        resp = requests.get(EVENTS_ENDPOINT, params=params, timeout=HTTP_TIMEOUT_S)
+        resp.raise_for_status()
+        return _unwrap_response(resp.json(), "gamma_api.events")
+    except requests.RequestException as exc:
+        log.log_exception("gamma_api._fetch_events_page", exc, {"params": params})
+        return []
+    except ValueError as exc:
+        log.log_exception("gamma_api._fetch_events_page.json_decode", exc)
         return []
 
-    log.log_parse_anomaly("gamma_api", "response_root", type(data).__name__, "unexpected root type")
-    return []
+
+def _markets_from_events(
+    events: List[Dict[str, Any]], seen_ids: Set[str]
+) -> List[Dict[str, Any]]:
+    """
+    Extract market dicts from Gamma event objects.
+
+    btc-updown-* slugs are event slugs. Each event object carries a `markets`
+    array with the Up and Down market records. We stamp `eventSlug` onto each
+    child market so _detect_family can route by event slug when the market's
+    own slug doesn't start with the allowed prefix.
+    """
+    result: List[Dict[str, Any]] = []
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        ev_slug = ev.get("slug") or ev.get("eventSlug") or ev.get("market_slug") or ""
+        raw_markets = ev.get("markets")
+        if not isinstance(raw_markets, list):
+            # Some shapes embed markets differently; try top-level as a market itself
+            raw_markets = []
+            if ev.get("id") or ev.get("conditionId"):
+                raw_markets = [ev]
+
+        for m in raw_markets:
+            if not isinstance(m, dict):
+                continue
+            mid = str(m.get("id") or m.get("conditionId") or "")
+            if not mid or mid in seen_ids:
+                continue
+            seen_ids.add(mid)
+            # Stamp event slug if not already present — critical for _detect_family
+            m_copy = dict(m)
+            if not m_copy.get("eventSlug") and not m_copy.get("event_slug"):
+                m_copy["eventSlug"] = ev_slug
+            result.append(m_copy)
+    return result
+
+
+def _collect_from_markets_endpoint(
+    params: Dict[str, Any], seen_ids: Set[str]
+) -> List[Dict[str, Any]]:
+    """Page through /markets with given params; dedup by seen_ids."""
+    result: List[Dict[str, Any]] = []
+    offset = params.pop("_offset_start", 0)
+    while True:
+        p = {**params, "limit": PAGE_LIMIT, "offset": offset}
+        page = _fetch_markets_page(p)
+        if not page:
+            break
+        for m in page:
+            mid = str(m.get("id") or m.get("conditionId") or "")
+            if mid and mid not in seen_ids:
+                seen_ids.add(mid)
+                result.append(m)
+        if len(page) < PAGE_LIMIT:
+            break
+        offset += PAGE_LIMIT
+    return result
+
+
+def _collect_from_events_endpoint(
+    params: Dict[str, Any], seen_ids: Set[str]
+) -> List[Dict[str, Any]]:
+    """Page through /events with given params; extract markets; dedup by seen_ids."""
+    result: List[Dict[str, Any]] = []
+    offset = params.pop("_offset_start", 0)
+    while True:
+        p = {**params, "limit": PAGE_LIMIT, "offset": offset}
+        events = _fetch_events_page(p)
+        if not events:
+            break
+        result.extend(_markets_from_events(events, seen_ids))
+        if len(events) < PAGE_LIMIT:
+            break
+        offset += PAGE_LIMIT
+    return result
 
 
 def _fetch_all_active_btc_candidates() -> List[Dict[str, Any]]:
     """
-    Page through the Gamma /markets endpoint collecting BTC candidates.
-    Queries both by tag and by active status to maximise discovery.
+    Multi-strategy BTC candidate fetch.
+
+    Strategy 1 (PRIMARY) — /events slug-prefix search:
+      btc-updown-15m-* and btc-updown-5m-* are event slugs on Polymarket.
+      Each event embeds Up + Down markets. We query /events by the known
+      family prefixes. Server-side active/closed filters are intentionally
+      omitted here — short-horizon windows cycle states quickly and the
+      normaliser will record state flags; we must not pre-filter at the API layer.
+
+    Strategy 2 — /events tag search:
+      Query /events with tag_slug=btc/bitcoin to catch events that the slug
+      search misses (e.g. if the API doesn't support slug_contains).
+
+    Strategy 3 — /markets tag search (existing approach, no active/closed filter):
+      Kept as fallback. active/closed removed so we don't miss markets whose
+      state the API reports differently from what we expect.
+
+    Strategy 4 — /markets question_contains:
+      Broad fallback. Also no active/closed filter.
     """
     all_raw: List[Dict[str, Any]] = []
-    seen_ids: set = set()
+    seen_ids: Set[str] = set()
 
-    # Strategy 1: tag-based search
+    # ---- Strategy 1: /events by slug prefix ----
+    for prefix in ("btc-updown-15m", "btc-updown-5m", "btc-updown"):
+        found = _collect_from_events_endpoint({"slug": prefix}, seen_ids)
+        if not found:
+            # Also try slug_contains if the API supports it
+            found = _collect_from_events_endpoint({"slug_contains": prefix}, seen_ids)
+        all_raw.extend(found)
+        log.log_system_event(
+            "gamma_events_fetch",
+            detail=f"events slug={prefix!r}: {len(found)} markets extracted",
+            extra={"strategy": "events_slug", "prefix": prefix, "count": len(found)},
+        )
+
+    # ---- Strategy 2: /events tag search ----
     for tag in ("btc", "bitcoin", "crypto"):
-        offset = 0
-        while True:
-            params = {
-                "tag_slug": tag,
-                "active": "true",
-                "closed": "false",
-                "limit": PAGE_LIMIT,
-                "offset": offset,
-            }
-            page = _fetch_markets_page(params)
-            if not page:
-                break
-            for m in page:
-                mid = m.get("id") or m.get("conditionId")
-                if mid and mid not in seen_ids:
-                    seen_ids.add(mid)
-                    all_raw.append(m)
-            if len(page) < PAGE_LIMIT:
-                break
-            offset += PAGE_LIMIT
+        found = _collect_from_events_endpoint({"tag_slug": tag}, seen_ids)
+        all_raw.extend(found)
+        log.log_system_event(
+            "gamma_events_fetch",
+            detail=f"events tag_slug={tag!r}: {len(found)} new markets",
+            extra={"strategy": "events_tag", "tag": tag, "count": len(found)},
+        )
 
-    # Strategy 2: question contains "BTC" (catches markets missing btc tag)
-    for kw in ("BTC", "Bitcoin"):
-        offset = 0
-        while True:
-            params = {
-                "question_contains": kw,
-                "active": "true",
-                "closed": "false",
-                "limit": PAGE_LIMIT,
-                "offset": offset,
-            }
-            page = _fetch_markets_page(params)
-            if not page:
-                break
-            for m in page:
-                mid = m.get("id") or m.get("conditionId")
-                if mid and mid not in seen_ids:
-                    seen_ids.add(mid)
-                    all_raw.append(m)
-            if len(page) < PAGE_LIMIT:
-                break
-            offset += PAGE_LIMIT
+    # ---- Strategy 3: /markets tag search (no active/closed filter) ----
+    for tag in ("btc", "bitcoin", "crypto"):
+        found = _collect_from_markets_endpoint({"tag_slug": tag}, seen_ids)
+        all_raw.extend(found)
+
+    # ---- Strategy 4: /markets question_contains ----
+    for kw in ("BTC", "Bitcoin", "btc updown", "btc-updown"):
+        found = _collect_from_markets_endpoint({"question_contains": kw}, seen_ids)
+        all_raw.extend(found)
 
     log.log_system_event(
         "gamma_fetch_complete",
-        detail=f"fetched {len(all_raw)} unique raw markets from Gamma",
+        detail=f"fetched {len(all_raw)} unique raw market records across all strategies",
+        extra={"total_candidates": len(all_raw)},
     )
     return all_raw
+
+
+# ---------------------------------------------------------------------------
+# Per-candidate discovery log (written to markets.jsonl)
+# ---------------------------------------------------------------------------
+
+def _log_discovery_candidate(
+    m: MarketRecord,
+    status: str,
+    reason: str,
+) -> None:
+    """
+    Write one structured record to markets.jsonl for every candidate seen.
+
+    status : "accepted" | "rejected"
+    reason : one of the REASON_* constants, or a free-form extension string
+
+    This is the audit trail that makes 'why is market_discovery empty?' answerable.
+    """
+    rec: Dict[str, Any] = {
+        "ts_local": _now_ms(),
+        "event": "discovery_candidate",
+        "status": status,
+        "reason": reason,
+        "market_slug": m.market_slug,
+        "event_slug": m.event_slug,
+        "market_id": m.market_id,
+        "family_label": m.family_label,
+        "active": m.active,
+        "closed": m.closed,
+        "accepting_orders": m.accepting_orders,
+        "end_time": m.end_time,
+        "token_count": len(m.tokens),
+        "parse_warnings": m.parse_warnings,
+    }
+    log.streams.markets.write(rec)
 
 
 # ---------------------------------------------------------------------------
@@ -476,17 +622,28 @@ def list_candidate_btc_markets() -> List[MarketRecord]:
     """
     Fetch, parse, and return markets that belong to the two allowed families.
 
-    Allowed:  btc-updown-15m-*  (family_label="15m")
-              btc-updown-5m-*   (family_label="5m")
-    Excluded: everything else — including all generic will-btc-be-above-*,
-              bitcoin-above, price-target markets, and any BTC market that
-              does not match the strict slug-prefix contract.
+    Acceptance:
+      btc-updown-15m-<unix_ts>  (family_label="15m") — primary execution family
+      btc-updown-5m-<unix_ts>   (family_label="5m")  — observer / gate family
 
-    Returns all records (candidates + excluded) with .excluded / .exclusion_reason set.
-    Never silently drops — every rejection is recorded.
+    The match is performed on market_slug first, then event_slug (fallback).
+    The unix timestamp suffix is not validated — any suffix is accepted.
+
+    Every candidate is logged to markets.jsonl with status + reason code so
+    the discovery audit trail is never empty when candidates exist.
+
+    Returns all records (accepted + excluded) with .excluded / .exclusion_reason set.
     """
     now_ms = _now_ms()
     raw_list = _fetch_all_active_btc_candidates()
+
+    if not raw_list:
+        log.log_system_event(
+            "gamma_no_raw_candidates",
+            detail="all fetch strategies returned 0 raw market records",
+            level="warning",
+            extra={"reason": "no_raw_candidates_from_api"},
+        )
 
     candidates: List[MarketRecord] = []
     excluded: List[MarketRecord] = []
@@ -496,54 +653,91 @@ def list_candidate_btc_markets() -> List[MarketRecord]:
         m = _normalise_market(raw)
         if m is None:
             parse_failures += 1
+            # Write a minimal record even for completely unparseable inputs
+            log.streams.markets.write({
+                "ts_local": _now_ms(),
+                "event": "discovery_candidate",
+                "status": "rejected",
+                "reason": REASON_UNKNOWN_SHAPE,
+                "raw_id": str(raw.get("id") or raw.get("conditionId") or "?")[:80],
+                "raw_slug": str(raw.get("slug") or raw.get("marketSlug") or "?")[:80],
+            })
             continue
 
+        # ----------------------------------------------------------------
         # Filter 1: strict family slug-prefix match
+        # Accepts: btc-updown-15m-<any>  or  btc-updown-5m-<any>
+        # Checks market_slug first; falls back to event_slug
+        # ----------------------------------------------------------------
         family = _detect_family(m)
         if family is None:
             m.excluded = True
             m.exclusion_reason = (
-                f"not_in_allowed_family (slug={m.market_slug!r}); "
-                "only btc-updown-15m-* and btc-updown-5m-* are accepted"
+                f"{REASON_NO_SLUG_MATCH}: slug={m.market_slug!r} "
+                f"event_slug={m.event_slug!r}; "
+                "only btc-updown-15m-* and btc-updown-5m-* accepted"
             )
             excluded.append(m)
+            _log_discovery_candidate(m, "rejected", REASON_NO_SLUG_MATCH)
             continue
 
-        # Stamp family and resolution reference on qualifying records
+        # Stamp family + resolution reference on qualifying records
         m.family_label = family
         m.resolution_reference = RESOLUTION_REFERENCE
 
+        # ----------------------------------------------------------------
         # Filter 2: market window must not have already closed
+        # ----------------------------------------------------------------
         if not _is_not_expired(m, now_ms):
             m.excluded = True
-            m.exclusion_reason = f"already_expired (end_time={m.end_time})"
+            m.exclusion_reason = (
+                f"{REASON_TIMING_REJECTED}: end_time={m.end_time} now={now_ms}"
+            )
             excluded.append(m)
+            _log_discovery_candidate(m, "rejected", REASON_TIMING_REJECTED)
             continue
 
-        # Filter 3: must have tokens
+        # ----------------------------------------------------------------
+        # Filter 3: must have at least one token (Up or Down)
+        # ----------------------------------------------------------------
         if not m.tokens:
             m.excluded = True
-            m.exclusion_reason = "no_tokens"
+            m.exclusion_reason = REASON_TOKEN_PARSE_FAILED
             excluded.append(m)
+            _log_discovery_candidate(m, "rejected", REASON_TOKEN_PARSE_FAILED)
             continue
 
+        # Accepted — log before appending
+        _log_discovery_candidate(m, "accepted", f"family={family}")
         candidates.append(m)
 
     if parse_failures:
         log.log_system_event(
             "gamma_parse_failures",
-            detail=f"{parse_failures} market records could not be identified at all",
+            detail=f"{parse_failures} market records dropped ({REASON_UNKNOWN_SHAPE})",
             level="warning",
+            extra={"count": parse_failures, "reason": REASON_UNKNOWN_SHAPE},
         )
 
-    by_family = {"15m": sum(1 for m in candidates if m.family_label == "15m"),
-                 "5m":  sum(1 for m in candidates if m.family_label == "5m")}
+    by_family = {
+        "15m": sum(1 for m in candidates if m.family_label == "15m"),
+        "5m":  sum(1 for m in candidates if m.family_label == "5m"),
+    }
     log.log_system_event(
         "gamma_candidates",
         detail=(
-            f"candidates={len(candidates)} (15m={by_family['15m']} 5m={by_family['5m']}) "
-            f"excluded={len(excluded)} parse_failures={parse_failures} total_raw={len(raw_list)}"
+            f"candidates={len(candidates)} "
+            f"(15m={by_family['15m']} 5m={by_family['5m']}) "
+            f"excluded={len(excluded)} parse_failures={parse_failures} "
+            f"total_raw={len(raw_list)}"
         ),
+        extra={
+            "candidates_15m": by_family["15m"],
+            "candidates_5m": by_family["5m"],
+            "excluded": len(excluded),
+            "parse_failures": parse_failures,
+            "total_raw": len(raw_list),
+        },
     )
     return candidates + excluded  # caller filters by .excluded
 
@@ -567,8 +761,9 @@ def _select_front_from_family(
     for m in sorted(pool, key=sort_key):
         if len(m.tokens) < 2:
             m.excluded = True
-            m.exclusion_reason = "fewer_than_2_tokens"
+            m.exclusion_reason = REASON_FEWER_THAN_2_TOKENS
             excluded.append(m)
+            _log_discovery_candidate(m, "rejected", REASON_FEWER_THAN_2_TOKENS)
             continue
         m.selected = True
         return m
@@ -601,27 +796,56 @@ def select_markets_by_family(now_ts: int) -> Dict[str, Optional[MarketRecord]]:
     result: Dict[str, Optional[MarketRecord]] = {"15m": None, "5m": None}
 
     for family in ("15m", "5m"):
-        sel = _select_front_from_family(candidates, excluded, family)
+        try:
+            sel = _select_front_from_family(candidates, excluded, family)
+        except Exception as exc:
+            log.log_exception(
+                f"gamma_api.select_front.{family}", exc,
+                {"reason": REASON_SELECTION_EXCEPTION, "family": family},
+            )
+            result[family] = None
+            continue
+
         result[family] = sel
 
+        family_candidates = [m for m in candidates if m.family_label == family and not m.excluded]
         log.log_market_selection(
             selected_market=sel,
-            candidates=[m for m in candidates if m.family_label == family and not m.excluded],
+            candidates=family_candidates,
             excluded=excluded,
         )
         if sel is None:
+            # Distinguish: were there candidates that all failed token check, or none at all?
+            reason = "no_active_candidates" if not family_candidates else "no_valid_token_pair"
             log.log_system_event(
                 "no_market_selected",
-                detail=f"no accepting market found for family={family}",
+                detail=f"family={family} reason={reason}",
                 level="warning",
-                extra={"family": family},
+                extra={"family": family, "reason": reason,
+                       "candidate_count": len(family_candidates)},
             )
+            # Write explicit discovery_audit record so markets.jsonl is never silent
+            log.streams.markets.write({
+                "ts_local": _now_ms(),
+                "event": "discovery_audit",
+                "family": family,
+                "selected": None,
+                "reason": reason,
+                "candidate_count": len(family_candidates),
+                "total_raw": len(candidates) + len(excluded),
+            })
         else:
             log.log_system_event(
                 "market_selected",
                 detail=f"family={family} slug={sel.market_slug} end={sel.end_time}",
-                extra={"family": family, "market_slug": sel.market_slug,
-                       "end_time": sel.end_time, "token_ids": [t.token_id for t in sel.tokens]},
+                extra={
+                    "family": family,
+                    "market_slug": sel.market_slug,
+                    "end_time": sel.end_time,
+                    "token_ids": [t.token_id for t in sel.tokens],
+                    "accepting_orders": sel.accepting_orders,
+                    "active": sel.active,
+                },
             )
 
     with _cache_lock:
