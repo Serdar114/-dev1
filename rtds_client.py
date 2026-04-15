@@ -4,13 +4,19 @@ rtds_client.py — Dual-source BTC reference price via Polymarket RTDS WebSocket
 Single connection to Polymarket RTDS WS:
   wss://ws-live-data.polymarket.com
 
-On connect, two subscription messages are sent (official Polymarket RTDS shape):
+On connect, two all-symbol subscription messages are sent.
+Server-side per-symbol filters are intentionally omitted to avoid
+"invalid Subscription.Filters" rejection; BTC filtering is done client-side.
 
-  Binance:
-    {"action":"subscribe","subscriptions":[{"topic":"crypto_prices","type":"update","filters":"btcusdt"}]}
+  Binance  (all-symbol, no filters field):
+    {"action":"subscribe","subscriptions":[{"topic":"crypto_prices","type":"update"}]}
 
-  Chainlink:
-    {"action":"subscribe","subscriptions":[{"topic":"crypto_prices_chainlink","type":"*","filters":"{\"symbol\":\"btc/usd\"}"}]}
+  Chainlink (all-symbol, empty filters):
+    {"action":"subscribe","subscriptions":[{"topic":"crypto_prices_chainlink","type":"*","filters":""}]}
+
+Client-side accept list (other symbols are silently ignored, no warning logged):
+  Binance   → payload.symbol in {"btcusdt", "btc/usdt"}
+  Chainlink → payload.symbol in {"btc/usd", "btcusd"}
 
 Incoming message shape (official):
   {
@@ -24,9 +30,12 @@ Incoming message shape (official):
     }
   }
 
+Server error payloads (event=="error" or status>=400) are logged as system
+events and never forwarded to the price parser.
+
 Routing: primary on msg["topic"]; fallback on msg["channel"] for robustness.
-Price:  payload["value"]   (fallback: top-level "price"/"p").
-Time:   payload["timestamp"] (fallback: top-level "timestamp"/"ts").
+Price:   payload["value"]     (fallback: top-level "price"/"p").
+Time:    payload["timestamp"] (fallback: top-level "timestamp"/"ts").
 
 Separate state is maintained for each source.
 latest_dual() returns a DualPriceSnapshot with both prices, basis_bps, lag_ms.
@@ -76,14 +85,16 @@ RECONNECT_DELAYS_S = [1, 2, 5, 10, 30, 60]
 
 HTTP_TIMEOUT_S = 5
 
-# Subscription messages sent on connection open (official Polymarket RTDS shape)
+# Subscription messages — all-symbol subscribe (no server-side filter).
+# Specific-symbol filters caused "invalid Subscription.Filters" rejections.
+# BTC is selected client-side via _BINANCE_ACCEPTED_SYMBOLS / _CHAINLINK_ACCEPTED_SYMBOLS.
 _SUB_BINANCE = {
     "action": "subscribe",
     "subscriptions": [
         {
             "topic": "crypto_prices",
             "type": "update",
-            "filters": "btcusdt",
+            # no "filters" key — all-symbol subscribe
         }
     ],
 }
@@ -93,10 +104,17 @@ _SUB_CHAINLINK = {
         {
             "topic": "crypto_prices_chainlink",
             "type": "*",
-            "filters": "{\"symbol\":\"btc/usd\"}",
+            "filters": "",   # empty string = all-symbol subscribe
         }
     ],
 }
+
+# Client-side accepted symbols — messages for other symbols are silently dropped
+_BINANCE_ACCEPTED_SYMBOLS   = {"btcusdt", "btc/usdt"}
+_CHAINLINK_ACCEPTED_SYMBOLS = {"btc/usd", "btcusd"}
+
+# Number of raw incoming messages to debug-log after (re)connect
+_RAW_DEBUG_MSG_LIMIT = 5
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -163,6 +181,7 @@ class RtdsClient:
 
         self._reconnect_count: int = 0
         self._last_message_ms: Optional[int] = None
+        self._raw_msg_count: int = 0   # resets to 0 per reconnect for first-N debug log
 
     # -----------------------------------------------------------------------
     # Public interface
@@ -329,6 +348,7 @@ class RtdsClient:
     # -----------------------------------------------------------------------
 
     def _on_open(self, ws: websocket.WebSocketApp) -> None:
+        self._raw_msg_count = 0   # reset per reconnect
         wire_binance   = json.dumps(_SUB_BINANCE)
         wire_chainlink = json.dumps(_SUB_CHAINLINK)
         ws.send(wire_binance)
@@ -346,6 +366,15 @@ class RtdsClient:
         ts_local = _now_ms()
         self._last_message_ms = ts_local
 
+        # Debug-log first N raw messages per connection for wire-level verification
+        if self._raw_msg_count < _RAW_DEBUG_MSG_LIMIT:
+            self._raw_msg_count += 1
+            log.log_system_event(
+                "rtds_raw_debug",
+                detail=f"raw msg #{self._raw_msg_count}",
+                extra={"seq": self._raw_msg_count, "raw": raw[:500]},
+            )
+
         try:
             msg = json.loads(raw)
         except json.JSONDecodeError as exc:
@@ -356,7 +385,43 @@ class RtdsClient:
             log.log_parse_anomaly("rtds_ws", "msg_type", type(msg).__name__, "expected dict")
             return
 
-        # Primary routing: msg["topic"] (official Polymarket RTDS shape)
+        # --- Server error / rejection payloads —————————————————————————————
+        # Log as system events and discard; never forward to price parser.
+        ev = msg.get("event", "")
+        if isinstance(ev, str) and ev.lower() == "error":
+            err_detail = (
+                msg.get("message")
+                or (msg.get("body") or {}).get("message")
+                or str(msg)[:300]
+            )
+            log.log_system_event(
+                "rtds_server_error",
+                detail=f"server error: {err_detail}",
+                level="warning",
+                extra={"raw": raw[:500]},
+            )
+            return
+        status = msg.get("status")
+        if status is not None:
+            try:
+                if int(status) >= 400:
+                    err_detail = (
+                        (msg.get("body") or {}).get("message")
+                        or msg.get("message")
+                        or str(msg)[:300]
+                    )
+                    log.log_system_event(
+                        "rtds_server_error",
+                        detail=f"server error status={status}: {err_detail}",
+                        level="warning",
+                        extra={"raw": raw[:500]},
+                    )
+                    return
+            except (TypeError, ValueError):
+                pass
+
+        # --- Price message routing ——————————————————————————————————————————
+        # Primary on msg["topic"]; fallback to channel/type for protocol robustness.
         topic = msg.get("topic", "").lower()
 
         # Subscription confirmations and heartbeats — nothing to do
@@ -368,7 +433,6 @@ class RtdsClient:
         elif topic == "crypto_prices":
             self._handle_price_message(msg, "binance", topic)
         else:
-            # Fallback: route by channel/type for robustness against protocol drift
             channel = (
                 msg.get("channel")
                 or msg.get("type")
@@ -391,7 +455,12 @@ class RtdsClient:
         self, msg: dict, source: str, topic: str
     ) -> None:
         """
-        Extract price and timestamp from a RTDS price message.
+        Extract price and timestamp from an RTDS price message.
+
+        Client-side symbol filter (all-symbol subscribe):
+          Binance   → accept only _BINANCE_ACCEPTED_SYMBOLS
+          Chainlink → accept only _CHAINLINK_ACCEPTED_SYMBOLS
+          Other symbols → silently return, no warning logged
 
         Primary path: payload["value"] / payload["timestamp"] / payload["symbol"]
         Fallback path: top-level "price"/"p" / "timestamp"/"ts"/... for robustness.
@@ -400,14 +469,17 @@ class RtdsClient:
 
         payload = msg.get("payload")
         if isinstance(payload, dict):
+            symbol = (payload.get("symbol") or "").lower()
+
+            # Client-side symbol filter — silently skip non-BTC symbols
+            if symbol:
+                if source == "binance" and symbol not in _BINANCE_ACCEPTED_SYMBOLS:
+                    return
+                if source == "chainlink" and symbol not in _CHAINLINK_ACCEPTED_SYMBOLS:
+                    return
+
             price_raw = payload.get("value")
             ts_raw    = payload.get("timestamp")
-            # symbol present for validation; log anomaly if unexpected but don't abort
-            symbol = (payload.get("symbol") or "").lower()
-            if source == "binance" and symbol and symbol not in ("btcusdt", "btc/usdt", "btc"):
-                log.log_parse_anomaly(context, "symbol", symbol, "unexpected symbol in binance payload")
-            if source == "chainlink" and symbol and symbol not in ("btc/usd", "btcusd", "btc"):
-                log.log_parse_anomaly(context, "symbol", symbol, "unexpected symbol in chainlink payload")
         else:
             # Fallback: top-level fields for protocol variants / forward compat
             price_raw = (
@@ -424,7 +496,6 @@ class RtdsClient:
                 or (msg.get("data") or {}).get("timestamp")
             )
             if payload is not None:
-                # payload present but not a dict — log it
                 log.log_parse_anomaly(context, "payload", type(payload).__name__, "payload is not dict; using top-level fallback")
 
         if price_raw is None:
