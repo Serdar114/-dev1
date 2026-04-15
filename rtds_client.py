@@ -4,16 +4,32 @@ rtds_client.py — Dual-source BTC reference price via Polymarket RTDS WebSocket
 Single connection to Polymarket RTDS WS:
   wss://ws-live-data.polymarket.com
 
-On connect, two subscriptions are sent:
-  {"type": "subscribe", "channel": "crypto_prices",           "ticker": "btcusdt"}
-  {"type": "subscribe", "channel": "crypto_prices_chainlink", "ticker": "btc/usd"}
+On connect, two subscription messages are sent (official Polymarket RTDS shape):
 
-This yields two independent price streams over one connection:
-  Binance    (crypto_prices)           — live traded spot; observer/reference only
-  Chainlink  (crypto_prices_chainlink) — aggregator; settlement truth for btc-updown-*
+  Binance:
+    {"action":"subscribe","subscriptions":[{"topic":"crypto_prices","type":"update","filters":"btcusdt"}]}
+
+  Chainlink:
+    {"action":"subscribe","subscriptions":[{"topic":"crypto_prices_chainlink","type":"*","filters":"{\"symbol\":\"btc/usd\"}"}]}
+
+Incoming message shape (official):
+  {
+    "topic":     "crypto_prices" | "crypto_prices_chainlink",
+    "type":      "update" | "*" | ...,
+    "timestamp": <epoch ms>,
+    "payload": {
+      "symbol":    "btcusdt" | "btc/usd",
+      "timestamp": <epoch ms>,
+      "value":     <price as number or string>
+    }
+  }
+
+Routing: primary on msg["topic"]; fallback on msg["channel"] for robustness.
+Price:  payload["value"]   (fallback: top-level "price"/"p").
+Time:   payload["timestamp"] (fallback: top-level "timestamp"/"ts").
 
 Separate state is maintained for each source.
-latest_dual() returns a DualPriceSnapshot with both prices, basis, and lag.
+latest_dual() returns a DualPriceSnapshot with both prices, basis_bps, lag_ms.
 latest()      returns Binance-only ExternalPriceSnapshot (backward compat).
 
 Binance REST fallback (api.binance.com) is used during WS reconnect back-off.
@@ -60,16 +76,26 @@ RECONNECT_DELAYS_S = [1, 2, 5, 10, 30, 60]
 
 HTTP_TIMEOUT_S = 5
 
-# Subscription messages sent on connection open
+# Subscription messages sent on connection open (official Polymarket RTDS shape)
 _SUB_BINANCE = {
-    "type": "subscribe",
-    "channel": "crypto_prices",
-    "ticker": "btcusdt",
+    "action": "subscribe",
+    "subscriptions": [
+        {
+            "topic": "crypto_prices",
+            "type": "update",
+            "filters": "btcusdt",
+        }
+    ],
 }
 _SUB_CHAINLINK = {
-    "type": "subscribe",
-    "channel": "crypto_prices_chainlink",
-    "ticker": "btc/usd",
+    "action": "subscribe",
+    "subscriptions": [
+        {
+            "topic": "crypto_prices_chainlink",
+            "type": "*",
+            "filters": "{\"symbol\":\"btc/usd\"}",
+        }
+    ],
 }
 
 # ---------------------------------------------------------------------------
@@ -324,55 +350,79 @@ class RtdsClient:
             log.log_parse_anomaly("rtds_ws", "msg_type", type(msg).__name__, "expected dict")
             return
 
-        # Route by channel field; fall back to type / event_type
-        channel = (
-            msg.get("channel")
-            or msg.get("type")
-            or msg.get("event_type")
-            or ""
-        ).lower()
+        # Primary routing: msg["topic"] (official Polymarket RTDS shape)
+        topic = msg.get("topic", "").lower()
 
         # Subscription confirmations and heartbeats — nothing to do
-        if channel in ("subscribed", "heartbeat", "connected", "subscribe"):
+        if topic in ("subscribed", "heartbeat", "connected") or msg.get("action") == "subscribe":
             return
 
-        # Route to correct handler
-        if "chainlink" in channel:
-            self._handle_price_message(msg, "chainlink", channel)
-        elif channel in ("crypto_prices", "btcusdt", "price", "crypto_price"):
-            self._handle_price_message(msg, "binance", channel)
+        if topic == "crypto_prices_chainlink":
+            self._handle_price_message(msg, "chainlink", topic)
+        elif topic == "crypto_prices":
+            self._handle_price_message(msg, "binance", topic)
         else:
-            # Unknown channel — try to route by ticker content as fallback
-            ticker = (
-                msg.get("ticker") or msg.get("asset") or msg.get("symbol") or ""
+            # Fallback: route by channel/type for robustness against protocol drift
+            channel = (
+                msg.get("channel")
+                or msg.get("type")
+                or msg.get("event_type")
+                or ""
             ).lower()
-            if "chainlink" in channel or "usd" in ticker:
+            if channel in ("subscribed", "heartbeat", "connected", "subscribe"):
+                return
+            if "chainlink" in channel:
                 self._handle_price_message(msg, "chainlink", channel)
-            elif ticker in ("btcusdt", "btc", "btcusd"):
+            elif channel in ("crypto_prices", "btcusdt", "price", "crypto_price"):
                 self._handle_price_message(msg, "binance", channel)
             else:
                 log.log_parse_anomaly(
-                    "rtds_ws", "channel", channel,
-                    f"unroutable message; ticker={ticker!r} raw={raw[:200]}"
+                    "rtds_ws", "topic", topic,
+                    f"unroutable message; channel={channel!r} raw={raw[:200]}"
                 )
 
     def _handle_price_message(
-        self, msg: dict, source: str, channel: str
+        self, msg: dict, source: str, topic: str
     ) -> None:
         """
         Extract price and timestamp from a RTDS price message.
-        Tries several common field name shapes defensively.
+
+        Primary path: payload["value"] / payload["timestamp"] / payload["symbol"]
+        Fallback path: top-level "price"/"p" / "timestamp"/"ts"/... for robustness.
         """
         context = f"rtds_ws.{source}"
 
-        # Price: try common field names
-        price_raw = (
-            msg.get("price")
-            or msg.get("p")
-            or (msg.get("data") or {}).get("price")
-        )
+        payload = msg.get("payload")
+        if isinstance(payload, dict):
+            price_raw = payload.get("value")
+            ts_raw    = payload.get("timestamp")
+            # symbol present for validation; log anomaly if unexpected but don't abort
+            symbol = (payload.get("symbol") or "").lower()
+            if source == "binance" and symbol and symbol not in ("btcusdt", "btc/usdt", "btc"):
+                log.log_parse_anomaly(context, "symbol", symbol, "unexpected symbol in binance payload")
+            if source == "chainlink" and symbol and symbol not in ("btc/usd", "btcusd", "btc"):
+                log.log_parse_anomaly(context, "symbol", symbol, "unexpected symbol in chainlink payload")
+        else:
+            # Fallback: top-level fields for protocol variants / forward compat
+            price_raw = (
+                msg.get("price")
+                or msg.get("p")
+                or (msg.get("data") or {}).get("price")
+            )
+            ts_raw = (
+                msg.get("timestamp")
+                or msg.get("ts")
+                or msg.get("t")
+                or msg.get("T")
+                or msg.get("E")
+                or (msg.get("data") or {}).get("timestamp")
+            )
+            if payload is not None:
+                # payload present but not a dict — log it
+                log.log_parse_anomaly(context, "payload", type(payload).__name__, "payload is not dict; using top-level fallback")
+
         if price_raw is None:
-            log.log_parse_anomaly(context, "price", msg, "no price field found")
+            log.log_parse_anomaly(context, "price", msg, "no price field found in payload or top-level")
             return
 
         price = _parse_price(price_raw, "price", context)
@@ -380,15 +430,6 @@ class RtdsClient:
             log.log_parse_anomaly(context, "price", price_raw, "price is None or ≤ 0")
             return
 
-        # Timestamp: try common field names
-        ts_raw = (
-            msg.get("timestamp")
-            or msg.get("ts")
-            or msg.get("t")
-            or msg.get("T")
-            or msg.get("E")
-            or (msg.get("data") or {}).get("timestamp")
-        )
         source_ts = _parse_ts_ms(ts_raw, "timestamp", context)
 
         if source == "binance":
