@@ -329,11 +329,17 @@ class RtdsClient:
     # -----------------------------------------------------------------------
 
     def _on_open(self, ws: websocket.WebSocketApp) -> None:
-        ws.send(json.dumps(_SUB_BINANCE))
-        ws.send(json.dumps(_SUB_CHAINLINK))
+        wire_binance   = json.dumps(_SUB_BINANCE)
+        wire_chainlink = json.dumps(_SUB_CHAINLINK)
+        ws.send(wire_binance)
+        ws.send(wire_chainlink)
         log.log_system_event(
             "rtds_ws_connected",
             detail="RTDS connected; sent binance + chainlink subscriptions",
+            extra={
+                "sub_binance_wire":   wire_binance,
+                "sub_chainlink_wire": wire_chainlink,
+            },
         )
 
     def _on_message(self, ws: websocket.WebSocketApp, raw: str) -> None:
