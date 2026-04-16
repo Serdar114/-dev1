@@ -132,6 +132,14 @@ class _Streams:
         return self._get("markets.jsonl")
 
     @property
+    def market_discovery(self) -> JsonlWriter:
+        """
+        market_discovery.jsonl — one line per candidate decision + summary per cycle.
+        Always created on first access; written even when 0 candidates are found.
+        """
+        return self._get("market_discovery.jsonl")
+
+    @property
     def books(self) -> JsonlWriter:
         return self._get("books.jsonl")
 

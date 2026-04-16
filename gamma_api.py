@@ -584,34 +584,35 @@ def _fetch_all_active_btc_candidates() -> List[Dict[str, Any]]:
 
 def _log_discovery_candidate(
     m: MarketRecord,
-    status: str,
+    accepted: bool,
     reason: str,
 ) -> None:
     """
-    Write one structured record to markets.jsonl for every candidate seen.
+    Write one line to market_discovery.jsonl for every candidate seen.
+    Called for every market record regardless of outcome — no silent drops.
 
-    status : "accepted" | "rejected"
-    reason : one of the REASON_* constants, or a free-form extension string
-
-    This is the audit trail that makes 'why is market_discovery empty?' answerable.
+    accepted : True if the market passed all filters
+    reason   : one of the REASON_* constants when rejected, or "family=Xm" when accepted
     """
+    token_ids = [t.token_id for t in m.tokens]
     rec: Dict[str, Any] = {
         "ts_local": _now_ms(),
-        "event": "discovery_candidate",
-        "status": status,
-        "reason": reason,
+        "event": "candidate",
         "market_slug": m.market_slug,
         "event_slug": m.event_slug,
         "market_id": m.market_id,
+        "accepted": accepted,
+        "reason": reason,
         "family_label": m.family_label,
         "active": m.active,
         "closed": m.closed,
         "accepting_orders": m.accepting_orders,
         "end_time": m.end_time,
-        "token_count": len(m.tokens),
+        "token_count": len(token_ids),
+        "token_ids": token_ids,
         "parse_warnings": m.parse_warnings,
     }
-    log.streams.markets.write(rec)
+    log.streams.market_discovery.write(rec)
 
 
 # ---------------------------------------------------------------------------
@@ -629,116 +630,160 @@ def list_candidate_btc_markets() -> List[MarketRecord]:
     The match is performed on market_slug first, then event_slug (fallback).
     The unix timestamp suffix is not validated — any suffix is accepted.
 
-    Every candidate is logged to markets.jsonl with status + reason code so
-    the discovery audit trail is never empty when candidates exist.
-
-    Returns all records (accepted + excluded) with .excluded / .exclusion_reason set.
+    Every candidate writes one line to market_discovery.jsonl — no silent drops.
+    A discovery_summary record is always written (even on exception / 0 candidates).
     """
     now_ms = _now_ms()
-    raw_list = _fetch_all_active_btc_candidates()
-
-    if not raw_list:
-        log.log_system_event(
-            "gamma_no_raw_candidates",
-            detail="all fetch strategies returned 0 raw market records",
-            level="warning",
-            extra={"reason": "no_raw_candidates_from_api"},
-        )
-
+    raw_list: List[Dict[str, Any]] = []
     candidates: List[MarketRecord] = []
     excluded: List[MarketRecord] = []
     parse_failures = 0
+    count_after_slug = 0
+    count_after_timing = 0
 
-    for raw in raw_list:
-        m = _normalise_market(raw)
-        if m is None:
-            parse_failures += 1
-            # Write a minimal record even for completely unparseable inputs
-            log.streams.markets.write({
+    try:
+        raw_list = _fetch_all_active_btc_candidates()
+
+        if not raw_list:
+            log.log_system_event(
+                "gamma_no_raw_candidates",
+                detail="all fetch strategies returned 0 raw market records",
+                level="warning",
+                extra={"reason": "no_raw_candidates_from_api"},
+            )
+            # Also write to discovery file so it is created even on zero-result run
+            log.streams.market_discovery.write({
                 "ts_local": _now_ms(),
-                "event": "discovery_candidate",
-                "status": "rejected",
-                "reason": REASON_UNKNOWN_SHAPE,
-                "raw_id": str(raw.get("id") or raw.get("conditionId") or "?")[:80],
-                "raw_slug": str(raw.get("slug") or raw.get("marketSlug") or "?")[:80],
+                "event": "candidate",
+                "market_slug": None,
+                "event_slug": None,
+                "market_id": None,
+                "accepted": False,
+                "reason": "no_raw_candidates_from_api",
+                "family_label": None,
+                "active": None,
+                "closed": None,
+                "accepting_orders": None,
+                "end_time": None,
+                "token_count": 0,
+                "token_ids": [],
+                "parse_warnings": [],
             })
-            continue
 
-        # ----------------------------------------------------------------
-        # Filter 1: strict family slug-prefix match
-        # Accepts: btc-updown-15m-<any>  or  btc-updown-5m-<any>
-        # Checks market_slug first; falls back to event_slug
-        # ----------------------------------------------------------------
-        family = _detect_family(m)
-        if family is None:
-            m.excluded = True
-            m.exclusion_reason = (
-                f"{REASON_NO_SLUG_MATCH}: slug={m.market_slug!r} "
-                f"event_slug={m.event_slug!r}; "
-                "only btc-updown-15m-* and btc-updown-5m-* accepted"
-            )
-            excluded.append(m)
-            _log_discovery_candidate(m, "rejected", REASON_NO_SLUG_MATCH)
-            continue
+        for raw in raw_list:
+            m = _normalise_market(raw)
+            if m is None:
+                parse_failures += 1
+                log.streams.market_discovery.write({
+                    "ts_local": _now_ms(),
+                    "event": "candidate",
+                    "market_slug": str(raw.get("slug") or raw.get("marketSlug") or "?")[:80],
+                    "event_slug": str(raw.get("eventSlug") or raw.get("event_slug") or "?")[:80],
+                    "market_id": str(raw.get("id") or raw.get("conditionId") or "?")[:80],
+                    "accepted": False,
+                    "reason": REASON_UNKNOWN_SHAPE,
+                    "family_label": None,
+                    "active": None,
+                    "closed": None,
+                    "accepting_orders": None,
+                    "end_time": None,
+                    "token_count": 0,
+                    "token_ids": [],
+                    "parse_warnings": ["normalise_market returned None"],
+                })
+                continue
 
-        # Stamp family + resolution reference on qualifying records
-        m.family_label = family
-        m.resolution_reference = RESOLUTION_REFERENCE
+            # ----------------------------------------------------------------
+            # Filter 1: strict family slug-prefix match
+            # Accepts: btc-updown-15m-<any>  or  btc-updown-5m-<any>
+            # Checks market_slug first; falls back to event_slug
+            # ----------------------------------------------------------------
+            family = _detect_family(m)
+            if family is None:
+                m.excluded = True
+                m.exclusion_reason = (
+                    f"{REASON_NO_SLUG_MATCH}: slug={m.market_slug!r} "
+                    f"event_slug={m.event_slug!r}"
+                )
+                excluded.append(m)
+                _log_discovery_candidate(m, False, REASON_NO_SLUG_MATCH)
+                continue
 
-        # ----------------------------------------------------------------
-        # Filter 2: market window must not have already closed
-        # ----------------------------------------------------------------
-        if not _is_not_expired(m, now_ms):
-            m.excluded = True
-            m.exclusion_reason = (
-                f"{REASON_TIMING_REJECTED}: end_time={m.end_time} now={now_ms}"
-            )
-            excluded.append(m)
-            _log_discovery_candidate(m, "rejected", REASON_TIMING_REJECTED)
-            continue
+            count_after_slug += 1
 
-        # ----------------------------------------------------------------
-        # Filter 3: must have at least one token (Up or Down)
-        # ----------------------------------------------------------------
-        if not m.tokens:
-            m.excluded = True
-            m.exclusion_reason = REASON_TOKEN_PARSE_FAILED
-            excluded.append(m)
-            _log_discovery_candidate(m, "rejected", REASON_TOKEN_PARSE_FAILED)
-            continue
+            # Stamp family + resolution reference on qualifying records
+            m.family_label = family
+            m.resolution_reference = RESOLUTION_REFERENCE
 
-        # Accepted — log before appending
-        _log_discovery_candidate(m, "accepted", f"family={family}")
-        candidates.append(m)
+            # ----------------------------------------------------------------
+            # Filter 2: market window must not have already closed
+            # ----------------------------------------------------------------
+            if not _is_not_expired(m, now_ms):
+                m.excluded = True
+                m.exclusion_reason = (
+                    f"{REASON_TIMING_REJECTED}: end_time={m.end_time} now={now_ms}"
+                )
+                excluded.append(m)
+                _log_discovery_candidate(m, False, REASON_TIMING_REJECTED)
+                continue
 
-    if parse_failures:
-        log.log_system_event(
-            "gamma_parse_failures",
-            detail=f"{parse_failures} market records dropped ({REASON_UNKNOWN_SHAPE})",
-            level="warning",
-            extra={"count": parse_failures, "reason": REASON_UNKNOWN_SHAPE},
-        )
+            count_after_timing += 1
 
-    by_family = {
-        "15m": sum(1 for m in candidates if m.family_label == "15m"),
-        "5m":  sum(1 for m in candidates if m.family_label == "5m"),
-    }
-    log.log_system_event(
-        "gamma_candidates",
-        detail=(
-            f"candidates={len(candidates)} "
-            f"(15m={by_family['15m']} 5m={by_family['5m']}) "
-            f"excluded={len(excluded)} parse_failures={parse_failures} "
-            f"total_raw={len(raw_list)}"
-        ),
-        extra={
+            # ----------------------------------------------------------------
+            # Filter 3: must have at least one token (Up or Down)
+            # ----------------------------------------------------------------
+            if not m.tokens:
+                m.excluded = True
+                m.exclusion_reason = REASON_TOKEN_PARSE_FAILED
+                excluded.append(m)
+                _log_discovery_candidate(m, False, REASON_TOKEN_PARSE_FAILED)
+                continue
+
+            # Accepted — log before appending
+            _log_discovery_candidate(m, True, f"family={family}")
+            candidates.append(m)
+
+    except Exception as exc:
+        log.log_exception("gamma_api.list_candidate_btc_markets", exc)
+        # summary still written in finally
+
+    finally:
+        by_family = {
+            "15m": sum(1 for m in candidates if m.family_label == "15m"),
+            "5m":  sum(1 for m in candidates if m.family_label == "5m"),
+        }
+        log.streams.market_discovery.write({
+            "ts_local": _now_ms(),
+            "event": "discovery_summary",
+            "raw_count": len(raw_list),
+            "after_slug_filter": count_after_slug,
+            "after_timing": count_after_timing,
+            "after_token_parse": len(candidates),
+            "final_selected": None,   # filled in by select_markets_by_family
+            "parse_failures": parse_failures,
+            "excluded_no_slug": sum(1 for m in excluded if m.exclusion_reason and REASON_NO_SLUG_MATCH in m.exclusion_reason),
+            "excluded_timing": sum(1 for m in excluded if m.exclusion_reason and REASON_TIMING_REJECTED in m.exclusion_reason),
+            "excluded_token": sum(1 for m in excluded if m.exclusion_reason and REASON_TOKEN_PARSE_FAILED in m.exclusion_reason),
             "candidates_15m": by_family["15m"],
             "candidates_5m": by_family["5m"],
-            "excluded": len(excluded),
-            "parse_failures": parse_failures,
-            "total_raw": len(raw_list),
-        },
-    )
+        })
+        if parse_failures:
+            log.log_system_event(
+                "gamma_parse_failures",
+                detail=f"{parse_failures} market records dropped ({REASON_UNKNOWN_SHAPE})",
+                level="warning",
+                extra={"count": parse_failures, "reason": REASON_UNKNOWN_SHAPE},
+            )
+        log.log_system_event(
+            "gamma_candidates",
+            detail=(
+                f"candidates={len(candidates)} "
+                f"(15m={by_family['15m']} 5m={by_family['5m']}) "
+                f"excluded={len(excluded)} parse_failures={parse_failures} "
+                f"total_raw={len(raw_list)}"
+            ),
+        )
+
     return candidates + excluded  # caller filters by .excluded
 
 
@@ -763,7 +808,7 @@ def _select_front_from_family(
             m.excluded = True
             m.exclusion_reason = REASON_FEWER_THAN_2_TOKENS
             excluded.append(m)
-            _log_discovery_candidate(m, "rejected", REASON_FEWER_THAN_2_TOKENS)
+            _log_discovery_candidate(m, False, REASON_FEWER_THAN_2_TOKENS)
             continue
         m.selected = True
         return m
@@ -803,6 +848,13 @@ def select_markets_by_family(now_ts: int) -> Dict[str, Optional[MarketRecord]]:
                 f"gamma_api.select_front.{family}", exc,
                 {"reason": REASON_SELECTION_EXCEPTION, "family": family},
             )
+            log.streams.market_discovery.write({
+                "ts_local": _now_ms(),
+                "event": "no_market_selected",
+                "family": family,
+                "reason": REASON_SELECTION_EXCEPTION,
+                "candidate_count": 0,
+            })
             result[family] = None
             continue
 
@@ -815,7 +867,6 @@ def select_markets_by_family(now_ts: int) -> Dict[str, Optional[MarketRecord]]:
             excluded=excluded,
         )
         if sel is None:
-            # Distinguish: were there candidates that all failed token check, or none at all?
             reason = "no_active_candidates" if not family_candidates else "no_valid_token_pair"
             log.log_system_event(
                 "no_market_selected",
@@ -824,12 +875,10 @@ def select_markets_by_family(now_ts: int) -> Dict[str, Optional[MarketRecord]]:
                 extra={"family": family, "reason": reason,
                        "candidate_count": len(family_candidates)},
             )
-            # Write explicit discovery_audit record so markets.jsonl is never silent
-            log.streams.markets.write({
+            log.streams.market_discovery.write({
                 "ts_local": _now_ms(),
-                "event": "discovery_audit",
+                "event": "no_market_selected",
                 "family": family,
-                "selected": None,
                 "reason": reason,
                 "candidate_count": len(family_candidates),
                 "total_raw": len(candidates) + len(excluded),
@@ -847,6 +896,33 @@ def select_markets_by_family(now_ts: int) -> Dict[str, Optional[MarketRecord]]:
                     "active": sel.active,
                 },
             )
+            log.streams.market_discovery.write({
+                "ts_local": _now_ms(),
+                "event": "market_selected",
+                "family": family,
+                "market_slug": sel.market_slug,
+                "market_id": sel.market_id,
+                "end_time": sel.end_time,
+                "token_count": len(sel.tokens),
+                "token_ids": [t.token_id for t in sel.tokens],
+                "accepting_orders": sel.accepting_orders,
+                "active": sel.active,
+            })
+
+    final_selected = sum(1 for v in result.values() if v is not None)
+    log.streams.market_discovery.write({
+        "ts_local": _now_ms(),
+        "event": "discovery_summary",
+        "raw_count": len(all_markets),
+        "after_slug_filter": sum(1 for m in all_markets if m.family_label is not None),
+        "after_timing": sum(1 for m in all_markets if not m.excluded or (m.exclusion_reason and REASON_TIMING_REJECTED not in m.exclusion_reason and REASON_NO_SLUG_MATCH not in m.exclusion_reason)),
+        "after_token_parse": len(candidates),
+        "final_selected": final_selected,
+        "families": {
+            "15m": result["15m"].market_slug if result["15m"] else None,
+            "5m":  result["5m"].market_slug  if result["5m"]  else None,
+        },
+    })
 
     with _cache_lock:
         global _cache_markets, _cache_ts
