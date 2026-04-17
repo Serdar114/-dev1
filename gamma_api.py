@@ -69,8 +69,20 @@ EXCLUDED_SLUG_SUBSTRINGS: List[str] = [
 # External spot price is observer-only; Chainlink BTC/USD is the settlement truth.
 RESOLUTION_REFERENCE = "chainlink_btc_usd"
 
-# HTTP timeout
-HTTP_TIMEOUT_S = 10
+# HTTP timeout — (connect_s, read_s); tight to prevent hanging discovery cycle
+GAMMA_FETCH_TIMEOUT = (2, 4)   # connect=2s, read=4s
+
+# Thread-local abort flag: set by first Timeout; clears at start of each cycle
+_tls = threading.local()
+
+def _abort_fetch() -> bool:
+    return getattr(_tls, "timed_out", False)
+
+def _set_abort() -> None:
+    _tls.timed_out = True
+
+def _clear_abort() -> None:
+    _tls.timed_out = False
 
 # ---------------------------------------------------------------------------
 # Rejection reason codes — used in every discovery log record
@@ -408,11 +420,32 @@ def _unwrap_response(data: Any, context: str) -> List[Dict[str, Any]]:
 
 
 def _fetch_markets_page(params: Dict[str, Any]) -> List[Dict[str, Any]]:
+    url = MARKETS_ENDPOINT
+    log.streams.market_discovery.write({
+        "ts_local": _now_ms(), "event": "gamma_fetch_start",
+        "url": url, "params": params,
+    })
     try:
-        resp = requests.get(MARKETS_ENDPOINT, params=params, timeout=HTTP_TIMEOUT_S)
+        resp = requests.get(url, params=params, timeout=GAMMA_FETCH_TIMEOUT)
         resp.raise_for_status()
-        return _unwrap_response(resp.json(), "gamma_api.markets")
+        result = _unwrap_response(resp.json(), "gamma_api.markets")
+        log.streams.market_discovery.write({
+            "ts_local": _now_ms(), "event": "gamma_fetch_done",
+            "url": url, "status": resp.status_code, "items": len(result),
+        })
+        return result
+    except requests.Timeout:
+        _set_abort()
+        log.streams.market_discovery.write({
+            "ts_local": _now_ms(), "event": "gamma_timeout",
+            "url": url, "timeout": GAMMA_FETCH_TIMEOUT,
+        })
+        return []
     except requests.RequestException as exc:
+        log.streams.market_discovery.write({
+            "ts_local": _now_ms(), "event": "gamma_fetch_error",
+            "url": url, "error": str(exc)[:200],
+        })
         log.log_exception("gamma_api._fetch_markets_page", exc, {"params": params})
         return []
     except ValueError as exc:
@@ -422,11 +455,32 @@ def _fetch_markets_page(params: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def _fetch_events_page(params: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Fetch one page from the /events endpoint."""
+    url = EVENTS_ENDPOINT
+    log.streams.market_discovery.write({
+        "ts_local": _now_ms(), "event": "gamma_fetch_start",
+        "url": url, "params": params,
+    })
     try:
-        resp = requests.get(EVENTS_ENDPOINT, params=params, timeout=HTTP_TIMEOUT_S)
+        resp = requests.get(url, params=params, timeout=GAMMA_FETCH_TIMEOUT)
         resp.raise_for_status()
-        return _unwrap_response(resp.json(), "gamma_api.events")
+        result = _unwrap_response(resp.json(), "gamma_api.events")
+        log.streams.market_discovery.write({
+            "ts_local": _now_ms(), "event": "gamma_fetch_done",
+            "url": url, "status": resp.status_code, "items": len(result),
+        })
+        return result
+    except requests.Timeout:
+        _set_abort()
+        log.streams.market_discovery.write({
+            "ts_local": _now_ms(), "event": "gamma_timeout",
+            "url": url, "timeout": GAMMA_FETCH_TIMEOUT,
+        })
+        return []
     except requests.RequestException as exc:
+        log.streams.market_discovery.write({
+            "ts_local": _now_ms(), "event": "gamma_fetch_error",
+            "url": url, "error": str(exc)[:200],
+        })
         log.log_exception("gamma_api._fetch_events_page", exc, {"params": params})
         return []
     except ValueError as exc:
@@ -534,14 +588,16 @@ def _fetch_all_active_btc_candidates() -> List[Dict[str, Any]]:
     Strategy 4 — /markets question_contains:
       Broad fallback. Also no active/closed filter.
     """
+    _clear_abort()   # reset per-cycle timeout flag
     all_raw: List[Dict[str, Any]] = []
     seen_ids: Set[str] = set()
 
     # ---- Strategy 1: /events by slug prefix ----
     for prefix in ("btc-updown-15m", "btc-updown-5m", "btc-updown"):
+        if _abort_fetch():
+            break
         found = _collect_from_events_endpoint({"slug": prefix}, seen_ids)
-        if not found:
-            # Also try slug_contains if the API supports it
+        if not found and not _abort_fetch():
             found = _collect_from_events_endpoint({"slug_contains": prefix}, seen_ids)
         all_raw.extend(found)
         log.log_system_event(
@@ -552,6 +608,8 @@ def _fetch_all_active_btc_candidates() -> List[Dict[str, Any]]:
 
     # ---- Strategy 2: /events tag search ----
     for tag in ("btc", "bitcoin", "crypto"):
+        if _abort_fetch():
+            break
         found = _collect_from_events_endpoint({"tag_slug": tag}, seen_ids)
         all_raw.extend(found)
         log.log_system_event(
@@ -560,20 +618,25 @@ def _fetch_all_active_btc_candidates() -> List[Dict[str, Any]]:
             extra={"strategy": "events_tag", "tag": tag, "count": len(found)},
         )
 
-    # ---- Strategy 3: /markets tag search (no active/closed filter) ----
+    # ---- Strategy 3: /markets tag search ----
     for tag in ("btc", "bitcoin", "crypto"):
+        if _abort_fetch():
+            break
         found = _collect_from_markets_endpoint({"tag_slug": tag}, seen_ids)
         all_raw.extend(found)
 
     # ---- Strategy 4: /markets question_contains ----
     for kw in ("BTC", "Bitcoin", "btc updown", "btc-updown"):
+        if _abort_fetch():
+            break
         found = _collect_from_markets_endpoint({"question_contains": kw}, seen_ids)
         all_raw.extend(found)
 
+    timed_out = _abort_fetch()
     log.log_system_event(
         "gamma_fetch_complete",
-        detail=f"fetched {len(all_raw)} unique raw market records across all strategies",
-        extra={"total_candidates": len(all_raw)},
+        detail=f"fetched {len(all_raw)} unique raw market records (timed_out={timed_out})",
+        extra={"total_candidates": len(all_raw), "timed_out": timed_out},
     )
     return all_raw
 
