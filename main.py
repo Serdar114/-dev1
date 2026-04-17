@@ -352,6 +352,52 @@ def run() -> None:
                 time.sleep(sleep_s)
             next_tick += OBSERVATION_INTERVAL_S
 
+            # --- Force discovery every tick (temporary diagnostic) ---
+            try:
+                markets = gamma_api.select_markets_by_family(_now_ms())
+                result_count = sum(1 for v in markets.values() if v is not None)
+                log.streams.market_discovery.write({
+                    "ts_local": _now_ms(),
+                    "event": "discovery_called",
+                    "result_count": result_count,
+                    "slug_15m": markets["15m"].market_slug if markets.get("15m") else None,
+                    "slug_5m":  markets["5m"].market_slug  if markets.get("5m")  else None,
+                })
+                # Wire discovered markets into obs_state so observation sees them
+                for family in ("15m", "5m"):
+                    new_market = markets.get(family)
+                    if new_market is not None:
+                        new_up, new_dn, side_labels = _token_side_labels(new_market)
+                        token_ids = [t.token_id for t in new_market.tokens]
+                        old_market = _live_markets.get(family)
+                        old_ids = sorted([t.token_id for t in old_market.tokens] if old_market else [])
+                        if sorted(token_ids) != old_ids:
+                            old_ws = _live_ws.get(family)
+                            if old_ws is not None:
+                                old_ws.stop()
+                            new_ws = ClobWsClient(
+                                token_ids=token_ids,
+                                side_labels=side_labels,
+                                market_slug=new_market.market_slug,
+                            )
+                            new_ws.start()
+                            _live_ws[family] = new_ws
+                        else:
+                            new_ws = _live_ws.get(family)
+                        _live_markets[family] = new_market
+                        with obs_lock:
+                            _obs_state[family]["market"]       = new_market
+                            _obs_state[family]["ws_client"]    = new_ws
+                            _obs_state[family]["up_token_id"]  = new_up
+                            _obs_state[family]["down_token_id"]= new_dn
+            except Exception as exc:
+                log.streams.market_discovery.write({
+                    "ts_local": _now_ms(),
+                    "event": "gamma_crash",
+                    "error": str(exc),
+                })
+                log.log_exception("observation_loop.discovery", exc)
+
             with obs_lock:
                 snap_15m = dict(_obs_state["15m"])
                 snap_5m  = dict(_obs_state["5m"])

@@ -834,6 +834,17 @@ def select_markets_by_family(now_ts: int) -> Dict[str, Optional[MarketRecord]]:
     Logs a market_selection event for each family.
     Updates the module-level cache.
     """
+    # Proof-of-execution: written before any API call so we know the function ran
+    log.streams.market_discovery.write({
+        "ts_local": _now_ms(),
+        "event": "discovery_start",
+    })
+    log.streams.market_discovery.write({
+        "ts_local": _now_ms(),
+        "event": "gamma_entry",
+        "now_ts": now_ts,
+    })
+
     all_markets = list_candidate_btc_markets()
     candidates = [m for m in all_markets if not m.excluded]
     excluded   = [m for m in all_markets if m.excluded]
