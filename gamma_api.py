@@ -566,78 +566,133 @@ def _collect_from_events_endpoint(
     return result
 
 
+def _compute_window_slugs(family: str, now_s: int) -> List[str]:
+    """Return [prev, current, next] exact event slugs for family at now_s."""
+    window_s = 900 if family == "15m" else 300
+    current = (now_s // window_s) * window_s
+    return [
+        f"btc-updown-{family}-{current - window_s}",
+        f"btc-updown-{family}-{current}",
+        f"btc-updown-{family}-{current + window_s}",
+    ]
+
+
+def _fetch_event_by_exact_slug(slug: str) -> List[Dict[str, Any]]:
+    """
+    Fetch one event by exact slug; write exact_slug_try/hit/miss logs.
+    Returns raw event list (normally 0 or 1 items).
+    """
+    if _abort_fetch():
+        return []
+    log.streams.market_discovery.write({
+        "ts_local": _now_ms(), "event": "exact_slug_try", "slug": slug,
+    })
+    events = _fetch_events_page({"slug": slug, "limit": 1})
+    if events:
+        log.streams.market_discovery.write({
+            "ts_local": _now_ms(), "event": "exact_slug_hit",
+            "slug": slug, "event_count": len(events),
+        })
+        return events
+    log.streams.market_discovery.write({
+        "ts_local": _now_ms(), "event": "exact_slug_miss", "slug": slug,
+    })
+    return []
+
+
+def _try_exact_slugs_for_family(
+    family: str, now_s: int, seen_ids: Set[str]
+) -> List[Dict[str, Any]]:
+    """
+    Try prev/current/next window slugs for one family.
+    Collects markets from all windows that resolve (deduped via seen_ids).
+    """
+    result: List[Dict[str, Any]] = []
+    for slug in _compute_window_slugs(family, now_s):
+        if _abort_fetch():
+            break
+        events = _fetch_event_by_exact_slug(slug)
+        if events:
+            result.extend(_markets_from_events(events, seen_ids))
+    return result
+
+
+def _collect_bounded_events(
+    params: Dict[str, Any], seen_ids: Set[str], max_pages: int = 2
+) -> List[Dict[str, Any]]:
+    """Page through /events up to max_pages; extract and dedup markets."""
+    result: List[Dict[str, Any]] = []
+    offset = 0
+    for _ in range(max_pages):
+        if _abort_fetch():
+            break
+        p = {**params, "limit": PAGE_LIMIT, "offset": offset}
+        events = _fetch_events_page(p)
+        if not events:
+            break
+        result.extend(_markets_from_events(events, seen_ids))
+        if len(events) < PAGE_LIMIT:
+            break
+        offset += PAGE_LIMIT
+    return result
+
+
 def _fetch_all_active_btc_candidates() -> List[Dict[str, Any]]:
     """
-    Multi-strategy BTC candidate fetch.
+    Exact-slug primary discovery.
 
-    Strategy 1 (PRIMARY) — /events slug-prefix search:
-      btc-updown-15m-* and btc-updown-5m-* are event slugs on Polymarket.
-      Each event embeds Up + Down markets. We query /events by the known
-      family prefixes. Server-side active/closed filters are intentionally
-      omitted here — short-horizon windows cycle states quickly and the
-      normaliser will record state flags; we must not pre-filter at the API layer.
+    Primary path (per family):
+      Compute exact event slugs for prev/current/next windows and fetch each by
+      exact slug from /events.  btc-updown-{family}-{floor(now_s/window)*window}.
 
-    Strategy 2 — /events tag search:
-      Query /events with tag_slug=btc/bitcoin to catch events that the slug
-      search misses (e.g. if the API doesn't support slug_contains).
-
-    Strategy 3 — /markets tag search (existing approach, no active/closed filter):
-      Kept as fallback. active/closed removed so we don't miss markets whose
-      state the API reports differently from what we expect.
-
-    Strategy 4 — /markets question_contains:
-      Broad fallback. Also no active/closed filter.
+    Bounded fallback (only triggered when a family misses all exact-slug attempts):
+      /events?slug_contains=btc-updown-{family} — max 2 pages.
     """
-    _clear_abort()   # reset per-cycle timeout flag
+    _clear_abort()
     all_raw: List[Dict[str, Any]] = []
     seen_ids: Set[str] = set()
+    now_s = int(time.time())
+    exact_hit: Dict[str, bool] = {"15m": False, "5m": False}
 
-    # ---- Strategy 1: /events by slug prefix ----
-    for prefix in ("btc-updown-15m", "btc-updown-5m", "btc-updown"):
+    # Primary: exact slug lookups per family
+    for family in ("15m", "5m"):
         if _abort_fetch():
             break
-        found = _collect_from_events_endpoint({"slug": prefix}, seen_ids)
+        found = _try_exact_slugs_for_family(family, now_s, seen_ids)
+        exact_hit[family] = bool(found)
+        all_raw.extend(found)
+        log.streams.market_discovery.write({
+            "ts_local": _now_ms(), "event": "exact_slug_family_result",
+            "family": family, "markets_found": len(found), "hit": exact_hit[family],
+        })
+
+    # Bounded fallback for each family that missed exact-slug
+    fallback_used = False
+    for family in ("15m", "5m"):
+        if exact_hit[family] or _abort_fetch():
+            continue
+        fallback_used = True
+        prefix = f"btc-updown-{family}"
+        log.streams.market_discovery.write({
+            "ts_local": _now_ms(), "event": "fallback_triggered",
+            "family": family, "prefix": prefix,
+        })
+        found = _collect_bounded_events({"slug_contains": prefix}, seen_ids, max_pages=2)
         if not found and not _abort_fetch():
-            found = _collect_from_events_endpoint({"slug_contains": prefix}, seen_ids)
+            found = _collect_bounded_events({"slug": prefix}, seen_ids, max_pages=2)
         all_raw.extend(found)
-        log.log_system_event(
-            "gamma_events_fetch",
-            detail=f"events slug={prefix!r}: {len(found)} markets extracted",
-            extra={"strategy": "events_slug", "prefix": prefix, "count": len(found)},
-        )
-
-    # ---- Strategy 2: /events tag search ----
-    for tag in ("btc", "bitcoin", "crypto"):
-        if _abort_fetch():
-            break
-        found = _collect_from_events_endpoint({"tag_slug": tag}, seen_ids)
-        all_raw.extend(found)
-        log.log_system_event(
-            "gamma_events_fetch",
-            detail=f"events tag_slug={tag!r}: {len(found)} new markets",
-            extra={"strategy": "events_tag", "tag": tag, "count": len(found)},
-        )
-
-    # ---- Strategy 3: /markets tag search ----
-    for tag in ("btc", "bitcoin", "crypto"):
-        if _abort_fetch():
-            break
-        found = _collect_from_markets_endpoint({"tag_slug": tag}, seen_ids)
-        all_raw.extend(found)
-
-    # ---- Strategy 4: /markets question_contains ----
-    for kw in ("BTC", "Bitcoin", "btc updown", "btc-updown"):
-        if _abort_fetch():
-            break
-        found = _collect_from_markets_endpoint({"question_contains": kw}, seen_ids)
-        all_raw.extend(found)
+        log.streams.market_discovery.write({
+            "ts_local": _now_ms(), "event": "fallback_result",
+            "family": family, "markets_found": len(found),
+        })
 
     timed_out = _abort_fetch()
-    log.log_system_event(
-        "gamma_fetch_complete",
-        detail=f"fetched {len(all_raw)} unique raw market records (timed_out={timed_out})",
-        extra={"total_candidates": len(all_raw), "timed_out": timed_out},
-    )
+    log.streams.market_discovery.write({
+        "ts_local": _now_ms(), "event": "fetch_complete",
+        "total_raw": len(all_raw), "timed_out": timed_out,
+        "exact_15m": exact_hit["15m"], "exact_5m": exact_hit["5m"],
+        "fallback_used": fallback_used,
+    })
     return all_raw
 
 
@@ -793,7 +848,23 @@ def list_candidate_btc_markets() -> List[MarketRecord]:
             count_after_timing += 1
 
             # ----------------------------------------------------------------
-            # Filter 3: must have at least one token (Up or Down)
+            # Filter 3: enableOrderBook tradability gate
+            # Exclude only when the field is explicitly False; absent = allow.
+            # ----------------------------------------------------------------
+            enable_ob_raw = m.raw_fields.get("enableOrderBook")
+            if enable_ob_raw is not None:
+                enable_ob = _parse_bool(
+                    enable_ob_raw, "enableOrderBook", f"market/{m.market_id}"
+                )
+                if enable_ob is False:
+                    m.excluded = True
+                    m.exclusion_reason = "enableOrderBook=False"
+                    excluded.append(m)
+                    _log_discovery_candidate(m, False, "enableOrderBook_false")
+                    continue
+
+            # ----------------------------------------------------------------
+            # Filter 4: must have at least one token (Up or Down)
             # ----------------------------------------------------------------
             if not m.tokens:
                 m.excluded = True
