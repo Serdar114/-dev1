@@ -50,6 +50,9 @@ EVENT_BUFFER_SIZE = 200
 # Reconnect back-off (seconds): attempt index → delay
 RECONNECT_DELAYS_S = [1, 2, 5, 10, 30, 60]
 
+# Log first N price_change messages in full for debugging
+_PRICE_CHANGE_DEBUG_LIMIT = 5
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -122,6 +125,25 @@ class _TokenBookState:
                 target.pop(price, None)
             else:
                 target[price] = size
+            self.last_update_ms = _now_ms()
+            self.update_count += 1
+
+    def apply_top_of_book(
+        self,
+        best_bid: Optional[float],
+        best_ask: Optional[float],
+        size: float = 1.0,
+    ) -> None:
+        """
+        Stamp best bid/ask directly from a price_change item's best_bid/best_ask fields.
+        Replaces the stored levels with just the reported best — stale inner levels
+        are discarded since we only need top-of-book for the observation run.
+        """
+        with self._lock:
+            if best_bid is not None:
+                self._bids = {best_bid: size}
+            if best_ask is not None:
+                self._asks = {best_ask: size}
             self.last_update_ms = _now_ms()
             self.update_count += 1
 
@@ -215,6 +237,7 @@ class ClobWsClient:
         self._last_message_ms: Optional[int] = None
         self._event_buffer: Deque[Dict[str, Any]] = deque(maxlen=EVENT_BUFFER_SIZE)
         self._lock = threading.Lock()
+        self._pc_debug_count = 0  # counts price_change messages logged at debug level
 
     # -----------------------------------------------------------------------
     # Public interface
@@ -345,28 +368,57 @@ class ClobWsClient:
         state.apply_snapshot(raw_bids, raw_asks, book_ts)
 
     def _handle_price_change(self, msg: Dict[str, Any], ts_local: int) -> None:
-        token_id = msg.get("asset_id") or msg.get("token_id")
-        if not token_id:
-            log.log_parse_anomaly("clob_ws.price_change", "asset_id", msg, "missing asset_id")
+        # asset_id is NOT at the top level for price_change — it lives inside
+        # each element of the price_changes list.
+        price_changes = msg.get("price_changes")
+        if not isinstance(price_changes, list):
+            log.log_parse_anomaly(
+                "clob_ws.price_change", "price_changes", price_changes, "expected list"
+            )
             return
 
-        state = self._states.get(str(token_id))
-        if state is None:
-            return
+        # Debug log for the first few messages to confirm shape
+        if self._pc_debug_count < _PRICE_CHANGE_DEBUG_LIMIT:
+            asset_ids = [ch.get("asset_id") for ch in price_changes if isinstance(ch, dict)]
+            log.streams.system.write({
+                "ts_local": ts_local, "event": "price_change_debug",
+                "event_type": "price_change",
+                "changes_count": len(price_changes),
+                "asset_ids": asset_ids,
+            })
+            self._pc_debug_count += 1
 
-        changes = msg.get("changes")
-        if not isinstance(changes, list):
-            log.log_parse_anomaly("clob_ws.price_change", "changes", changes, "expected list")
-            return
-
-        for ch in changes:
+        for ch in price_changes:
             if not isinstance(ch, dict):
                 continue
+
+            asset_id = ch.get("asset_id")
+            if not asset_id:
+                log.log_parse_anomaly(
+                    "clob_ws.price_change", "asset_id", ch,
+                    "price_changes item missing asset_id"
+                )
+                continue
+
+            state = self._states.get(str(asset_id))
+            if state is None:
+                continue  # not our token
+
             try:
+                best_bid_raw = ch.get("best_bid")
+                best_ask_raw = ch.get("best_ask")
+                price_raw = ch.get("price")
+                size_raw = ch.get("size")
                 side = str(ch.get("side", ""))
-                price = float(ch.get("price", 0))
-                size = float(ch.get("size", 0))
-                state.apply_delta(side, price, size)
+
+                best_bid = float(best_bid_raw) if best_bid_raw is not None else None
+                best_ask = float(best_ask_raw) if best_ask_raw is not None else None
+                size = float(size_raw) if size_raw is not None else 1.0
+
+                if best_bid is not None or best_ask is not None:
+                    state.apply_top_of_book(best_bid, best_ask, size)
+                elif price_raw is not None and side:
+                    state.apply_delta(side, float(price_raw), size)
             except (TypeError, ValueError) as exc:
                 log.log_parse_anomaly("clob_ws.price_change", "change_item", ch, str(exc))
 
