@@ -13,6 +13,7 @@ All microstructure fields treated as discoverable, not assumed.
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -173,23 +174,67 @@ def _parse_ts_ms(val: Any, field: str, context: str) -> Optional[int]:
     return None
 
 
-def _extract_tokens(raw: Dict[str, Any], context: str) -> List[TokenInfo]:
+def _extract_outcomes(raw: Dict[str, Any], n: int, context: str) -> List[str]:
     """
-    Parse the tokens/clob_token_ids field from a Gamma market object.
-    Handles multiple known shapes:
+    Try to resolve n outcome labels from the raw market dict.
+    Checks the `outcomes` field (plain list or stringified JSON).
+    Falls back to ["Yes", "No"] for n=2, else ["token_0", "token_1", ...].
+    """
+    outcomes_raw = raw.get("outcomes")
+    if outcomes_raw:
+        if isinstance(outcomes_raw, str):
+            try:
+                outcomes_raw = json.loads(outcomes_raw)
+            except (ValueError, TypeError):
+                outcomes_raw = None
+        if isinstance(outcomes_raw, list) and len(outcomes_raw) == n:
+            return [str(o) for o in outcomes_raw]
+    return ["Yes", "No"] if n == 2 else [f"token_{i}" for i in range(n)]
+
+
+def _extract_tokens(raw: Dict[str, Any], context: str) -> Tuple[List[TokenInfo], str, str]:
+    """
+    Parse token fields from a Gamma market object.
+    Returns (tokens, source_field, raw_type).
+
+    Supported shapes (native or stringified JSON):
       Shape A: [{"token_id": "...", "outcome": "Yes"}, ...]
-      Shape B: ["token_id_1", "token_id_2"]  (outcomes inferred from position)
+      Shape B: ["token_id_1", "token_id_2"]  — outcomes from `outcomes` field or Yes/No
       Shape C: {"Yes": "token_id_1", "No": "token_id_2"}
+      Shape D: any of the above encoded as a JSON string
     """
-    raw_tokens = raw.get("tokens") or raw.get("clobTokenIds") or raw.get("clob_token_ids")
-    if not raw_tokens:
-        log.log_parse_anomaly(context, "tokens", raw_tokens, "no token field found")
-        return []
+    source_field = "none"
+    raw_tokens = None
+    for key in ("tokens", "clobTokenIds", "clob_token_ids"):
+        val = raw.get(key)
+        if val:
+            raw_tokens = val
+            source_field = key
+            break
+
+    if raw_tokens is None:
+        log.log_parse_anomaly(context, "tokens", None, "no token field found")
+        return [], source_field, "none"
+
+    raw_type = type(raw_tokens).__name__
+
+    # Shape D: stringified JSON — decode then re-dispatch
+    if isinstance(raw_tokens, str):
+        try:
+            raw_tokens = json.loads(raw_tokens)
+        except (ValueError, TypeError):
+            log.log_parse_anomaly(context, source_field, raw_tokens[:100], "token field is string but not valid JSON")
+            return [], source_field, raw_type
+        log.streams.market_discovery.write({
+            "ts_local": _now_ms(), "event": "token_string_decoded",
+            "context": context, "source_field": source_field,
+            "decoded_type": type(raw_tokens).__name__,
+        })
 
     result: List[TokenInfo] = []
 
     # Shape A: list of dicts
-    if isinstance(raw_tokens, list) and all(isinstance(t, dict) for t in raw_tokens):
+    if isinstance(raw_tokens, list) and raw_tokens and all(isinstance(t, dict) for t in raw_tokens):
         for i, t in enumerate(raw_tokens):
             tid = t.get("token_id") or t.get("tokenId") or t.get("id")
             outcome = t.get("outcome") or t.get("side") or f"token_{i}"
@@ -199,15 +244,14 @@ def _extract_tokens(raw: Dict[str, Any], context: str) -> List[TokenInfo]:
                 log.log_parse_anomaly(context, f"tokens[{i}].token_id", t, "missing token_id in dict")
                 continue
             result.append(TokenInfo(token_id=str(tid), outcome=str(outcome), price=price))
-        return result
+        return result, source_field, raw_type
 
-    # Shape B: list of strings (token ids only, infer outcomes by position)
+    # Shape B: list of strings — map outcomes by index
     if isinstance(raw_tokens, list) and all(isinstance(t, str) for t in raw_tokens):
-        outcomes = ["Yes", "No"] if len(raw_tokens) == 2 else [f"token_{i}" for i in range(len(raw_tokens))]
+        outcomes = _extract_outcomes(raw, len(raw_tokens), context)
         for tid, outcome in zip(raw_tokens, outcomes):
             result.append(TokenInfo(token_id=tid, outcome=outcome))
-        log.log_parse_anomaly(context, "tokens", raw_tokens, "token list was bare strings; outcomes inferred by position")
-        return result
+        return result, source_field, raw_type
 
     # Shape C: dict mapping outcome -> token_id
     if isinstance(raw_tokens, dict):
@@ -216,10 +260,10 @@ def _extract_tokens(raw: Dict[str, Any], context: str) -> List[TokenInfo]:
                 log.log_parse_anomaly(context, f"tokens[{outcome}]", tid, "token_id value is not a string")
                 continue
             result.append(TokenInfo(token_id=tid, outcome=str(outcome)))
-        return result
+        return result, source_field, raw_type
 
-    log.log_parse_anomaly(context, "tokens", type(raw_tokens).__name__, "unrecognised token shape")
-    return result
+    log.log_parse_anomaly(context, source_field, type(raw_tokens).__name__, "unrecognised token shape")
+    return [], source_field, raw_type
 
 
 def _normalise_market(raw: Dict[str, Any]) -> Optional[MarketRecord]:
@@ -246,7 +290,7 @@ def _normalise_market(raw: Dict[str, Any]) -> Optional[MarketRecord]:
     question = raw.get("question") or raw.get("title")
 
     # ---- tokens ----
-    tokens = _extract_tokens(raw, context)
+    tokens, _tok_src, _tok_type = _extract_tokens(raw, context)
     if not tokens:
         warn("no tokens extracted")
 
@@ -320,6 +364,8 @@ def _normalise_market(raw: Dict[str, Any]) -> Optional[MarketRecord]:
         "minIncentiveSize", "min_incentive_size", "maxIncentiveSpread", "max_incentive_spread",
     }
     raw_fields = {k: v for k, v in raw.items() if k not in known_keys}
+    raw_fields["_token_source_field"] = _tok_src
+    raw_fields["_token_raw_type"] = _tok_type
 
     return MarketRecord(
         market_id=str(market_id),
@@ -728,6 +774,8 @@ def _log_discovery_candidate(
         "end_time": m.end_time,
         "token_count": len(token_ids),
         "token_ids": token_ids,
+        "token_source_field": m.raw_fields.get("_token_source_field", "unknown"),
+        "token_raw_type": m.raw_fields.get("_token_raw_type", "unknown"),
         "parse_warnings": m.parse_warnings,
     }
     log.streams.market_discovery.write(rec)
