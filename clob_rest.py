@@ -34,6 +34,10 @@ HTTP_TIMEOUT_S = 10
 # Stale threshold: if we haven't refreshed fees in this many seconds, warn
 FEE_STALE_THRESHOLD_S = 300
 
+# Per-endpoint "known unavailable" flags — set on first 404/405; skip on future calls
+_market_info_unavailable: bool = False
+_rewards_rates_unavailable: bool = False
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -395,44 +399,61 @@ def get_fee_rate(token_id: str, condition_id: Optional[str] = None) -> Dict[str,
                 except (TypeError, ValueError) as exc:
                     log.log_parse_anomaly("clob_rest.get_fee_rate", "feeRate", fee_val, str(exc))
 
-    # Attempt 2: /market-info endpoint (may not exist; probe it)
-    data2 = _get("/market-info", params={"token_id": token_id})
-    if data2 is not None and isinstance(data2, dict):
-        fee_val = (
-            data2.get("makerBaseFee")
-            or data2.get("takerBaseFee")
-            or data2.get("feeRate")
-            or data2.get("fee_rate")
-        )
-        if fee_val is not None:
-            try:
-                return {
-                    **base_result,
-                    "fee_rate": float(fee_val),
-                    "fee_rate_units": "bps",
-                    "fee_rate_source": "market_info_endpoint",
-                    "fees_enabled": data2.get("feesEnabled"),
-                    "status": "ok",
-                    "raw": data2,
-                }
-            except (TypeError, ValueError) as exc:
-                log.log_parse_anomaly("clob_rest.get_fee_rate", "feeRate", fee_val, str(exc))
+    # Attempt 2: /market-info endpoint — skip if already known 404/405
+    global _market_info_unavailable
+    if not _market_info_unavailable:
+        data2 = _get("/market-info", params={"token_id": token_id})
+        if data2 is None:
+            _market_info_unavailable = True
+            log.log_system_event(
+                "clob_endpoint_unavailable",
+                detail="/market-info returned no data; skipping in future calls",
+                extra={"endpoint": "/market-info"},
+            )
+        elif isinstance(data2, dict):
+            fee_val = (
+                data2.get("makerBaseFee")
+                or data2.get("takerBaseFee")
+                or data2.get("feeRate")
+                or data2.get("fee_rate")
+            )
+            if fee_val is not None:
+                try:
+                    return {
+                        **base_result,
+                        "fee_rate": float(fee_val),
+                        "fee_rate_units": "bps",
+                        "fee_rate_source": "market_info_endpoint",
+                        "fees_enabled": data2.get("feesEnabled"),
+                        "status": "ok",
+                        "raw": data2,
+                    }
+                except (TypeError, ValueError) as exc:
+                    log.log_parse_anomaly("clob_rest.get_fee_rate", "feeRate", fee_val, str(exc))
 
-    # Attempt 3: /rewards/rates (global rates)
-    data3 = _get("/rewards/rates")
-    if data3 is not None:
-        log.log_system_event(
-            "clob_fee_rates_global",
-            detail=f"got global rates response (token={token_id}), inspect raw for fee structure",
-            extra={"raw_snippet": str(data3)[:300]},
-        )
-        # We don't know the shape post-March 30; log and return unknown
-        return {
-            **base_result,
-            "fee_rate_source": "global_rates_endpoint_unknown_shape",
-            "status": "unknown",
-            "raw": data3,
-        }
+    # Attempt 3: /rewards/rates — skip if already known 404/405
+    global _rewards_rates_unavailable
+    if not _rewards_rates_unavailable:
+        data3 = _get("/rewards/rates")
+        if data3 is None:
+            _rewards_rates_unavailable = True
+            log.log_system_event(
+                "clob_endpoint_unavailable",
+                detail="/rewards/rates returned no data; skipping in future calls",
+                extra={"endpoint": "/rewards/rates"},
+            )
+        elif data3 is not None:
+            log.log_system_event(
+                "clob_fee_rates_global",
+                detail=f"got global rates response (token={token_id}), inspect raw for fee structure",
+                extra={"raw_snippet": str(data3)[:300]},
+            )
+            return {
+                **base_result,
+                "fee_rate_source": "global_rates_endpoint_unknown_shape",
+                "status": "unknown",
+                "raw": data3,
+            }
 
     # All attempts failed
     log.log_system_event(

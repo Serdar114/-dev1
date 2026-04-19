@@ -315,6 +315,10 @@ class ClobWsClient:
             log.log_parse_anomaly("clob_ws", "raw_message", raw[:200], f"JSON decode error: {exc}")
             return
 
+        if not isinstance(msg, dict):
+            # Valid JSON but not an object (e.g. a bare list or scalar) — skip silently
+            return
+
         # Buffer for debugging
         with self._lock:
             self._event_buffer.append({"ts_local": ts_local, "msg": msg})
@@ -422,8 +426,12 @@ class ClobWsClient:
             except (TypeError, ValueError) as exc:
                 log.log_parse_anomaly("clob_ws.price_change", "change_item", ch, str(exc))
 
-    def _on_error(self, ws: websocket.WebSocketApp, error: Exception) -> None:
-        log.log_exception("clob_ws.on_error", error if isinstance(error, Exception) else Exception(str(error)))
+    def _on_error(self, ws: websocket.WebSocketApp, error: Any) -> None:
+        try:
+            exc = error if isinstance(error, Exception) else Exception(str(error))
+            log.log_exception("clob_ws.on_error", exc)
+        except Exception:
+            pass  # never raise from on_error
 
     def _on_close(self, ws: websocket.WebSocketApp, close_status_code: Any, close_msg: Any) -> None:
         log.log_system_event(
