@@ -37,6 +37,8 @@ FEE_STALE_THRESHOLD_S = 300
 # Per-endpoint "known unavailable" flags — set on first 404/405; skip on future calls
 _market_info_unavailable: bool = False
 _rewards_rates_unavailable: bool = False
+# Per-condition_id set: neg-risk endpoint 404'd for these ids; never retry
+_neg_risk_unavailable: set = set()
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -374,10 +376,18 @@ def get_fee_rate(token_id: str, condition_id: Optional[str] = None) -> Dict[str,
         "raw": None,
     }
 
-    # Attempt 1: neg-risk-market-info endpoint
-    if condition_id:
+    # Attempt 1: neg-risk-market-info endpoint — skip if already known 404
+    global _neg_risk_unavailable
+    if condition_id and condition_id not in _neg_risk_unavailable:
         data = _get(f"/neg-risk-market-info/{condition_id}")
-        if data is not None and isinstance(data, dict):
+        if data is None:
+            _neg_risk_unavailable.add(condition_id)
+            log.log_system_event(
+                "clob_endpoint_unavailable",
+                detail=f"/neg-risk-market-info/{condition_id} returned no data; skipping in future calls",
+                extra={"endpoint": "/neg-risk-market-info", "condition_id": condition_id},
+            )
+        elif isinstance(data, dict):
             fee_val = (
                 data.get("makerBaseFee")
                 or data.get("takerBaseFee")

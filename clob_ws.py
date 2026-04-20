@@ -478,12 +478,29 @@ class ClobWsClient:
     def check_liveness(self) -> None:
         """
         Check for heartbeat miss. Call periodically from main thread (e.g. every 5s).
-        Logs warning if no message received within HEARTBEAT_MISS_THRESHOLD_MS.
+        On miss, closes the socket so _run_loop's reconnect path picks it back up.
         """
         ts_local = _now_ms()
         if self._last_message_ms is None:
-            # Not yet received any message
             return
         gap = ts_local - self._last_message_ms
         if gap > HEARTBEAT_MISS_THRESHOLD_MS:
             log.log_heartbeat_miss("clob_ws", self._last_message_ms, HEARTBEAT_MISS_THRESHOLD_MS)
+            log.log_system_event(
+                "clob_ws_heartbeat_restart",
+                detail=f"gap_ms={gap} > {HEARTBEAT_MISS_THRESHOLD_MS}; closing socket to trigger reconnect",
+                extra={
+                    "gap_ms": gap,
+                    "threshold_ms": HEARTBEAT_MISS_THRESHOLD_MS,
+                    "token_ids": self.token_ids,
+                    "market_slug": self.market_slug,
+                },
+            )
+            # Reset before close so repeated check_liveness calls don't pile on
+            self._last_message_ms = None
+            ws = self._ws
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
