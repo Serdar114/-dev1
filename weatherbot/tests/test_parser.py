@@ -167,3 +167,44 @@ def test_parse_never_crashes():
     for i, q in enumerate(weird_inputs):
         r = parse_market(f"weird_{i}", q)
         assert r is not None  # never crashes
+
+
+# ── ICAO extraction ───────────────────────────────────────────────────────────
+
+def test_icao_not_extracted_from_question_word():
+    """'WILL' from 'Will the highest temperature...' must not be returned as ICAO."""
+    q = "Will the highest temperature in Hong Kong on April 26 be 29°C?"
+    r = parse_market("icao1", q)
+    assert r.station_code_from_text is None, (
+        f"Expected None but got {r.station_code_from_text!r}"
+    )
+
+
+def test_icao_extracted_from_metar_station_context():
+    """VHHH accepted when it appears near 'METAR station' in resolution text."""
+    r = parse_market(
+        "icao2",
+        "Will the daily high temperature in Hong Kong be above 30°C on April 26?",
+        resolution_text="Weather reported by METAR station VHHH",
+    )
+    assert r.station_code_from_text == "VHHH"
+
+
+def test_icao_extracted_from_airport_station_context():
+    """KLGA accepted when it appears near 'Airport station' in rules text."""
+    r = parse_market(
+        "icao3",
+        "Will the daily high in New York City be above 70°F on June 1, 2026?",
+        rules="Resolves using LaGuardia Airport station KLGA data.",
+    )
+    assert r.station_code_from_text == "KLGA"
+
+
+def test_icao_denylist_words_rejected():
+    """Common English words that match ICAO prefix must be rejected."""
+    for word in ("WILL", "HIGH", "TEMP", "DATE", "CITY", "THIS", "THAT", "OVER", "LESS", "MORE"):
+        q = f"Will the temperature be {word} degrees Fahrenheit on July 4, 2026?"
+        r = parse_market(f"deny_{word}", q)
+        assert r.station_code_from_text != word, (
+            f"Denylist word {word!r} was incorrectly returned as ICAO"
+        )

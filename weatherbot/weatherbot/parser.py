@@ -50,6 +50,53 @@ RISK_KEYWORDS = [
 
 MANIPULATION_CITIES = {"paris", "cdg", "le bourget"}
 
+# ICAO codes known from stations.yaml — accepted from anywhere in combined text
+_KNOWN_ICAO_CODES: frozenset[str] = frozenset([
+    "KLGA", "KORD", "KDAL", "KDFW", "KMIA", "KLAX", "KATL",
+    "RJTT", "RKSI", "WSSS", "LTFM", "ZSPD", "VHHH", "EGLC",
+    "LFPB", "LFPG", "EDDB", "EHAM", "YSSY", "YMML", "CYYZ",
+    "CYVR", "KPHX", "KIAH", "KDEN", "KSEA", "KMSP", "KBOS",
+    "KPHL", "KLAS", "OMDB", "VABB", "MMMX", "SBGR", "SAEZ",
+])
+
+# Common English words that happen to match ICAO prefix rules — must be rejected
+_ICAO_DENYLIST: frozenset[str] = frozenset([
+    # User-required
+    "WILL", "HIGH", "TEMP", "DATE", "CITY", "THIS", "THAT", "OVER", "LESS", "MORE",
+    # Common W-words (W is a valid ICAO prefix letter)
+    "WAIT", "WALK", "WARM", "WASH", "WAVE", "WEEK", "WELL", "WERE", "WHAT", "WHEN",
+    "WIDE", "WIND", "WISE", "WISH", "WITH", "WORD", "WORK", "WANT", "WENT",
+    # Common L-words
+    "LACK", "LAND", "LAST", "LEAD", "LEFT", "LIFE", "LIKE", "LIVE", "LOAD",
+    "LONG", "LOOK", "LOSE", "LOVE",
+    # Common K-words
+    "KEEP", "KNOW",
+    # Common C-words
+    "CALL", "CAME", "CARE", "CASE", "COLD", "COME", "COOL", "COST",
+    # Common B-words
+    "BACK", "BALL", "BASE", "BEEN", "BEST", "BOTH", "BURN",
+    # Common E-words
+    "EACH", "EARN", "EAST", "EASY", "EVEN", "EVER",
+    # Common P-words
+    "PACK", "PAGE", "PAID", "PAIN", "PART", "PASS", "PAST", "PICK", "PLAN", "PLAY",
+    "PLUS", "POOR", "PULL", "PUSH",
+    # Common R-words
+    "RACE", "RAIN", "RANK", "RATE", "READ", "REAL", "RIDE", "RING", "RISE", "RISK",
+    "ROAD", "ROLE", "ROOM", "RULE", "RUSH",
+    # Common V-words
+    "VERY", "VIEW", "VOTE",
+    # Common Y-words
+    "YEAR", "YOUR",
+    # Common Z-words
+    "ZONE",
+])
+
+# Keywords that signal station context — ICAO accepted when one is nearby in the text
+_STATION_CONTEXT_KWS: tuple[str, ...] = (
+    "station", "airport", "metar", "icao", "weather station",
+    "observed at", "reported by", "reporting station",
+)
+
 # Month name to number
 _MONTH_MAP = {
     "january": 1, "february": 2, "march": 3, "april": 4,
@@ -403,14 +450,62 @@ def _classify_source_type(text: str) -> str:
     return SOURCE_TYPE_UNKNOWN
 
 
-def _extract_icao_from_text(text: str) -> Optional[str]:
-    """Look for a 4-letter ICAO code pattern in text."""
-    m = re.search(r"\b([A-Z]{4})\b", text)
-    if m:
-        candidate = m.group(1)
-        # Basic filter: must start with a valid region prefix
-        if candidate[0] in "KLBCEPRVWYZ" or candidate[:2] in ("EG", "LF", "RJ", "RK", "WS", "VH", "ZS", "SA", "SB", "CY", "OM"):
-            return candidate
+_ICAO_PATTERN = re.compile(r"\b([A-Z]{4})\b")
+_ICAO_VALID_PREFIXES = frozenset("KLBCEPRVWYZ")
+_ICAO_VALID_DIPREFIXES = frozenset([
+    "EG", "LF", "RJ", "RK", "WS", "VH", "ZS", "SA", "SB", "CY", "OM",
+])
+
+
+def _icao_valid_prefix(code: str) -> bool:
+    return code[0] in _ICAO_VALID_PREFIXES or code[:2] in _ICAO_VALID_DIPREFIXES
+
+
+def _extract_icao_from_text(
+    full_text: str,
+    source_text: Optional[str] = None,
+    rules_text: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Extract a 4-letter ICAO station code with three zones of trust:
+
+    Zone 1 — Trusted fields (resolution_source + rules): any valid-prefix code
+              not on the denylist is accepted without further context.
+    Zone 2 — Full combined text with station-context requirement: accepted only
+              when a station keyword ("station", "airport", "METAR", etc.) appears
+              within 100 characters of the candidate.
+    Zone 3 — Known-station whitelist: accepted from anywhere in combined text if
+              the code is in _KNOWN_ICAO_CODES (loaded from stations.yaml).
+    """
+    def _accepted(code: str) -> bool:
+        return code not in _ICAO_DENYLIST and _icao_valid_prefix(code)
+
+    # Zone 1: trusted source / rules fields
+    for zone in (source_text, rules_text):
+        if not zone:
+            continue
+        for m in _ICAO_PATTERN.finditer(zone.upper()):
+            if _accepted(m.group(1)):
+                return m.group(1)
+
+    # Zone 2: full combined text but only near station-context keywords
+    text_upper = full_text.upper()
+    text_lower = full_text.lower()
+    for m in _ICAO_PATTERN.finditer(text_upper):
+        code = m.group(1)
+        if not _accepted(code):
+            continue
+        start = max(0, m.start() - 100)
+        end = min(len(text_lower), m.end() + 100)
+        window = text_lower[start:end]
+        if any(kw in window for kw in _STATION_CONTEXT_KWS):
+            return code
+
+    # Zone 3: known-station whitelist — accepted from anywhere
+    for m in _ICAO_PATTERN.finditer(full_text.upper()):
+        if m.group(1) in _KNOWN_ICAO_CODES:
+            return m.group(1)
+
     return None
 
 
@@ -547,7 +642,11 @@ def _parse_inner(
     resolution_source = _extract_resolution_source(combined)
     station_url = _extract_station_url(combined)
     source_type = _classify_source_type(combined)
-    station_code_from_text = _extract_icao_from_text(combined.upper())
+    station_code_from_text = _extract_icao_from_text(
+        combined,
+        source_text=resolution_text,
+        rules_text=rules,
+    )
     risk_kw = _find_risk_keywords(combined)
 
     manipulation_flag = False
