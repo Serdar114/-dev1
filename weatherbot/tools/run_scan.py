@@ -8,6 +8,8 @@ Usage:
   python tools/run_scan.py --paper-only
   python tools/run_scan.py --include-unknown-cities
   python tools/run_scan.py --max-markets 100
+  python tools/run_scan.py --slug highest-temperature-in-seoul-on-april-27-2026
+  python tools/run_scan.py --url https://polymarket.com/event/highest-temperature-in-seoul-on-april-27-2026
 """
 import argparse
 import logging
@@ -51,11 +53,25 @@ def main():
                         help="Maximum number of markets to scan per cycle")
     parser.add_argument("--log-level", default="INFO",
                         help="Logging level (DEBUG/INFO/WARNING/ERROR)")
+    parser.add_argument("--slug", default=None,
+                        help="Polymarket event slug for targeted single-market scan")
+    parser.add_argument("--url", default=None,
+                        help="Polymarket event URL (slug extracted automatically)")
 
     args = parser.parse_args()
 
     setup_logging(args.log_level)
     logger = logging.getLogger("run_scan")
+
+    # Resolve slug from --url if provided
+    slug = args.slug
+    if args.url and not slug:
+        # Extract slug from https://polymarket.com/event/<slug>
+        url = args.url.rstrip("/")
+        if "/event/" in url:
+            slug = url.split("/event/")[-1]
+        else:
+            slug = url.split("/")[-1]
 
     if not args.once and not args.loop:
         # Default to --once
@@ -66,8 +82,8 @@ def main():
     logger.info("=" * 60)
     logger.info("Polymarket Weather Temperature Edge Scanner V1")
     logger.info("Mode: paper/ghost only — NO live orders")
-    logger.info("once=%s loop=%s interval=%ds max_markets=%d include_unknown=%s",
-                args.once, args.loop, args.interval, args.max_markets, args.include_unknown_cities)
+    logger.info("once=%s loop=%s interval=%ds max_markets=%d include_unknown=%s slug=%r",
+                args.once, args.loop, args.interval, args.max_markets, args.include_unknown_cities, slug)
     logger.info("=" * 60)
 
     stats = run_scan(
@@ -76,6 +92,7 @@ def main():
         once=once,
         loop_interval_seconds=args.interval,
         paper_only=args.paper_only,
+        slug=slug,
     )
 
     print("\n=== SCAN COMPLETE ===")
@@ -85,6 +102,7 @@ def main():
     print(f"Markets blacklisted:   {stats.markets_blacklisted}")
     print(f"Markets precipitation: {stats.markets_precipitation}")
     print(f"Markets skipped/closed:{stats.markets_skipped_closed}")
+    print(f"Markets non-weather:   {stats.markets_skipped_non_weather}")
     print(f"Markets processed:     {stats.markets_processed}")
     print(f"Signals generated:     {stats.signals_generated}")
     print(f"Ghost trades logged:   {stats.ghost_trades_logged}")

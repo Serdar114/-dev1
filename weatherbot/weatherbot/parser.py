@@ -456,9 +456,9 @@ def _extract_bucket(text: str, unit: Optional[str]) -> dict:
 
     q = text.strip()
 
-    # Open-ended high: "at least X", "X or higher/above", ">= X"
+    # Open-ended high: "at least X", "above X", "exceed X", "X or higher/above", ">= X"
     m = re.search(
-        r"(?:at least|>=?|≥)\s*(-?\d+(?:\.\d+)?)\s*[°]?\s*[FC]?",
+        r"(?:at least|above|exceed(?:s|ing)?|>=?|≥)\s*(-?\d+(?:\.\d+)?)\s*[°]?\s*[FC]?",
         q, re.IGNORECASE
     )
     if m:

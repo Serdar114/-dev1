@@ -25,7 +25,7 @@ from typing import Any, Optional
 import yaml
 
 from .book_collector import fetch_orderbook
-from .discovery import RawMarket, discover_all
+from .discovery import RawMarket, discover_all, discover_by_slug, is_weather_candidate
 from .ev_calculator import (
     ACTION_PAPER_MAKER,
     ACTION_PAPER_TAKER,
@@ -127,6 +127,7 @@ class ScanStats:
     markets_precipitation: int = 0
     markets_skipped_closed: int = 0
     markets_missing_target_date: int = 0
+    markets_skipped_non_weather: int = 0
     markets_processed: int = 0
     signals_generated: int = 0
     ghost_trades_logged: int = 0
@@ -165,6 +166,12 @@ def process_market(
             resolution_text=raw.resolution_source,
             close_time=raw.close_time,
         )
+
+        # ── Non-weather guard ─────────────────────────────────────────────────
+        if not is_weather_candidate(raw.question, slug=raw.slug or ""):
+            result["status"] = "skipped_non_weather"
+            result["reason"] = "no_weather_signal"
+            return result
 
         # ── Hours to close (lifecycle only) ───────────────────────────────────
         htc = _hours_to_close(raw.close_time)
@@ -573,6 +580,7 @@ def run_scan(
     once: bool = True,
     loop_interval_seconds: int = 60,
     paper_only: bool = True,
+    slug: Optional[str] = None,
 ) -> ScanStats:
     settings = _load_settings()
     ev_cfg = settings.get("ev", {})
@@ -584,8 +592,8 @@ def run_scan(
     stats = ScanStats()
 
     logger.info(
-        "Starting scan: max_markets=%d include_unknown=%s once=%s",
-        max_markets, include_unknown_cities, once,
+        "Starting scan: max_markets=%d include_unknown=%s once=%s slug=%r",
+        max_markets, include_unknown_cities, once, slug,
     )
 
     while True:
@@ -596,6 +604,7 @@ def run_scan(
             include_unknown_cities=include_unknown_cities,
             hours_to_close_reject=hours_reject,
             max_open_ghost_trades=max_open,
+            slug=slug,
         )
 
         stats.markets_discovered += cycle_stats.markets_discovered
@@ -605,6 +614,7 @@ def run_scan(
         stats.markets_precipitation += cycle_stats.markets_precipitation
         stats.markets_skipped_closed += cycle_stats.markets_skipped_closed
         stats.markets_missing_target_date += cycle_stats.markets_missing_target_date
+        stats.markets_skipped_non_weather += cycle_stats.markets_skipped_non_weather
         stats.markets_processed += cycle_stats.markets_processed
         stats.signals_generated += cycle_stats.signals_generated
         stats.ghost_trades_logged += cycle_stats.ghost_trades_logged
@@ -637,9 +647,13 @@ def _run_cycle(
     include_unknown_cities: bool,
     hours_to_close_reject: float,
     max_open_ghost_trades: int,
+    slug: Optional[str] = None,
 ) -> ScanStats:
     stats = ScanStats()
-    raw_markets = discover_all(max_markets=max_markets)
+    if slug:
+        raw_markets = discover_by_slug(slug)
+    else:
+        raw_markets = discover_all(max_markets=max_markets)
     stats.markets_discovered = len(raw_markets)
 
     for raw in raw_markets:
@@ -655,6 +669,8 @@ def _run_cycle(
 
         if status == "parse_failed":
             stats.markets_parse_failed += 1
+        elif status == "skipped_non_weather":
+            stats.markets_skipped_non_weather += 1
         elif status == "skipped_expired":
             stats.markets_skipped_closed += 1
         elif status == "hard_blacklist":

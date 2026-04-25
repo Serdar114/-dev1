@@ -6,6 +6,7 @@ from weatherbot.discovery import (
     _extract_token_ids,
     _extract_outcomes,
     _parse_raw_market,
+    is_weather_candidate,
 )
 from weatherbot.runner import _is_valid_token_id
 
@@ -179,3 +180,67 @@ def test_valid_token_id_large_decimal():
     """A realistic Polymarket asset ID (large decimal string) must be accepted."""
     tid = "52114319501245915516055106046884209969926127482827954674443846427813813222426"
     assert _is_valid_token_id(tid) is True
+
+
+# ── is_weather_candidate ──────────────────────────────────────────────────────
+
+def test_seoul_slug_is_weather():
+    assert is_weather_candidate(
+        "Will the highest temperature in Seoul on April 27 be above 20°C?",
+        slug="highest-temperature-in-seoul-on-april-27-2026",
+    ) is True
+
+
+def test_seoul_slug_only_triggers_weather():
+    """Slug alone (even with empty question) must trigger weather candidate."""
+    assert is_weather_candidate("", slug="highest-temperature-in-seoul-on-april-27-2026") is True
+
+
+def test_non_weather_microstrategy():
+    assert is_weather_candidate(
+        "Will MicroStrategy buy more Bitcoin this week?",
+        slug="microstrategy-bitcoin-purchase",
+    ) is False
+
+
+def test_non_weather_ukraine():
+    assert is_weather_candidate(
+        "Will Ukraine sign a ceasefire agreement in 2025?",
+        slug="ukraine-ceasefire-2025",
+    ) is False
+
+
+def test_non_weather_gta():
+    assert is_weather_candidate(
+        "Will GTA 6 be released before December 2025?",
+        slug="gta-6-release-2025",
+    ) is False
+
+
+def test_non_weather_taylor_swift():
+    assert is_weather_candidate(
+        "Will Taylor Swift release a new album in 2025?",
+        slug="taylor-swift-album-2025",
+    ) is False
+
+
+def test_precipitation_question_is_weather():
+    assert is_weather_candidate(
+        "Will there be more than 10mm of precipitation in Tokyo on April 27?",
+    ) is True
+
+
+def test_wet_word_not_weather():
+    """'wet' alone must not classify a market as weather."""
+    assert is_weather_candidate(
+        "Will the streets be wet after the flood in New Orleans?",
+        slug="new-orleans-flood-damage",
+    ) is False
+
+
+def test_flood_word_not_weather():
+    """'flood' alone must not classify a market as weather."""
+    assert is_weather_candidate(
+        "Will the 2025 Mississippi River flood exceed 1993 levels?",
+        slug="mississippi-river-flood-1993",
+    ) is False

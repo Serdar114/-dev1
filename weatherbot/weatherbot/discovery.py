@@ -15,13 +15,35 @@ GAMMA_BASE = "https://gamma-api.polymarket.com"
 CLOB_BASE = "https://clob.polymarket.com"
 
 WEATHER_TAGS = {"weather", "temperature", "climate"}
+
+# These words in question/slug/title reliably indicate a temperature market
 WEATHER_KEYWORDS = [
     "temperature", "high temp", "low temp", "daily high", "daily low",
     "degrees", "fahrenheit", "celsius", "°f", "°c", "heat", "cold snap",
+    "highest temp", "lowest temp", "max temp", "min temp",
 ]
+
+# Slug/title sub-strings that unambiguously mark weather events
+WEATHER_SLUG_PATTERNS = [
+    "highest-temperature-in-",
+    "lowest-temperature-in-",
+    "daily-high-temperature",
+    "daily-low-temperature",
+    "highest temperature in",
+    "lowest temperature in",
+    "daily high temperature",
+    "daily low temperature",
+    "temperature in ",
+    "precipitation in ",
+    "rainfall in ",
+]
+
+# Precipitation keywords — explicit only; "wet" and "flood" removed (too generic)
 PRECIP_KEYWORDS = [
-    "rain", "rainfall", "precipitation", "snow", "snowfall", "inches of rain",
-    "mm of rain", "wet", "flood",
+    "rainfall", "precipitation", "snowfall",
+    "inches of rain", "mm of rain", "inches of precip",
+    " rain ", "rain?", "it rain", "will rain",
+    " snow ", "snow?", "it snow",
 ]
 
 TEMP_MARKET_TYPES = {"daily_high_temperature", "daily_low_temperature"}
@@ -72,13 +94,21 @@ def _get(url: str, params: dict, timeout: int = 15, retries: int = 3, backoff: f
 
 
 def _is_weather_market(market: dict) -> bool:
+    """Return True if the market looks like a weather/temperature market."""
     question = (market.get("question") or "").lower()
     slug = (market.get("slug") or "").lower()
+    title = (market.get("title") or market.get("groupItemTitle") or "").lower()
+    group_slug = (market.get("groupItemTag") or "").lower()
     tags = [t.lower() for t in (market.get("tags") or [])]
-    group_slug = (market.get("groupItemTitle") or market.get("groupItemTag") or "").lower()
+
+    combined = f"{question} {slug} {title} {group_slug}"
+
+    for pat in WEATHER_SLUG_PATTERNS:
+        if pat in combined:
+            return True
 
     for kw in WEATHER_KEYWORDS:
-        if kw in question or kw in slug or kw in group_slug:
+        if kw in combined:
             return True
 
     for tag in tags:
@@ -88,11 +118,37 @@ def _is_weather_market(market: dict) -> bool:
     return False
 
 
+def is_weather_candidate(question: str, slug: str = "") -> bool:
+    """
+    Public helper: does this question/slug contain any temperature or weather signal?
+
+    Used as a last-resort non-weather filter in the processing pipeline —
+    markets that pass discovery but have zero weather signal are skipped
+    before being logged to observations.jsonl.
+    """
+    text = (question + " " + slug).lower()
+    for kw in WEATHER_KEYWORDS:
+        if kw in text:
+            return True
+    for pat in WEATHER_SLUG_PATTERNS:
+        if pat in text:
+            return True
+    for kw in PRECIP_KEYWORDS:
+        if kw in text:
+            return True
+    return False
+
+
 def _is_precipitation_only(market: dict) -> bool:
+    """
+    Return True only when explicit precipitation words are present.
+    Generic words like 'wet' and 'flood' are intentionally excluded.
+    """
     question = (market.get("question") or "").lower()
     slug = (market.get("slug") or "").lower()
+    text = question + " " + slug
     for kw in PRECIP_KEYWORDS:
-        if kw in question or kw in slug:
+        if kw in text:
             return True
     return False
 
@@ -279,6 +335,98 @@ def _parse_raw_market(m: dict) -> Optional[RawMarket]:
     )
 
 
+def _extract_markets_from_event(event: dict) -> list[RawMarket]:
+    """
+    Extract all RawMarket objects from a Gamma event dict.
+    Inherits event-level title/description/rules into each child market
+    so the parser has the richest possible text.
+    """
+    event_id = str(event.get("id") or "")
+    event_title = event.get("title") or event.get("name") or ""
+    event_desc = event.get("description") or ""
+    event_rules = event.get("resolutionRules") or event.get("rules") or ""
+
+    results: list[RawMarket] = []
+    for m in (event.get("markets") or []):
+        if not isinstance(m, dict):
+            continue
+        # Merge event metadata without mutating the original dict
+        merged: dict = dict(m)
+        if event_id and not merged.get("eventId"):
+            merged["eventId"] = event_id
+        if event_title and not merged.get("title"):
+            merged["title"] = event_title
+        if event_desc and not merged.get("description"):
+            merged["description"] = event_desc
+        if event_rules and not merged.get("rules"):
+            merged["rules"] = event_rules
+
+        rm = _parse_raw_market(merged)
+        if rm is not None:
+            results.append(rm)
+    return results
+
+
+def fetch_event_by_slug(slug: str) -> list[RawMarket]:
+    """
+    Fetch all markets for a Polymarket event by its slug.
+
+    Tries three Gamma endpoints in order:
+      1. /events/{slug}          — single event object
+      2. /events?slug={slug}     — list query
+      3. /markets?slug={slug}    — direct market query (single-outcome markets)
+    """
+    if not slug:
+        return []
+
+    # 1. Direct event object
+    data = _get(f"{GAMMA_BASE}/events/{slug}", params={})
+    if data and isinstance(data, dict) and data.get("markets"):
+        results = _extract_markets_from_event(data)
+        if results:
+            logger.info("fetch_event_by_slug %r → %d markets via /events/{slug}", slug, len(results))
+            return results
+
+    # 2. Events list query
+    data = _get(f"{GAMMA_BASE}/events", params={"slug": slug})
+    if data:
+        events = data if isinstance(data, list) else (data.get("data") or data.get("events") or [])
+        results = []
+        for ev in events:
+            if isinstance(ev, dict):
+                results.extend(_extract_markets_from_event(ev))
+        if results:
+            logger.info("fetch_event_by_slug %r → %d markets via /events?slug=", slug, len(results))
+            return results
+
+    # 3. Markets query (single-outcome or direct market slug)
+    data = _get(f"{GAMMA_BASE}/markets", params={"slug": slug})
+    if data:
+        items = data if isinstance(data, list) else (data.get("data") or data.get("markets") or [])
+        results = []
+        for m in items:
+            if isinstance(m, dict):
+                rm = _parse_raw_market(m)
+                if rm is not None:
+                    results.append(rm)
+        if results:
+            logger.info("fetch_event_by_slug %r → %d markets via /markets?slug=", slug, len(results))
+            return results
+
+    logger.warning("fetch_event_by_slug %r: no markets found on any endpoint", slug)
+    return []
+
+
+def discover_by_slug(slug: str) -> list[RawMarket]:
+    """
+    Targeted discovery: fetch all markets for a specific event slug.
+    Bypasses broad discovery for testing and single-market validation.
+    """
+    logger.info("Targeted discovery: slug=%r", slug)
+    results = fetch_event_by_slug(slug)
+    logger.info("discover_by_slug %r: found %d markets", slug, len(results))
+    return results
+
 
 def discover_gamma_markets(max_markets: int = 200, offset: int = 0) -> list[RawMarket]:
     """Fetch markets from Gamma API, filter for active weather/temperature markets."""
@@ -360,14 +508,10 @@ def discover_gamma_events(max_markets: int = 200) -> list[RawMarket]:
         for event in items:
             if not isinstance(event, dict):
                 continue
-            markets_in_event = event.get("markets") or []
-            for m in markets_in_event:
-                if not isinstance(m, dict):
-                    continue
-                if not m.get("eventId"):
-                    m["eventId"] = event.get("id")
-                rm = _parse_raw_market(m)
-                if rm is not None and rm.active:
+            if not _is_weather_market(event):
+                continue
+            for rm in _extract_markets_from_event(event):
+                if rm.active:
                     results.append(rm)
                 if len(results) >= max_markets:
                     break

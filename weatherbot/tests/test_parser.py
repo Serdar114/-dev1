@@ -271,3 +271,45 @@ def test_date_close_time_provides_year_not_date():
     assert r.parsed_target_date == date(2026, 4, 26), repr(r.parsed_target_date)
     # Confirm it is NOT the close_time date
     assert r.parsed_target_date != date(2026, 4, 27)
+
+
+# ── Seoul known-positive fixture ──────────────────────────────────────────────
+
+def test_seoul_market_parses_correctly():
+    """Known-positive fixture: highest-temperature-in-seoul-on-april-27-2026."""
+    from datetime import date
+    r = parse_market(
+        "seoul1",
+        "Will the highest temperature in Seoul on April 27 be above 20°C?",
+        close_time="2026-04-28T00:00:00Z",
+    )
+    assert r.parse_failed is False, f"parse_failed with reason: {r.forecast_blocked_reason}"
+    assert r.city is not None and r.city != ""
+    assert r.unit == UNIT_C
+    assert r.parsed_target_date == date(2026, 4, 27), repr(r.parsed_target_date)
+    assert r.market_type == MARKET_TYPE_DAILY_HIGH
+    assert r.manipulation_flag is False
+
+
+# ── Precipitation strict filter ───────────────────────────────────────────────
+
+def test_wet_not_precipitation():
+    """'wet' alone must not set is_precipitation=True."""
+    r = parse_market("wet1", "Will the streets be wet after the New Orleans storm?")
+    assert r.is_precipitation is False
+
+
+def test_flood_not_precipitation():
+    """'flood' alone must not set is_precipitation=True."""
+    r = parse_market("flood1", "Will the Mississippi River flood in 2025?")
+    assert r.is_precipitation is False
+
+
+def test_rainfall_is_precipitation():
+    r = parse_market("rain1", "Will there be rainfall in London on June 1, 2026?")
+    assert r.is_precipitation is True
+
+
+def test_snowfall_is_precipitation():
+    r = parse_market("snow1", "Will snowfall exceed 5 inches in Chicago on December 10, 2025?")
+    assert r.is_precipitation is True
