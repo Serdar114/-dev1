@@ -202,7 +202,17 @@ class ParsedMarket:
 
 
 def _normalize(text: str) -> str:
-    return text.strip().replace("°", "°").replace("–", "-").replace("—", "-")
+    return (
+        text.strip()
+        .replace("°", "°")
+        .replace("–", "-")
+        .replace("—", "-")
+        # Mojibake: UTF-8 degree sign (U+00B0) bytes mis-read as CP437 → ┬░
+        .replace("┬░", "°")
+        # Mojibake: UTF-8 degree sign bytes mis-read as Latin-1 → Â°
+        .replace("Â°", "°")
+        .replace("Âº", "°")
+    )
 
 
 def _combine_text(
@@ -283,14 +293,23 @@ def _detect_market_type(text: str) -> str:
 
 def _detect_unit(text: str) -> Optional[str]:
     q = text.lower()
-    if "°f" in q or "fahrenheit" in q or re.search(r"\d°f", q):
-        return UNIT_F
-    if "°c" in q or "celsius" in q or "centigrade" in q or re.search(r"\d°c", q):
+    # Count explicit C and F signals; majority wins (avoids Wunderground-F noise)
+    c_count = (
+        q.count("°c") + q.count("celsius") + q.count("centigrade")
+        + len(re.findall(r"\d°c", q))
+    )
+    f_count = (
+        q.count("°f") + q.count("fahrenheit")
+        + len(re.findall(r"\d°f", q))
+    )
+    if c_count > f_count:
         return UNIT_C
+    if f_count > c_count:
+        return UNIT_F
+    # Tied or both zero — look for standalone degree+letter
     m = re.search(r"°\s*([FC])", text, re.IGNORECASE)
     if m:
         return m.group(1).upper()
-    # Check for "degrees F" / "degrees C"
     m = re.search(r"degrees?\s+([FC])\b", text, re.IGNORECASE)
     if m:
         return m.group(1).upper()
@@ -499,7 +518,7 @@ def _extract_bucket(text: str, unit: Optional[str]) -> dict:
         val = float(m.group(1))
         result["bucket_high"] = val
         result["open_ended_low"] = True
-        result["bucket_label"] = f"< {val}"
+        result["bucket_label"] = f"<= {val}"
         return result
 
     # Range: "between X and Y"
@@ -526,6 +545,19 @@ def _extract_bucket(text: str, unit: Optional[str]) -> dict:
             result["bucket_high"] = max(lo, hi)
             result["bucket_label"] = f"{min(lo,hi)}-{max(lo,hi)}"
             return result
+
+    # Exact single-degree bucket: "be 14°C", "be 14 C", "be 14 degrees Celsius"
+    # Placed last — only reached when no range/open-ended pattern matched above.
+    m = re.search(
+        r"\bbe\s+(-?\d+(?:\.\d+)?)\s*(?:°\s*[FC]?|degrees?\s+(?:celsius|fahrenheit)|[FC]\b)?",
+        q, re.IGNORECASE,
+    )
+    if m:
+        val = float(m.group(1))
+        result["bucket_low"] = val
+        result["bucket_high"] = val
+        result["bucket_label"] = str(val)
+        return result
 
     return result
 
@@ -729,12 +761,18 @@ def _parse_inner(
     market_type = _detect_market_type(combined)
     is_precipitation = market_type == MARKET_TYPE_PRECIPITATION
 
-    unit = _detect_unit(combined)
+    # Unit: question text has the definitive unit; fall back to combined only if absent.
+    # This prevents Wunderground/Fahrenheit mentions in rules from overriding °C in question.
+    unit = _detect_unit(_normalize(question)) or _detect_unit(combined)
+
     city = _extract_city(_normalize(question))  # city extraction from question primarily
     reference_date = _parse_reference_date(close_time)
     date_str, parsed_target_date = _extract_date(combined, reference_date=reference_date)
 
-    bucket_info = _extract_bucket(combined, unit)
+    # Bucket: try question text first (avoids spurious range matches in description/rules)
+    bucket_info = _extract_bucket(_normalize(question), unit)
+    if bucket_info["bucket_label"] is None:
+        bucket_info = _extract_bucket(combined, unit)
     bucket_low = bucket_info["bucket_low"]
     bucket_high = bucket_info["bucket_high"]
     open_ended_low = bucket_info["open_ended_low"]

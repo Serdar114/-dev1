@@ -77,6 +77,9 @@ class RawMarket:
     accepting_orders: Optional[bool] = None
     closed: Optional[bool] = None
     token_mapping_failed: bool = False
+    # Polymarket: first clobTokenId = Yes, second = No
+    yes_token_id: Optional[str] = None
+    no_token_id: Optional[str] = None
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -302,15 +305,20 @@ def _parse_raw_market(m: dict) -> Optional[RawMarket]:
             return None
         return bool(val)
 
+    yes_token_id = token_ids[0] if len(token_ids) >= 1 else None
+    no_token_id = token_ids[1] if len(token_ids) >= 2 else None
+
     return RawMarket(
         market_id=market_id,
-        event_id=str(m.get("eventId")) if m.get("eventId") else (token_ids[0] if token_ids else None),
+        event_id=str(m.get("eventId")) if m.get("eventId") else None,
         question=question,
         slug=m.get("slug"),
         close_time=m.get("endDate") or m.get("closeTime") or m.get("end_date_iso"),
         outcomes=outcomes,
         token_ids=token_ids,
         token_mapping_failed=token_mapping_failed,
+        yes_token_id=yes_token_id,
+        no_token_id=no_token_id,
         category=m.get("category"),
         tags=tags,
         volume=_extract_volume(m),
@@ -338,13 +346,17 @@ def _parse_raw_market(m: dict) -> Optional[RawMarket]:
 def _extract_markets_from_event(event: dict) -> list[RawMarket]:
     """
     Extract all RawMarket objects from a Gamma event dict.
-    Inherits event-level title/description/rules into each child market
-    so the parser has the richest possible text.
+    Merges event-level title/description/rules/close_time into each child so
+    the parser has the richest possible text and all children have a valid date.
     """
     event_id = str(event.get("id") or "")
     event_title = event.get("title") or event.get("name") or ""
     event_desc = event.get("description") or ""
     event_rules = event.get("resolutionRules") or event.get("rules") or ""
+    event_close = (
+        event.get("endDate") or event.get("closeTime")
+        or event.get("end_date_iso") or event.get("startDate")
+    )
 
     results: list[RawMarket] = []
     for m in (event.get("markets") or []):
@@ -360,6 +372,9 @@ def _extract_markets_from_event(event: dict) -> list[RawMarket]:
             merged["description"] = event_desc
         if event_rules and not merged.get("rules"):
             merged["rules"] = event_rules
+        # Propagate event close_time so children can infer year for partial dates
+        if event_close and not merged.get("endDate") and not merged.get("closeTime"):
+            merged["endDate"] = event_close
 
         rm = _parse_raw_market(merged)
         if rm is not None:

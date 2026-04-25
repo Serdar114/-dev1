@@ -185,6 +185,20 @@ def compute_forecast(
     members = extract_ensemble_members(ensemble_data)
     ensemble_keys_detected = len(members) if members else 0
 
+    if members:
+        key_examples = list(members.keys())[:3]
+        logger.info(
+            "Ensemble members: model=%s n=%d key_examples=%s lat=%.3f lon=%.3f date=%s",
+            model_used, ensemble_keys_detected, key_examples, lat, lon, target_date,
+        )
+    else:
+        logger.warning(
+            "Ensemble: model=%s — no members detected. hourly_keys=%s lat=%.3f lon=%.3f",
+            model_used,
+            list((ensemble_data.get("hourly") or {}).keys())[:8],
+            lat, lon,
+        )
+
     if not members:
         logger.warning("No ensemble members in response, falling back to deterministic")
         det_data = fetch_open_meteo_forecast(lat, lon, target_date)

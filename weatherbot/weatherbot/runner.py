@@ -288,25 +288,28 @@ def process_market(
         active_token_id = None
         token_id_valid = False
 
-        if raw.token_ids:
+        # Use yes_token_id (first clobTokenId = Yes per Polymarket spec)
+        if raw.yes_token_id:
+            active_token_id = raw.yes_token_id
+        elif raw.token_ids:
             active_token_id = raw.token_ids[0]
-            token_id_valid = _is_valid_token_id(active_token_id)
-            if not token_id_valid:
-                logger.warning(
-                    "market %s has invalid token_id %r (token_mapping_failed=%s) — skipping CLOB fetch",
-                    raw.market_id, active_token_id, raw.token_mapping_failed,
-                )
-            elif not raw.token_mapping_failed:
-                book_result = fetch_orderbook(active_token_id)
-                if book_result:
-                    best_bid = book_result.best_bid
-                    best_ask = book_result.best_ask
-                    bid_size_best = book_result.bid_size_best
-                    ask_size_best = book_result.ask_size_best
-                    spread = book_result.spread
-                    bid_depth = book_result.bid_depth_top_n
-                    ask_depth = book_result.ask_depth_top_n
-                    book_state = book_result.book_state
+        token_id_valid = _is_valid_token_id(active_token_id)
+        if not token_id_valid:
+            logger.warning(
+                "market %s has invalid token_id %r (token_mapping_failed=%s) — skipping CLOB fetch",
+                raw.market_id, active_token_id, raw.token_mapping_failed,
+            )
+        elif not raw.token_mapping_failed:
+            book_result = fetch_orderbook(active_token_id)
+            if book_result:
+                best_bid = book_result.best_bid
+                best_ask = book_result.best_ask
+                bid_size_best = book_result.bid_size_best
+                ask_size_best = book_result.ask_size_best
+                spread = book_result.spread
+                bid_depth = book_result.bid_depth_top_n
+                ask_depth = book_result.ask_depth_top_n
+                book_state = book_result.book_state
 
         top_book_depth = bid_depth + ask_depth  # combined for legacy log field
 
@@ -440,6 +443,8 @@ def process_market(
                 "token_ids_count": len(raw.token_ids),
                 "outcomes_count": len(raw.outcomes),
                 "token_mapping_failed": raw.token_mapping_failed,
+                "yes_token_id_preview": (raw.yes_token_id[:12] + "…") if raw.yes_token_id and len(raw.yes_token_id) > 12 else raw.yes_token_id,
+                "no_token_id_preview": (raw.no_token_id[:12] + "…") if raw.no_token_id and len(raw.no_token_id) > 12 else raw.no_token_id,
                 "active_token_id_preview": (active_token_id[:12] + "…") if active_token_id and len(active_token_id) > 12 else active_token_id,
                 "active_token_id_valid": token_id_valid,
             },

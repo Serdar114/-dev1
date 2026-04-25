@@ -39,6 +39,11 @@ def _get(
     for attempt in range(retries):
         try:
             resp = requests.get(url, params=params, timeout=timeout)
+            if not resp.ok:
+                logger.warning(
+                    "GET %s HTTP %d body: %s",
+                    url, resp.status_code, resp.text[:600],
+                )
             resp.raise_for_status()
             return resp.json()
         except requests.RequestException as exc:
@@ -96,8 +101,11 @@ def fetch_open_meteo_forecast(
     target_date: date,
 ) -> Optional[dict]:
     """
-    Fetch deterministic hourly forecast from Open-Meteo (non-ensemble).
+    Fetch deterministic hourly + daily forecast from Open-Meteo (non-ensemble).
     Used as fallback when ensemble fails.
+
+    NOTE: Do NOT send forecast_days together with start_date/end_date — the API
+    returns 400 if both are present.
     """
     start = target_date.isoformat()
     end = target_date.isoformat()
@@ -110,7 +118,6 @@ def fetch_open_meteo_forecast(
         "end_date": end,
         "temperature_unit": "celsius",
         "timezone": "UTC",
-        "forecast_days": 1,
     }
     data = _get(OPEN_METEO_FORECAST_BASE, params=params)
     if data:
@@ -243,23 +250,51 @@ def extract_hourly_temps_from_ensemble(data: dict) -> Optional[list[float]]:
 
 def extract_ensemble_members(data: dict) -> Optional[dict[str, list[float]]]:
     """
-    Extract per-member hourly temperature arrays.
+    Extract per-member hourly temperature arrays from Open-Meteo ensemble response.
 
-    Returns {member_id: [temp_hour0, temp_hour1, ...]} or None.
+    Open-Meteo ensemble API returns flat keys like:
+        hourly.temperature_2m_member01, temperature_2m_member02, ...
+    (not a nested dict under temperature_2m)
+
+    Fallback: also handles older format where temperature_2m is a dict of members.
+
+    Returns {member_key: [temp_hour0, ...]} or None if no members found.
     """
     hourly = data.get("hourly") or {}
+
+    # Primary: flat member keys temperature_2m_memberXX
+    member_keys = sorted(
+        k for k in hourly
+        if "temperature_2m" in k and "member" in k.lower()
+    )
+    if member_keys:
+        result = {}
+        for k in member_keys:
+            v = hourly[k]
+            if isinstance(v, list):
+                result[k] = [float(x) for x in v if x is not None]
+        if result:
+            logger.debug(
+                "Ensemble members: n=%d examples=%s",
+                len(result), list(result.keys())[:3],
+            )
+            return result
+
+    # Fallback: temperature_2m as a dict of member arrays
     temp_data = hourly.get("temperature_2m")
-
-    if temp_data is None:
-        return None
-
     if isinstance(temp_data, dict):
         result = {}
         for k, v in temp_data.items():
             if isinstance(v, list):
                 result[k] = [float(x) for x in v if x is not None]
-        return result if result else None
+        if result:
+            return result
 
+    # Log which hourly keys were present so we can debug what the API returned
+    logger.warning(
+        "extract_ensemble_members: no member keys found. hourly_keys=%s",
+        list(hourly.keys())[:8],
+    )
     return None
 
 
