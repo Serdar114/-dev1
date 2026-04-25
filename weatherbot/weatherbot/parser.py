@@ -2,11 +2,13 @@
 Parse Polymarket weather market questions into structured fields.
 
 Conservative: if bucket/source cannot be reliably parsed, mark parse_failed.
+Combines question + title + description + rules for richer parsing.
 Never crash.
 """
 import logging
 import re
 from dataclasses import dataclass, field
+from datetime import date, datetime
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -18,6 +20,16 @@ MARKET_TYPE_UNKNOWN = "unknown"
 
 UNIT_F = "F"
 UNIT_C = "C"
+
+# Source type classification
+SOURCE_TYPE_NOAA = "NOAA"
+SOURCE_TYPE_NWS = "NWS"
+SOURCE_TYPE_METAR = "METAR"
+SOURCE_TYPE_WUNDERGROUND = "Wunderground"
+SOURCE_TYPE_HKO = "HKO"
+SOURCE_TYPE_METOFFICE = "MetOffice"
+SOURCE_TYPE_AVIATIONWEATHER = "AviationWeather"
+SOURCE_TYPE_UNKNOWN = "Unknown"
 
 RISK_KEYWORDS = [
     "wunderground",
@@ -38,35 +50,6 @@ RISK_KEYWORDS = [
 
 MANIPULATION_CITIES = {"paris", "cdg", "le bourget"}
 
-# Patterns for temperature ranges in bucket questions
-_RANGE_PATTERNS = [
-    # "between 85°F and 89°F" / "between 85 and 89 degrees F"
-    re.compile(
-        r"between\s+(-?\d+(?:\.\d+)?)\s*[°]?\s*([FC])?\s+and\s+(-?\d+(?:\.\d+)?)\s*[°]?\s*([FC])?",
-        re.IGNORECASE,
-    ),
-    # "85°F - 89°F" / "85 - 89 °F"
-    re.compile(
-        r"(-?\d+(?:\.\d+)?)\s*[°]?\s*([FC])?\s*[-–]\s*(-?\d+(?:\.\d+)?)\s*[°]?\s*([FC])?",
-        re.IGNORECASE,
-    ),
-    # "at least 90°F" / "90°F or above" / "90 or higher"
-    re.compile(
-        r"(?:at least|>=?|≥|above|or (above|higher|more))\s*(-?\d+(?:\.\d+)?)\s*[°]?\s*([FC])?",
-        re.IGNORECASE,
-    ),
-    # "below 60°F" / "less than 60°F" / "under 60°F"
-    re.compile(
-        r"(?:below|less than|under|<=?|≤)\s*(-?\d+(?:\.\d+)?)\s*[°]?\s*([FC])?",
-        re.IGNORECASE,
-    ),
-    # "85°F or higher" (already covered but extra)
-    re.compile(
-        r"(-?\d+(?:\.\d+)?)\s*[°]?\s*([FC])?\s+or\s+(higher|above|more|lower|below|less)",
-        re.IGNORECASE,
-    ),
-]
-
 # Month name to number
 _MONTH_MAP = {
     "january": 1, "february": 2, "march": 3, "april": 4,
@@ -76,52 +59,109 @@ _MONTH_MAP = {
     "jun": 6, "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
 }
 
+_CURRENT_YEAR = datetime.now().year
+
 
 @dataclass
 class ParsedMarket:
     market_id: str
     question: str
+    # combined source text used for parsing
+    parsed_source_text: str = ""
+    parsed_source_confidence: str = "low"  # "high" / "medium" / "low"
     # core fields
     city: Optional[str] = None
     date_str: Optional[str] = None
+    parsed_target_date: Optional[date] = None   # <-- KEY: actual weather target date
     market_type: str = MARKET_TYPE_UNKNOWN
     unit: Optional[str] = None
     # bucket
     bucket_label: Optional[str] = None
     bucket_low: Optional[float] = None
     bucket_high: Optional[float] = None
-    open_ended_low: bool = False   # bucket is "<= X" (no lower bound)
-    open_ended_high: bool = False  # bucket is ">= X" (no upper bound)
-    exact_boundary: Optional[str] = None  # "inclusive" / "exclusive" / "unknown"
-    # settlement
+    open_ended_low: bool = False
+    open_ended_high: bool = False
+    exact_boundary: Optional[str] = None
+    # settlement source
     resolution_source_text: Optional[str] = None
+    source_type: str = SOURCE_TYPE_UNKNOWN
+    station_code_from_text: Optional[str] = None  # ICAO extracted from rules text
     station_url: Optional[str] = None
     # risk
     risk_keywords_found: list[str] = field(default_factory=list)
     manipulation_flag: bool = False
     parse_failed: bool = False
     parse_failure_reason: Optional[str] = None
-    # precipitation flag
+    # type flags
     is_precipitation: bool = False
+    # forecast blocking
+    forecast_blocked_reason: Optional[str] = None
 
 
-def _normalize_question(q: str) -> str:
-    return q.strip().replace("°", "°").replace("–", "-").replace("—", "-")
+def _normalize(text: str) -> str:
+    return text.strip().replace("°", "°").replace("–", "-").replace("—", "-")
 
 
-def _detect_market_type(question: str) -> str:
-    q = question.lower()
+def _combine_text(
+    question: str,
+    title: Optional[str] = None,
+    description: Optional[str] = None,
+    rules: Optional[str] = None,
+    resolution_text: Optional[str] = None,
+) -> tuple[str, str]:
+    """
+    Combine all available text for parsing. Returns (combined_text, confidence).
+    More sources = higher confidence.
+    """
+    parts = []
+    source_count = 0
 
-    if any(kw in q for kw in ["rain", "rainfall", "precipitation", "snow", "snowfall", "inches of rain", "mm of rain"]):
+    if question:
+        parts.append(_normalize(question))
+        source_count += 1
+    if title and title.lower() != question.lower():
+        parts.append(_normalize(title))
+        source_count += 1
+    if description:
+        parts.append(_normalize(description))
+        source_count += 1
+    if rules:
+        parts.append(_normalize(rules))
+        source_count += 1
+    if resolution_text:
+        parts.append(_normalize(resolution_text))
+        source_count += 1
+
+    combined = " | ".join(p for p in parts if p)
+
+    if source_count >= 3:
+        confidence = "high"
+    elif source_count == 2:
+        confidence = "medium"
+    else:
+        confidence = "low"
+
+    return combined, confidence
+
+
+def _detect_market_type(text: str) -> str:
+    q = text.lower()
+
+    if any(kw in q for kw in [
+        "rain", "rainfall", "precipitation", "snow", "snowfall",
+        "inches of rain", "mm of rain", "inches of precip",
+    ]):
         return MARKET_TYPE_PRECIPITATION
 
     high_patterns = [
         "daily high", "high temperature", "high temp", "max temp", "maximum temp",
         "highest temp", "peak temp", "will the high", "daily maximum",
+        "high of ", "high will", "maximum temperature",
     ]
     low_patterns = [
         "daily low", "low temperature", "low temp", "min temp", "minimum temp",
-        "lowest temp", "will the low", "daily minimum",
+        "lowest temp", "will the low", "daily minimum", "low of ",
+        "minimum temperature",
     ]
 
     for p in high_patterns:
@@ -132,69 +172,133 @@ def _detect_market_type(question: str) -> str:
         if p in q:
             return MARKET_TYPE_DAILY_LOW
 
-    # temperature mentioned but no clear high/low → unknown
     if "temperature" in q or "degrees" in q or "°f" in q or "°c" in q:
         return MARKET_TYPE_UNKNOWN
 
     return MARKET_TYPE_UNKNOWN
 
 
-def _detect_unit(question: str) -> Optional[str]:
-    q = question.lower()
-    if "°f" in q or " f " in q or "fahrenheit" in q or re.search(r"\d°f", q):
+def _detect_unit(text: str) -> Optional[str]:
+    q = text.lower()
+    if "°f" in q or "fahrenheit" in q or re.search(r"\d°f", q):
         return UNIT_F
-    if "°c" in q or " c " in q or "celsius" in q or "centigrade" in q or re.search(r"\d°c", q):
+    if "°c" in q or "celsius" in q or "centigrade" in q or re.search(r"\d°c", q):
         return UNIT_C
-    # Scan for degree symbol followed by F or C
-    m = re.search(r"°\s*([FC])", question, re.IGNORECASE)
+    m = re.search(r"°\s*([FC])", text, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    # Check for "degrees F" / "degrees C"
+    m = re.search(r"degrees?\s+([FC])\b", text, re.IGNORECASE)
     if m:
         return m.group(1).upper()
     return None
 
 
-def _extract_city(question: str) -> Optional[str]:
-    """
-    Heuristic city extraction.
-    Look for 'in <City>' or 'for <City>' patterns, or known city names.
-    """
-    # "Will the daily high temperature in New York City on ..."
-    # "Will the high in Chicago on ..."
+def _extract_city(text: str) -> Optional[str]:
+    """Heuristic city extraction from combined text."""
     patterns = [
-        re.compile(r"\bin\s+([\w\s,'-]+?)\s+(?:on|for|reach|exceed|be|between|above|below|at least)", re.IGNORECASE),
-        re.compile(r"\bfor\s+([\w\s,'-]+?)\s+(?:on|reach|exceed|be|between|above|below|at least)", re.IGNORECASE),
-        re.compile(r"^(?:will (?:the )?(?:daily )?(?:high|low) (?:temp(?:erature)? )?(?:in|for) )([\w\s,'-]+?)\s", re.IGNORECASE),
+        re.compile(
+            r"\bin\s+([\w\s,\'\-]+?)\s+(?:on|for|reach|exceed|be|between|above|below|at least|will)",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\bfor\s+([\w\s,\'\-]+?)\s+(?:on|reach|exceed|be|between|above|below|at least)",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"^(?:will (?:the )?(?:daily )?(?:high|low) (?:temp(?:erature)? )?(?:in|for) )([\w\s,\'\-]+?)\s",
+            re.IGNORECASE,
+        ),
     ]
     for p in patterns:
-        m = p.search(question)
+        m = p.search(text)
         if m:
-            city = m.group(1).strip().rstrip(",")
-            # Filter out common false positives
-            if city.lower() not in ("the", "a", "an", "this", "that"):
-                return city
+            city = m.group(1).strip().rstrip(",").strip()
+            if city.lower() not in ("the", "a", "an", "this", "that", "it"):
+                # Exclude if city looks like a date or number
+                if not re.match(r"^\d", city):
+                    return city
     return None
 
 
-def _extract_date(question: str) -> Optional[str]:
-    """Extract date string from question."""
-    # "on April 25, 2025" / "on 04/25/2025" / "on 2025-04-25"
+def _parse_date_string(date_str: str) -> Optional[date]:
+    """
+    Convert a date string like 'April 25, 2025' or '2025-04-25' to a date object.
+    Returns None if unparseable.
+    """
+    if not date_str:
+        return None
+
+    date_str = date_str.strip()
+
+    # ISO format
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", date_str)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            pass
+
+    # "Month DD, YYYY" or "Month DD YYYY"
+    m = re.match(
+        r"^(\w+)\s+(\d{1,2}),?\s*(\d{4})$", date_str, re.IGNORECASE
+    )
+    if m:
+        month_name = m.group(1).lower()
+        month_num = _MONTH_MAP.get(month_name)
+        if month_num:
+            try:
+                return date(int(m.group(3)), month_num, int(m.group(2)))
+            except ValueError:
+                pass
+
+    # "MM/DD/YYYY"
+    m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})$", date_str)
+    if m:
+        try:
+            return date(int(m.group(3)), int(m.group(1)), int(m.group(2)))
+        except ValueError:
+            pass
+
+    # "DD Month YYYY"
+    m = re.match(r"^(\d{1,2})\s+(\w+)\s+(\d{4})$", date_str, re.IGNORECASE)
+    if m:
+        month_name = m.group(2).lower()
+        month_num = _MONTH_MAP.get(month_name)
+        if month_num:
+            try:
+                return date(int(m.group(3)), month_num, int(m.group(1)))
+            except ValueError:
+                pass
+
+    return None
+
+
+def _extract_date(text: str) -> tuple[Optional[str], Optional[date]]:
+    """
+    Extract date string and parse to date object.
+    Returns (date_str, parsed_date).
+    """
     date_patterns = [
         re.compile(r"on\s+(\w+ \d{1,2},?\s*\d{4})", re.IGNORECASE),
         re.compile(r"on\s+(\d{1,2}/\d{1,2}/\d{4})", re.IGNORECASE),
         re.compile(r"on\s+(\d{4}-\d{2}-\d{2})", re.IGNORECASE),
         re.compile(r"\b(\d{4}-\d{2}-\d{2})\b"),
         re.compile(r"\b(\w+ \d{1,2},\s*\d{4})\b", re.IGNORECASE),
+        re.compile(r"\b(\d{1,2}\s+\w+\s+\d{4})\b", re.IGNORECASE),
     ]
     for p in date_patterns:
-        m = p.search(question)
+        m = p.search(text)
         if m:
-            return m.group(1).strip()
-    return None
+            ds = m.group(1).strip()
+            parsed = _parse_date_string(ds)
+            if parsed:
+                return ds, parsed
+            return ds, None
+    return None, None
 
 
-def _extract_bucket(question: str, unit: Optional[str]) -> dict:
-    """
-    Returns dict with: bucket_low, bucket_high, open_ended_low, open_ended_high, bucket_label
-    """
+def _extract_bucket(text: str, unit: Optional[str]) -> dict:
     result = {
         "bucket_low": None,
         "bucket_high": None,
@@ -203,8 +307,7 @@ def _extract_bucket(question: str, unit: Optional[str]) -> dict:
         "bucket_label": None,
     }
 
-    q = question.strip()
-    q_lower = q.lower()
+    q = text.strip()
 
     # Open-ended high: "at least X", "X or higher/above", ">= X"
     m = re.search(
@@ -252,7 +355,7 @@ def _extract_bucket(question: str, unit: Optional[str]) -> dict:
         result["bucket_label"] = f"< {val}"
         return result
 
-    # Range: "between X and Y" or "X - Y"
+    # Range: "between X and Y"
     m = re.search(
         r"between\s+(-?\d+(?:\.\d+)?)\s*[°]?\s*[FC]?\s+and\s+(-?\d+(?:\.\d+)?)\s*[°]?\s*[FC]?",
         q, re.IGNORECASE,
@@ -264,13 +367,14 @@ def _extract_bucket(question: str, unit: Optional[str]) -> dict:
         result["bucket_label"] = f"{min(lo,hi)}-{max(lo,hi)}"
         return result
 
+    # Range: "X - Y degrees"
     m = re.search(
         r"(-?\d+(?:\.\d+)?)\s*[°]?\s*[FC]?\s*[-–]\s*(-?\d+(?:\.\d+)?)\s*[°]?\s*[FC]?",
         q, re.IGNORECASE,
     )
     if m:
         lo, hi = float(m.group(1)), float(m.group(2))
-        if abs(hi - lo) <= 30:  # sanity: reasonable bucket range
+        if abs(hi - lo) <= 30:
             result["bucket_low"] = min(lo, hi)
             result["bucket_high"] = max(lo, hi)
             result["bucket_label"] = f"{min(lo,hi)}-{max(lo,hi)}"
@@ -279,14 +383,50 @@ def _extract_bucket(question: str, unit: Optional[str]) -> dict:
     return result
 
 
-def _extract_resolution_source(question: str) -> Optional[str]:
-    """Find resolution/settlement source text."""
+def _classify_source_type(text: str) -> str:
+    """Identify resolution source type from combined text."""
+    t = text.lower()
+    if "wunderground" in t or "weather underground" in t:
+        return SOURCE_TYPE_WUNDERGROUND
+    if "aviationweather" in t or "aviation weather" in t:
+        return SOURCE_TYPE_AVIATIONWEATHER
+    if "metar" in t:
+        return SOURCE_TYPE_METAR
+    if "hko" in t or "hong kong observatory" in t:
+        return SOURCE_TYPE_HKO
+    if "met office" in t or "metoffice" in t:
+        return SOURCE_TYPE_METOFFICE
+    if "national weather service" in t or "nws" in t:
+        return SOURCE_TYPE_NWS
+    if "noaa" in t:
+        return SOURCE_TYPE_NOAA
+    return SOURCE_TYPE_UNKNOWN
+
+
+def _extract_icao_from_text(text: str) -> Optional[str]:
+    """Look for a 4-letter ICAO code pattern in text."""
+    m = re.search(r"\b([A-Z]{4})\b", text)
+    if m:
+        candidate = m.group(1)
+        # Basic filter: must start with a valid region prefix
+        if candidate[0] in "KLBCEPRVWYZ" or candidate[:2] in ("EG", "LF", "RJ", "RK", "WS", "VH", "ZS", "SA", "SB", "CY", "OM"):
+            return candidate
+    return None
+
+
+def _extract_resolution_source(text: str) -> Optional[str]:
     patterns = [
-        re.compile(r"(?:according to|based on|source:|settlement:|resolved by|data from)\s+(.+?)(?:\.|$)", re.IGNORECASE),
-        re.compile(r"(?:wunderground|weather underground|noaa|nws|metar|weather\.gov|aviationweather)", re.IGNORECASE),
+        re.compile(
+            r"(?:according to|based on|source:|settlement:|resolved by|data from|using data from)\s+(.+?)(?:\.|$|\|)",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"(?:wunderground|weather underground|noaa|nws|metar|weather\.gov|aviationweather|hko|met office)",
+            re.IGNORECASE,
+        ),
     ]
     for p in patterns:
-        m = p.search(question)
+        m = p.search(text)
         if m:
             try:
                 return m.group(1).strip()
@@ -295,15 +435,15 @@ def _extract_resolution_source(question: str) -> Optional[str]:
     return None
 
 
-def _extract_station_url(question: str) -> Optional[str]:
-    m = re.search(r"https?://\S+", question)
+def _extract_station_url(text: str) -> Optional[str]:
+    m = re.search(r"https?://\S+", text)
     if m:
         return m.group(0)
     return None
 
 
-def _find_risk_keywords(question: str) -> list[str]:
-    q = question.lower()
+def _find_risk_keywords(text: str) -> list[str]:
+    q = text.lower()
     found = []
     for kw in RISK_KEYWORDS:
         if kw.lower() in q:
@@ -311,14 +451,21 @@ def _find_risk_keywords(question: str) -> list[str]:
     return found
 
 
-def parse_market(market_id: str, question: str, outcomes: Optional[list[str]] = None) -> ParsedMarket:
+def parse_market(
+    market_id: str,
+    question: str,
+    outcomes: Optional[list[str]] = None,
+    title: Optional[str] = None,
+    description: Optional[str] = None,
+    rules: Optional[str] = None,
+    resolution_text: Optional[str] = None,
+) -> ParsedMarket:
     """
-    Parse a single market question into structured fields.
-    Returns ParsedMarket with parse_failed=True if critical fields cannot be determined.
-    Never raises.
+    Parse a market into structured fields. Never raises.
+    Combines question + title + description + rules for richer parsing.
     """
     try:
-        return _parse_market_inner(market_id, question, outcomes)
+        return _parse_inner(market_id, question, outcomes, title, description, rules, resolution_text)
     except Exception as exc:
         logger.exception("Unexpected parse error for market %s: %s", market_id, exc)
         return ParsedMarket(
@@ -329,25 +476,63 @@ def parse_market(market_id: str, question: str, outcomes: Optional[list[str]] = 
         )
 
 
-def _parse_market_inner(market_id: str, question: str, outcomes: Optional[list[str]]) -> ParsedMarket:
-    q = _normalize_question(question)
+def parse_market_from_raw(market_id: str, raw: dict) -> ParsedMarket:
+    """
+    Parse directly from raw Gamma/CLOB market JSON dict.
+    Extracts all available text fields automatically.
+    """
+    question = str(raw.get("question") or "")
+    title = raw.get("title") or raw.get("groupItemTitle") or raw.get("name")
+    description = raw.get("description") or raw.get("longDescription")
+    rules = raw.get("rules") or raw.get("resolutionRules") or raw.get("resolution_rules")
+    resolution_text = raw.get("resolutionSource") or raw.get("resolution_source")
 
-    market_type = _detect_market_type(q)
+    outcomes_raw = raw.get("outcomes") or []
+    if isinstance(outcomes_raw, str):
+        import json as _json
+        try:
+            outcomes_raw = _json.loads(outcomes_raw)
+        except Exception:
+            outcomes_raw = []
+    outcomes = [str(o) for o in outcomes_raw]
+
+    return parse_market(
+        market_id=market_id,
+        question=question,
+        outcomes=outcomes,
+        title=str(title) if title else None,
+        description=str(description) if description else None,
+        rules=str(rules) if rules else None,
+        resolution_text=str(resolution_text) if resolution_text else None,
+    )
+
+
+def _parse_inner(
+    market_id: str,
+    question: str,
+    outcomes: Optional[list[str]],
+    title: Optional[str],
+    description: Optional[str],
+    rules: Optional[str],
+    resolution_text: Optional[str],
+) -> ParsedMarket:
+    combined, confidence = _combine_text(question, title, description, rules, resolution_text)
+
+    market_type = _detect_market_type(combined)
     is_precipitation = market_type == MARKET_TYPE_PRECIPITATION
 
-    unit = _detect_unit(q)
+    unit = _detect_unit(combined)
+    city = _extract_city(_normalize(question))  # city extraction from question primarily
+    date_str, parsed_target_date = _extract_date(combined)
 
-    city = _extract_city(q)
-    date_str = _extract_date(q)
-
-    bucket_info = _extract_bucket(q, unit)
+    bucket_info = _extract_bucket(combined, unit)
     bucket_low = bucket_info["bucket_low"]
     bucket_high = bucket_info["bucket_high"]
     open_ended_low = bucket_info["open_ended_low"]
     open_ended_high = bucket_info["open_ended_high"]
     bucket_label = bucket_info["bucket_label"]
 
-    # Fallback: try to infer bucket from outcomes list
+    # Fallback: try outcomes list
     if bucket_label is None and outcomes:
         for outcome in outcomes:
             b = _extract_bucket(outcome, unit)
@@ -359,49 +544,54 @@ def _parse_market_inner(market_id: str, question: str, outcomes: Optional[list[s
                 bucket_label = b["bucket_label"]
                 break
 
-    resolution_source = _extract_resolution_source(q)
-    station_url = _extract_station_url(q)
-    risk_kw = _find_risk_keywords(q)
+    resolution_source = _extract_resolution_source(combined)
+    station_url = _extract_station_url(combined)
+    source_type = _classify_source_type(combined)
+    station_code_from_text = _extract_icao_from_text(combined.upper())
+    risk_kw = _find_risk_keywords(combined)
 
     manipulation_flag = False
-    if city:
-        if city.lower() in MANIPULATION_CITIES:
-            manipulation_flag = True
+    combined_lower = combined.lower()
+    if city and city.lower() in MANIPULATION_CITIES:
+        manipulation_flag = True
     for kw in ["paris", "cdg", "le bourget", "le_bourget"]:
-        if kw in q.lower():
+        if kw in combined_lower:
             manipulation_flag = True
 
-    # Determine parse failure
+    # Parse failure assessment
     parse_failed = False
-    parse_failure_reason = None
+    parse_failure_parts = []
 
     if market_type == MARKET_TYPE_UNKNOWN and not is_precipitation:
-        # Still useful if we have temperature keywords; mark as partial
-        if "temperature" not in q.lower() and "°" not in q and "degrees" not in q.lower():
+        if "temperature" not in combined_lower and "°" not in combined and "degrees" not in combined_lower:
             parse_failed = True
-            parse_failure_reason = "market_type_undetermined_no_temperature_keywords"
-
-    if unit is None and not is_precipitation and not parse_failed:
-        # Many markets don't state unit in the question — allowed; just unknown
-        pass
+            parse_failure_parts.append("market_type_undetermined")
 
     if bucket_label is None and not is_precipitation:
         parse_failed = True
-        parse_failure_reason = (parse_failure_reason or "") + "|bucket_not_parseable"
+        parse_failure_parts.append("bucket_not_parseable")
 
-    # Determine exact boundary hint
+    parse_failure_reason = "|".join(parse_failure_parts) or None
+
+    # Forecast blocking: missing target date blocks PAPER_ actions
+    forecast_blocked_reason = None
+    if parsed_target_date is None and not is_precipitation:
+        forecast_blocked_reason = "missing_target_date"
+
     exact_boundary = "unknown"
-    q_lower = q.lower()
-    if "inclusive" in q_lower or "or equal" in q_lower:
+    if "inclusive" in combined_lower or "or equal" in combined_lower:
         exact_boundary = "inclusive"
-    elif "exclusive" in q_lower or "strictly" in q_lower:
+    elif "exclusive" in combined_lower or "strictly" in combined_lower:
         exact_boundary = "exclusive"
 
     return ParsedMarket(
         market_id=market_id,
-        question=q,
+        question=_normalize(question),
+        parsed_source_text=combined,
+        parsed_source_confidence=confidence,
         city=city,
         date_str=date_str,
+        parsed_target_date=parsed_target_date,
         market_type=market_type,
         unit=unit,
         bucket_label=bucket_label,
@@ -411,19 +601,19 @@ def _parse_market_inner(market_id: str, question: str, outcomes: Optional[list[s
         open_ended_high=open_ended_high,
         exact_boundary=exact_boundary,
         resolution_source_text=resolution_source,
+        source_type=source_type,
+        station_code_from_text=station_code_from_text,
         station_url=station_url,
         risk_keywords_found=risk_kw,
         manipulation_flag=manipulation_flag,
         parse_failed=parse_failed,
-        parse_failure_reason=parse_failure_reason.strip("|") if parse_failure_reason else None,
+        parse_failure_reason=parse_failure_reason,
         is_precipitation=is_precipitation,
+        forecast_blocked_reason=forecast_blocked_reason,
     )
 
 
 def parse_markets_bulk(markets: list[dict]) -> list[ParsedMarket]:
-    """
-    Parse a list of dicts with keys: market_id, question, outcomes (optional).
-    """
     results = []
     for m in markets:
         mid = str(m.get("market_id") or m.get("id") or "")

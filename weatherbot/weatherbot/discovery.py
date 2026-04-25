@@ -40,6 +40,19 @@ class RawMarket:
     volume: Optional[float]
     liquidity: Optional[float]
     active: bool
+    # Extra text fields for richer parsing
+    title: Optional[str] = None
+    description: Optional[str] = None
+    rules: Optional[str] = None
+    resolution_source: Optional[str] = None
+    # Market microstructure
+    order_min_size: Optional[float] = None
+    order_price_min_tick_size: Optional[float] = None
+    tick_size: Optional[float] = None
+    min_order_size: Optional[float] = None
+    reward_eligible: Optional[bool] = None
+    accepting_orders: Optional[bool] = None
+    closed: Optional[bool] = None
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -143,6 +156,17 @@ def _parse_raw_market(m: dict) -> Optional[RawMarket]:
     else:
         tags = []
 
+    def _safe_float(val) -> Optional[float]:
+        try:
+            return float(val) if val is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _safe_bool(val) -> Optional[bool]:
+        if val is None:
+            return None
+        return bool(val)
+
     return RawMarket(
         market_id=market_id,
         event_id=str(m.get("clob_token_ids", [None])[0]) if not m.get("eventId") else str(m.get("eventId")),
@@ -154,10 +178,26 @@ def _parse_raw_market(m: dict) -> Optional[RawMarket]:
         category=m.get("category"),
         tags=tags,
         volume=_extract_volume(m),
+        # Extra text
+        title=m.get("title") or m.get("groupItemTitle"),
+        description=m.get("description") or m.get("longDescription"),
+        rules=m.get("rules") or m.get("resolutionRules"),
+        resolution_source=m.get("resolutionSource") or m.get("resolution_source"),
+        # Microstructure
+        order_min_size=_safe_float(m.get("orderMinSize") or m.get("order_min_size")),
+        order_price_min_tick_size=_safe_float(
+            m.get("orderPriceMinTickSize") or m.get("order_price_min_tick_size")
+        ),
+        tick_size=_safe_float(m.get("tickSize") or m.get("tick_size")),
+        min_order_size=_safe_float(m.get("minOrderSize") or m.get("min_order_size")),
+        reward_eligible=_safe_bool(m.get("rewardEligible") or m.get("reward_eligible")),
+        accepting_orders=_safe_bool(m.get("acceptingOrders") or m.get("accepting_orders")),
+        closed=_safe_bool(m.get("closed")),
         liquidity=_extract_liquidity(m),
         active=active,
         raw=m,
     )
+
 
 
 def discover_gamma_markets(max_markets: int = 200, offset: int = 0) -> list[RawMarket]:

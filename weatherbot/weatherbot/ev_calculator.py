@@ -1,15 +1,14 @@
 """
 EV calculator: compute gross and net edge for each market/bucket.
 
-Inputs: model probability, nowcast, orderbook, buffers.
+Inputs: model probability, nowcast, orderbook, buffers, ensemble validation.
 Outputs: action recommendation, price, size.
 
-V1 signal thresholds (configurable):
-  - maker candidate: net_edge_maker >= 0.08
-  - taker candidate: net_edge_taker >= 0.12 AND stale flag
-  - strong signal: net_edge >= 0.15
-  - reject: spread > 0.10, depth < 2x stake, safety < 0.65
-  - reject: entry within 4h of resolution (configurable)
+Key safety rules (V1):
+  - Uses entry-side depth (ask for taker, bid for maker) not combined depth
+  - n_members == 0 or deterministic_fallback → downgrade to WATCH/SKIP
+  - forecast_blocked_reason set → downgrade to WATCH/SKIP
+  - live_eligible False → paper candidates only (ghost trades fine in V1)
 """
 import logging
 from dataclasses import dataclass
@@ -17,14 +16,12 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Action codes
 ACTION_SKIP = "SKIP"
 ACTION_WATCH = "WATCH"
 ACTION_PAPER_MAKER = "PAPER_MAKER"
 ACTION_PAPER_TAKER = "PAPER_TAKER"
 ACTION_EXIT_WATCH = "EXIT_WATCH"
 
-# Default thresholds
 DEFAULT_MAKER_EDGE_THRESHOLD = 0.08
 DEFAULT_MAKER_STRONG_THRESHOLD = 0.15
 DEFAULT_TAKER_EDGE_THRESHOLD = 0.12
@@ -65,11 +62,19 @@ class EVResult:
     stale_flag: bool
     near_resolution: bool
     safety_score: float
-    # Details
+    # Quality
     nowcast_confidence: str
     ensemble_agreement: float
     model_spread: float
-    top_book_depth: float
+    # Depth (side-specific)
+    ask_depth_top_n: float
+    bid_depth_top_n: float
+    entry_side_depth: float
+    exit_side_depth: float
+    # Ensemble validation
+    n_members: int
+    deterministic_fallback_used: bool
+    forecast_blocked_reason: Optional[str]
 
 
 def _blend_probabilities(
@@ -77,20 +82,10 @@ def _blend_probabilities(
     nowcast_prob: Optional[float],
     nowcast_confidence: str,
 ) -> float:
-    """
-    Blend model and nowcast probabilities.
-    Nowcast weight depends on confidence:
-      high   → 0.35 weight
-      medium → 0.20 weight
-      low    → 0.08 weight
-      none   → 0.00 weight
-    """
     weights = {"high": 0.35, "medium": 0.20, "low": 0.08, "none": 0.0}
     w = weights.get(nowcast_confidence, 0.0)
-
     if nowcast_prob is None or w == 0.0:
         return model_prob
-
     return model_prob * (1 - w) + nowcast_prob * w
 
 
@@ -101,36 +96,25 @@ def _kelly_size(
     kelly_fraction: float,
     max_stake: float,
 ) -> float:
-    """Fractional Kelly sizing. Returns USDC stake."""
     if price <= 0 or price >= 1:
         return 0.0
-    # Kelly for binary bet: f = (p*(1/price) - 1) / ((1/price) - 1)
-    # Simplified: f = (p - price) / (1 - price)
-    b = (1.0 - price) / price  # odds
+    b = (1.0 - price) / price
     kelly_f = (probability * (b + 1) - 1) / b
     if kelly_f <= 0:
         return 0.0
-    frac_kelly = kelly_f * kelly_fraction
-    stake = frac_kelly * bankroll
+    stake = kelly_f * kelly_fraction * bankroll
     return min(stake, max_stake)
 
 
 def _detect_stale_flag(
     spread: Optional[float],
     hours_to_close: float,
-    display_price_mode: str,
+    book_state: str,
     ensemble_agreement: float,
 ) -> bool:
-    """
-    Stale quote flag: market hasn't repriced despite model conviction.
-    Heuristics:
-    - Wide spread AND < 8 hours to resolution
-    - One-sided book near resolution
-    - High ensemble agreement (>= 0.75) but market price is stale
-    """
     if spread is not None and spread >= 0.08 and hours_to_close <= 8:
         return True
-    if display_price_mode in ("one_sided", "no_book") and hours_to_close <= 6:
+    if book_state in ("one_sided", "no_book") and hours_to_close <= 6:
         return True
     return False
 
@@ -141,15 +125,21 @@ def calculate_ev(
     nowcast_confidence: str,
     best_bid: Optional[float],
     best_ask: Optional[float],
-    bid_size: Optional[float],
+    bid_size: Optional[float],     # kept for compat; prefer depth fields
     ask_size: Optional[float],
     spread: Optional[float],
-    top_book_depth: float,
-    display_price_mode: str,
-    ensemble_agreement: float,
-    model_spread: float,
-    settlement_safety: float,
-    hours_to_close: float,
+    # Side-specific depths (required for correct gating)
+    ask_depth_top_n: float = 0.0,
+    bid_depth_top_n: float = 0.0,
+    book_state: str = "unknown",
+    ensemble_agreement: float = 0.0,
+    model_spread: float = 0.0,
+    settlement_safety: float = 0.5,
+    hours_to_close: float = 999.0,
+    # Ensemble validation
+    n_members: int = 0,
+    deterministic_fallback_used: bool = False,
+    forecast_blocked_reason: Optional[str] = None,
     # Config
     stake_usdc: float = DEFAULT_STAKE_USDC,
     max_stake_usdc: float = DEFAULT_MAX_STAKE_USDC,
@@ -167,15 +157,29 @@ def calculate_ev(
     min_safety: float = DEFAULT_MIN_SAFETY,
     close_hours_reject: float = DEFAULT_CLOSE_HOURS_REJECT,
     taker_requires_stale: bool = True,
+    # Legacy compat
+    top_book_depth: float = 0.0,
+    display_price_mode: str = "unknown",
 ) -> EVResult:
     """
     Main EV calculation. Returns EVResult with action, edge, recommended price/size.
+
+    Uses entry-side depth for gating:
+      taker buy → needs ask_depth_top_n
+      maker bid → needs bid_depth_top_n
     """
+    # Handle legacy callers that pass top_book_depth but not side-specific
+    if ask_depth_top_n == 0.0 and bid_depth_top_n == 0.0 and top_book_depth > 0.0:
+        ask_depth_top_n = top_book_depth / 2.0
+        bid_depth_top_n = top_book_depth / 2.0
+    # book_state fallback for legacy display_price_mode
+    if book_state == "unknown" and display_price_mode != "unknown":
+        book_state = display_price_mode
+
     blended = _blend_probabilities(model_probability, nowcast_probability, nowcast_confidence)
-    stale_flag = _detect_stale_flag(spread, hours_to_close, display_price_mode, ensemble_agreement)
+    stale_flag = _detect_stale_flag(spread, hours_to_close, book_state, ensemble_agreement)
     near_resolution = hours_to_close <= close_hours_reject
 
-    # Compute gross and net edges
     total_buffer = fee_buffer + slippage_buffer + confidence_buffer
 
     if best_ask is not None and best_ask > 0:
@@ -185,21 +189,33 @@ def calculate_ev(
         edge_gross = 0.0
         edge_net_taker = -total_buffer
 
-    # Maker: we place a limit bid below ask
     if best_bid is not None and best_ask is not None and spread is not None:
-        # Maker entry = mid minus a small improvement, no taker fee
-        maker_entry = (best_bid + best_ask) / 2.0 - 0.01  # try to set near mid
+        maker_entry = (best_bid + best_ask) / 2.0 - 0.01
         maker_entry = max(maker_entry, best_bid)
         edge_net_maker = blended - maker_entry - confidence_buffer - slippage_buffer / 2
     elif best_bid is not None:
-        maker_entry = best_bid + 0.01  # improve on best bid
+        maker_entry = best_bid + 0.01
         edge_net_maker = blended - maker_entry - confidence_buffer
     else:
         maker_entry = None
         edge_net_maker = -total_buffer
 
-    # --- Filter gates ---
-    reject_reasons = []
+    # ── Ensemble quality gate ─────────────────────────────────────────────────
+    ensemble_blocked = False
+    ensemble_block_reason = None
+
+    if forecast_blocked_reason:
+        ensemble_blocked = True
+        ensemble_block_reason = forecast_blocked_reason
+    elif n_members == 0:
+        ensemble_blocked = True
+        ensemble_block_reason = "n_members_zero"
+    elif deterministic_fallback_used:
+        ensemble_blocked = True
+        ensemble_block_reason = "deterministic_fallback_only"
+
+    # ── Reject filters ────────────────────────────────────────────────────────
+    reject_reasons: list[str] = []
 
     if near_resolution:
         reject_reasons.append(f"near_resolution_{hours_to_close:.1f}h")
@@ -207,18 +223,24 @@ def calculate_ev(
     if spread is not None and spread > max_spread:
         reject_reasons.append(f"spread_too_wide_{spread:.3f}")
 
-    if top_book_depth < stake_usdc * min_depth_multiplier:
-        reject_reasons.append(f"insufficient_depth_{top_book_depth:.2f}_need_{stake_usdc*min_depth_multiplier:.2f}")
+    if book_state in ("no_book",):
+        reject_reasons.append("no_book")
 
     if settlement_safety < min_safety:
         reject_reasons.append(f"safety_score_low_{settlement_safety:.2f}")
 
-    if display_price_mode == "no_book":
-        reject_reasons.append("no_book")
+    # Side-specific depth check
+    taker_depth_ok = ask_depth_top_n >= stake_usdc * min_depth_multiplier
+    maker_depth_ok = bid_depth_top_n >= stake_usdc * min_depth_multiplier
 
-    # --- Determine action ---
+    if not taker_depth_ok and not maker_depth_ok:
+        reject_reasons.append(
+            f"insufficient_depth_ask={ask_depth_top_n:.2f}_bid={bid_depth_top_n:.2f}"
+            f"_need={stake_usdc*min_depth_multiplier:.2f}"
+        )
+
+    # ── Action determination ──────────────────────────────────────────────────
     if reject_reasons:
-        # May still be a watch candidate for exit or logging
         if near_resolution and edge_net_taker >= taker_edge_threshold * 0.8:
             action = ACTION_EXIT_WATCH
             reason = "near_resolution_exit_opportunity"
@@ -227,24 +249,35 @@ def calculate_ev(
             action = ACTION_SKIP
             reason = "; ".join(reject_reasons)
             signal_type = None
+    elif ensemble_blocked:
+        # Ensemble quality insufficient → downgrade to WATCH at best
+        if edge_net_maker > 0.03 or edge_net_taker > 0.05:
+            action = ACTION_WATCH
+            reason = f"ensemble_blocked:{ensemble_block_reason}"
+            signal_type = "watch_ensemble_weak"
+        else:
+            action = ACTION_SKIP
+            reason = f"ensemble_blocked:{ensemble_block_reason}"
+            signal_type = None
     else:
         signal_type = None
         action = ACTION_SKIP
         reason = "edge_below_threshold"
 
-        # Taker check (requires stale flag in V1)
-        if not taker_requires_stale or stale_flag:
-            if edge_net_taker >= taker_strong_threshold:
-                action = ACTION_PAPER_TAKER
-                signal_type = "taker_strong" if stale_flag else "taker_standard"
-                reason = f"taker_edge_{edge_net_taker:.3f}_strong"
-            elif edge_net_taker >= taker_edge_threshold:
-                action = ACTION_PAPER_TAKER
-                signal_type = "taker_stale" if stale_flag else "taker_standard"
-                reason = f"taker_edge_{edge_net_taker:.3f}"
+        # Taker check
+        if taker_depth_ok:
+            if not taker_requires_stale or stale_flag:
+                if edge_net_taker >= taker_strong_threshold:
+                    action = ACTION_PAPER_TAKER
+                    signal_type = "taker_strong" if stale_flag else "taker_standard"
+                    reason = f"taker_edge_{edge_net_taker:.3f}_strong"
+                elif edge_net_taker >= taker_edge_threshold:
+                    action = ACTION_PAPER_TAKER
+                    signal_type = "taker_stale" if stale_flag else "taker_standard"
+                    reason = f"taker_edge_{edge_net_taker:.3f}"
 
         # Maker check
-        if action == ACTION_SKIP or action == ACTION_WATCH:
+        if action == ACTION_SKIP and maker_depth_ok:
             if edge_net_maker >= maker_strong_threshold:
                 action = ACTION_PAPER_MAKER
                 signal_type = "maker_strong"
@@ -254,30 +287,31 @@ def calculate_ev(
                 signal_type = "maker_standard"
                 reason = f"maker_edge_{edge_net_maker:.3f}"
 
-        # Watch: some edge but below thresholds, or moderate confidence
         if action == ACTION_SKIP:
             if edge_net_maker > 0.03 or edge_net_taker > 0.05:
                 action = ACTION_WATCH
                 signal_type = "watch_low_edge"
                 reason = f"watch_maker={edge_net_maker:.3f}_taker={edge_net_taker:.3f}"
 
-    # Size calculation
+    # ── Sizing ────────────────────────────────────────────────────────────────
     if action in (ACTION_PAPER_MAKER, ACTION_PAPER_TAKER):
         if best_ask is not None and best_ask > 0:
             size = _kelly_size(blended, best_ask, bankroll, kelly_fraction, max_stake_usdc)
-            size = max(size, 0.5)  # minimum ghost size
+            size = max(size, 0.5)
         else:
             size = stake_usdc
     else:
         size = 0.0
 
-    # Recommended price
     if action == ACTION_PAPER_TAKER:
         rec_price = best_ask
     elif action == ACTION_PAPER_MAKER:
         rec_price = maker_entry
     else:
         rec_price = None
+
+    entry_side = ask_depth_top_n if action == ACTION_PAPER_TAKER else bid_depth_top_n
+    exit_side = bid_depth_top_n
 
     return EVResult(
         action=action,
@@ -300,5 +334,11 @@ def calculate_ev(
         nowcast_confidence=nowcast_confidence,
         ensemble_agreement=ensemble_agreement,
         model_spread=model_spread,
-        top_book_depth=top_book_depth,
+        ask_depth_top_n=ask_depth_top_n,
+        bid_depth_top_n=bid_depth_top_n,
+        entry_side_depth=entry_side,
+        exit_side_depth=exit_side,
+        n_members=n_members,
+        deterministic_fallback_used=deterministic_fallback_used,
+        forecast_blocked_reason=ensemble_block_reason if ensemble_blocked else forecast_blocked_reason,
     )
