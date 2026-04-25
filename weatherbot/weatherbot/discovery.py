@@ -1,6 +1,7 @@
 """
 Discover active Polymarket temperature/weather markets via Gamma and CLOB APIs.
 """
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -53,6 +54,7 @@ class RawMarket:
     reward_eligible: Optional[bool] = None
     accepting_orders: Optional[bool] = None
     closed: Optional[bool] = None
+    token_mapping_failed: bool = False
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -95,23 +97,97 @@ def _is_precipitation_only(market: dict) -> bool:
     return False
 
 
+def normalize_jsonish_list(value: Any) -> list:
+    """
+    Safely normalise a value that may arrive as a list or a JSON-encoded string.
+
+    Gamma API sometimes returns clobTokenIds (and outcomes) as a raw JSON string
+    like '["123456","789012"]' instead of a parsed list.  Iterating such a string
+    character-by-character would yield ["[", '"', "1", ...]; this helper prevents
+    that by always producing a proper Python list.
+
+    Rules:
+    - None / empty  → []
+    - already list  → returned as-is
+    - str starting with '[' or '{' → json.loads; on failure → []
+    - any other type → [value]  (int, float, dict wrapping)
+    - individual characters are NEVER returned
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        if stripped[0] in ("[", "{"):
+            try:
+                parsed = json.loads(stripped)
+                return parsed if isinstance(parsed, list) else [parsed]
+            except (json.JSONDecodeError, ValueError):
+                return []
+        # Plain string that is not JSON — do not split, caller decides what to do
+        return []
+    # int, float, dict, etc.
+    return [value]
+
+
 def _extract_token_ids(market: dict) -> list[str]:
-    tokens = market.get("clob_token_ids") or market.get("clobTokenIds") or []
-    if not tokens:
-        outcomes_raw = market.get("outcomePrices") or {}
-        tokens = list(outcomes_raw.keys())
-    return [str(t) for t in tokens if t]
+    """
+    Extract CLOB token IDs from all known Gamma field shapes.
+
+    Priority:
+    1. clobTokenIds / clob_token_ids  (list or JSON string)
+    2. tokens[] array of objects with token_id/id keys
+    3. outcomePrices dict keys (legacy)
+    """
+    # 1. Primary field — may be a list or a JSON-encoded string
+    raw = market.get("clobTokenIds") or market.get("clob_token_ids")
+    tokens = normalize_jsonish_list(raw)
+
+    # Each element may itself be a dict {"token_id": "...", "outcome": "Yes"}
+    result: list[str] = []
+    for t in tokens:
+        if isinstance(t, dict):
+            tid = t.get("token_id") or t.get("id") or ""
+            if tid:
+                result.append(str(tid))
+        elif t:
+            result.append(str(t))
+
+    if result:
+        return result
+
+    # 2. tokens[] array of objects
+    token_objs = normalize_jsonish_list(market.get("tokens"))
+    for t in token_objs:
+        if isinstance(t, dict):
+            tid = t.get("token_id") or t.get("id") or ""
+            if tid:
+                result.append(str(tid))
+
+    if result:
+        return result
+
+    # 3. outcomePrices dict keys (legacy Gamma format)
+    op = market.get("outcomePrices")
+    if isinstance(op, dict):
+        return [str(k) for k in op.keys() if k]
+    if isinstance(op, str):
+        try:
+            parsed = json.loads(op)
+            if isinstance(parsed, dict):
+                return [str(k) for k in parsed.keys() if k]
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    return []
 
 
 def _extract_outcomes(market: dict) -> list[str]:
-    outcomes = market.get("outcomes") or []
-    if isinstance(outcomes, str):
-        import json
-        try:
-            outcomes = json.loads(outcomes)
-        except Exception:
-            outcomes = [outcomes]
-    return [str(o) for o in outcomes]
+    outcomes = normalize_jsonish_list(market.get("outcomes"))
+    return [str(o) for o in outcomes if o is not None]
 
 
 def _extract_volume(market: dict) -> Optional[float]:
@@ -149,6 +225,9 @@ def _parse_raw_market(m: dict) -> Optional[RawMarket]:
 
     token_ids = _extract_token_ids(m)
     outcomes = _extract_outcomes(m)
+    token_mapping_failed = (
+        bool(token_ids) and bool(outcomes) and len(token_ids) != len(outcomes)
+    )
 
     tags_raw = m.get("tags") or []
     if isinstance(tags_raw, list):
@@ -169,12 +248,13 @@ def _parse_raw_market(m: dict) -> Optional[RawMarket]:
 
     return RawMarket(
         market_id=market_id,
-        event_id=str(m.get("clob_token_ids", [None])[0]) if not m.get("eventId") else str(m.get("eventId")),
+        event_id=str(m.get("eventId")) if m.get("eventId") else (token_ids[0] if token_ids else None),
         question=question,
         slug=m.get("slug"),
         close_time=m.get("endDate") or m.get("closeTime") or m.get("end_date_iso"),
         outcomes=outcomes,
         token_ids=token_ids,
+        token_mapping_failed=token_mapping_failed,
         category=m.get("category"),
         tags=tags,
         volume=_extract_volume(m),

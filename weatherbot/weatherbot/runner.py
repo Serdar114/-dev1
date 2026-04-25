@@ -54,6 +54,11 @@ from .station_mapper import map_parsed_market
 
 logger = logging.getLogger(__name__)
 
+# Token IDs that indicate a broken extraction — must never be sent to the CLOB.
+_INVALID_TOKEN_IDS: frozenset[str] = frozenset([
+    "[", "]", ",", "{", "}", "YES", "NO", "", "null", "None", "true", "false",
+])
+
 _SETTINGS_PATH = os.path.join(os.path.dirname(__file__), "..", "config", "settings.yaml")
 _settings_cache: Optional[dict] = None
 
@@ -70,6 +75,19 @@ def _load_settings() -> dict:
     with open(path, "r") as f:
         _settings_cache = yaml.safe_load(f) or {}
     return _settings_cache
+
+
+def _is_valid_token_id(token_id: Optional[str]) -> bool:
+    """Return True only for token IDs that are safe to send to the CLOB API."""
+    if not token_id:
+        return False
+    if token_id in _INVALID_TOKEN_IDS:
+        return False
+    # Polymarket CLOB asset IDs are large decimal integers (50+ digits) or
+    # hex strings; anything shorter than 5 chars is almost certainly garbage.
+    if len(token_id) < 5:
+        return False
+    return True
 
 
 def _parse_close_time(close_time_str: Optional[str]) -> Optional[datetime]:
@@ -261,19 +279,27 @@ def process_market(
         ask_depth = 0.0
         book_state = "unknown"
         active_token_id = None
+        token_id_valid = False
 
         if raw.token_ids:
             active_token_id = raw.token_ids[0]
-            book_result = fetch_orderbook(active_token_id)
-            if book_result:
-                best_bid = book_result.best_bid
-                best_ask = book_result.best_ask
-                bid_size_best = book_result.bid_size_best
-                ask_size_best = book_result.ask_size_best
-                spread = book_result.spread
-                bid_depth = book_result.bid_depth_top_n
-                ask_depth = book_result.ask_depth_top_n
-                book_state = book_result.book_state
+            token_id_valid = _is_valid_token_id(active_token_id)
+            if not token_id_valid:
+                logger.warning(
+                    "market %s has invalid token_id %r (token_mapping_failed=%s) — skipping CLOB fetch",
+                    raw.market_id, active_token_id, raw.token_mapping_failed,
+                )
+            elif not raw.token_mapping_failed:
+                book_result = fetch_orderbook(active_token_id)
+                if book_result:
+                    best_bid = book_result.best_bid
+                    best_ask = book_result.best_ask
+                    bid_size_best = book_result.bid_size_best
+                    ask_size_best = book_result.ask_size_best
+                    spread = book_result.spread
+                    bid_depth = book_result.bid_depth_top_n
+                    ask_depth = book_result.ask_depth_top_n
+                    book_state = book_result.book_state
 
         top_book_depth = bid_depth + ask_depth  # combined for legacy log field
 
@@ -402,6 +428,13 @@ def process_market(
                 "tick_size": raw.tick_size,
                 "min_order_size": raw.min_order_size,
                 "accepting_orders": raw.accepting_orders,
+                # Patch 3 (token correctness)
+                "raw_clobTokenIds_type": type(raw.raw.get("clobTokenIds") or raw.raw.get("clob_token_ids")).__name__,
+                "token_ids_count": len(raw.token_ids),
+                "outcomes_count": len(raw.outcomes),
+                "token_mapping_failed": raw.token_mapping_failed,
+                "active_token_id_preview": (active_token_id[:12] + "…") if active_token_id and len(active_token_id) > 12 else active_token_id,
+                "active_token_id_valid": token_id_valid,
             },
         )
 
