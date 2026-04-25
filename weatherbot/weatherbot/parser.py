@@ -109,6 +109,62 @@ _MONTH_MAP = {
 _CURRENT_YEAR = datetime.now().year
 
 
+def _parse_reference_date(close_time_str: Optional[str]) -> Optional[date]:
+    """Parse a close_time ISO string to a date, used only for year inference."""
+    if not close_time_str:
+        return None
+    # datetime.fromisoformat handles most ISO formats; normalise Z suffix first
+    try:
+        return datetime.fromisoformat(close_time_str.replace("Z", "+00:00")).date()
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(close_time_str, fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+def _infer_year(month: int, day: int, reference_date: Optional[date] = None) -> int:
+    """
+    Infer the calendar year for a partial date (month + day).
+
+    When reference_date (from close_time) is provided:
+      - prefer the year that places the date <= reference_date
+      - if ref_year gives a date after reference_date, fall back to ref_year - 1
+
+    When no reference_date:
+      - use today's year
+      - if result would be > 180 days in the past, roll forward to next year
+    """
+    today = date.today()
+    if reference_date is not None:
+        ref_year = reference_date.year
+        try:
+            candidate = date(ref_year, month, day)
+        except ValueError:
+            return ref_year
+        if candidate <= reference_date:
+            return ref_year
+        # candidate falls after close_time → must be previous year's occurrence
+        try:
+            date(ref_year - 1, month, day)  # validate it's a real date
+        except ValueError:
+            return ref_year
+        return ref_year - 1
+    else:
+        ref_year = today.year
+        try:
+            candidate = date(ref_year, month, day)
+        except ValueError:
+            return ref_year
+        # More than 6 months in the past → roll forward
+        if (today - candidate).days > 180:
+            return ref_year + 1
+        return ref_year
+
+
 @dataclass
 class ParsedMarket:
     market_id: str
@@ -321,12 +377,26 @@ def _parse_date_string(date_str: str) -> Optional[date]:
     return None
 
 
-def _extract_date(text: str) -> tuple[Optional[str], Optional[date]]:
+_MONTH_RE = (
+    r"(?:january|february|march|april|may|june|july|august|september|"
+    r"october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)"
+)
+
+
+def _extract_date(
+    text: str,
+    reference_date: Optional[date] = None,
+) -> tuple[Optional[str], Optional[date]]:
     """
-    Extract date string and parse to date object.
-    Returns (date_str, parsed_date).
+    Extract the weather target date from market text.
+
+    Tries full-year patterns first; falls back to partial (month + day) patterns
+    with year inferred via _infer_year(reference_date).
+
+    Returns (date_str, parsed_date).  date_str is the raw matched string.
     """
-    date_patterns = [
+    # ── Full-year patterns (no inference needed) ───────────────────────────────
+    full_patterns = [
         re.compile(r"on\s+(\w+ \d{1,2},?\s*\d{4})", re.IGNORECASE),
         re.compile(r"on\s+(\d{1,2}/\d{1,2}/\d{4})", re.IGNORECASE),
         re.compile(r"on\s+(\d{4}-\d{2}-\d{2})", re.IGNORECASE),
@@ -334,7 +404,7 @@ def _extract_date(text: str) -> tuple[Optional[str], Optional[date]]:
         re.compile(r"\b(\w+ \d{1,2},\s*\d{4})\b", re.IGNORECASE),
         re.compile(r"\b(\d{1,2}\s+\w+\s+\d{4})\b", re.IGNORECASE),
     ]
-    for p in date_patterns:
+    for p in full_patterns:
         m = p.search(text)
         if m:
             ds = m.group(1).strip()
@@ -342,6 +412,36 @@ def _extract_date(text: str) -> tuple[Optional[str], Optional[date]]:
             if parsed:
                 return ds, parsed
             return ds, None
+
+    # ── Partial-date patterns (month + day, no year) ───────────────────────────
+    # Ordered most-specific first: "on Month DD" beats plain "Month DD"
+    partial_patterns = [
+        # "on April 26" / "on Apr 26"
+        re.compile(rf"on\s+({_MONTH_RE})\s+(\d{{1,2}})\b", re.IGNORECASE),
+        # "April 26" / "Apr 26"
+        re.compile(rf"\b({_MONTH_RE})\s+(\d{{1,2}})\b", re.IGNORECASE),
+        # "26 April" / "26 Apr"
+        re.compile(rf"\b(\d{{1,2}})\s+({_MONTH_RE})\b", re.IGNORECASE),
+    ]
+    for i, p in enumerate(partial_patterns):
+        m = p.search(text)
+        if not m:
+            continue
+        if i <= 1:  # Month DD
+            month_str, day_str = m.group(1), m.group(2)
+        else:  # DD Month
+            day_str, month_str = m.group(1), m.group(2)
+        month_num = _MONTH_MAP.get(month_str.lower())
+        if not month_num:
+            continue
+        try:
+            day_num = int(day_str)
+            year = _infer_year(month_num, day_num, reference_date)
+            inferred = date(year, month_num, day_num)
+            return f"{month_str.capitalize()} {day_num}", inferred
+        except ValueError:
+            continue
+
     return None, None
 
 
@@ -554,13 +654,20 @@ def parse_market(
     description: Optional[str] = None,
     rules: Optional[str] = None,
     resolution_text: Optional[str] = None,
+    close_time: Optional[str] = None,
 ) -> ParsedMarket:
     """
     Parse a market into structured fields. Never raises.
     Combines question + title + description + rules for richer parsing.
+
+    close_time is used ONLY to infer the year for partial dates ("April 26").
+    It is never used as the target date itself.
     """
     try:
-        return _parse_inner(market_id, question, outcomes, title, description, rules, resolution_text)
+        return _parse_inner(
+            market_id, question, outcomes, title, description,
+            rules, resolution_text, close_time,
+        )
     except Exception as exc:
         logger.exception("Unexpected parse error for market %s: %s", market_id, exc)
         return ParsedMarket(
@@ -591,6 +698,10 @@ def parse_market_from_raw(market_id: str, raw: dict) -> ParsedMarket:
             outcomes_raw = []
     outcomes = [str(o) for o in outcomes_raw]
 
+    close_time = (
+        raw.get("endDate") or raw.get("closeTime")
+        or raw.get("end_date_iso") or raw.get("close_time")
+    )
     return parse_market(
         market_id=market_id,
         question=question,
@@ -599,6 +710,7 @@ def parse_market_from_raw(market_id: str, raw: dict) -> ParsedMarket:
         description=str(description) if description else None,
         rules=str(rules) if rules else None,
         resolution_text=str(resolution_text) if resolution_text else None,
+        close_time=str(close_time) if close_time else None,
     )
 
 
@@ -610,6 +722,7 @@ def _parse_inner(
     description: Optional[str],
     rules: Optional[str],
     resolution_text: Optional[str],
+    close_time: Optional[str] = None,
 ) -> ParsedMarket:
     combined, confidence = _combine_text(question, title, description, rules, resolution_text)
 
@@ -618,7 +731,8 @@ def _parse_inner(
 
     unit = _detect_unit(combined)
     city = _extract_city(_normalize(question))  # city extraction from question primarily
-    date_str, parsed_target_date = _extract_date(combined)
+    reference_date = _parse_reference_date(close_time)
+    date_str, parsed_target_date = _extract_date(combined, reference_date=reference_date)
 
     bucket_info = _extract_bucket(combined, unit)
     bucket_low = bucket_info["bucket_low"]

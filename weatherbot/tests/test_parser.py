@@ -208,3 +208,66 @@ def test_icao_denylist_words_rejected():
         assert r.station_code_from_text != word, (
             f"Denylist word {word!r} was incorrectly returned as ICAO"
         )
+
+
+# ── Date parsing: partial dates with year inference ───────────────────────────
+
+def test_date_partial_on_month_dd_with_close_time():
+    """'on April 26' + close_time 2026 => parsed_target_date 2026-04-26."""
+    from datetime import date
+    r = parse_market(
+        "dt1",
+        "Will the highest temperature in Hong Kong on April 26 be above 29°C?",
+        close_time="2026-04-27T00:00:00Z",
+    )
+    assert r.parsed_target_date == date(2026, 4, 26), repr(r.parsed_target_date)
+    assert r.forecast_blocked_reason is None
+
+
+def test_date_partial_full_question_with_close_time():
+    """Full HK question with 29°C bucket — date inferred from close_time year."""
+    from datetime import date
+    r = parse_market(
+        "dt2",
+        "Will the highest temperature in Hong Kong on April 26 be 29°C?",
+        close_time="2026-04-27T00:00:00Z",
+    )
+    assert r.parsed_target_date == date(2026, 4, 26), repr(r.parsed_target_date)
+    assert r.forecast_blocked_reason is None
+
+
+def test_date_explicit_year_unchanged():
+    """Explicit year in question is used as-is; close_time has no effect."""
+    from datetime import date
+    r = parse_market(
+        "dt3",
+        "Will the highest temperature in NYC on April 26, 2026 be above 70°F?",
+        close_time="2030-01-01T00:00:00Z",  # different year — must be ignored
+    )
+    assert r.parsed_target_date == date(2026, 4, 26), repr(r.parsed_target_date)
+
+
+def test_date_partial_dd_month_format():
+    """'26 April' (day-month order) + close_time 2026 => 2026-04-26."""
+    from datetime import date
+    r = parse_market(
+        "dt4",
+        "Will the highest temperature in London on 26 April be above 20°C?",
+        close_time="2026-04-27T00:00:00Z",
+    )
+    assert r.parsed_target_date == date(2026, 4, 26), repr(r.parsed_target_date)
+    assert r.forecast_blocked_reason is None
+
+
+def test_date_close_time_provides_year_not_date():
+    """close_time must not override the question date — only provides year."""
+    from datetime import date
+    # Question says April 26; close_time is April 27. Target must be April 26.
+    r = parse_market(
+        "dt5",
+        "Will the daily high temperature in Chicago on April 26 be above 65°F?",
+        close_time="2026-04-27T00:00:00Z",
+    )
+    assert r.parsed_target_date == date(2026, 4, 26), repr(r.parsed_target_date)
+    # Confirm it is NOT the close_time date
+    assert r.parsed_target_date != date(2026, 4, 27)

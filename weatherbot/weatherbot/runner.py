@@ -145,6 +145,7 @@ def process_market(
             description=raw.description,
             rules=raw.rules,
             resolution_text=raw.resolution_source,
+            close_time=raw.close_time,
         )
 
         # ── Hours to close (lifecycle only) ───────────────────────────────────
