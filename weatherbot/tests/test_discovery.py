@@ -3,8 +3,10 @@ import pytest
 from weatherbot.discovery import (
     RawMarket,
     normalize_jsonish_list,
+    normalize_text_items,
     _extract_token_ids,
     _extract_outcomes,
+    _is_weather_market,
     _parse_raw_market,
     is_weather_candidate,
 )
@@ -413,3 +415,126 @@ def test_model_sanity_percentile_stats():
     assert sanity["member_max"] == 50.0
     assert sanity["members_inside_bucket"] == 1  # only 30.0
     assert sanity["model_distribution_outside_bucket_range"] is False
+
+
+# ── normalize_text_items ──────────────────────────────────────────────────────
+
+def test_normalize_text_items_none():
+    assert normalize_text_items(None) == []
+
+
+def test_normalize_text_items_string():
+    assert normalize_text_items("Weather") == ["weather"]
+
+
+def test_normalize_text_items_empty_string():
+    assert normalize_text_items("") == []
+
+
+def test_normalize_text_items_list_of_strings():
+    assert normalize_text_items(["Weather", "Temperature"]) == ["weather", "temperature"]
+
+
+def test_normalize_text_items_list_of_dicts():
+    """Dicts with label/name/slug keys are extracted."""
+    result = normalize_text_items([{"label": "Weather", "slug": "weather"}])
+    assert "weather" in result
+
+
+def test_normalize_text_items_dict_name():
+    result = normalize_text_items({"name": "Weather"})
+    assert result == ["weather"]
+
+
+def test_normalize_text_items_mixed_list():
+    """Mixed list with strings, dicts, and bad types must not crash."""
+    result = normalize_text_items(["Weather", {"slug": "temperature"}, 123, None])
+    assert "weather" in result
+    assert "temperature" in result
+
+
+def test_normalize_text_items_bad_types_no_crash():
+    """Numbers, None, dicts with no useful keys — must not crash."""
+    result = normalize_text_items([123, None, {"x": "bad"}, True])
+    assert isinstance(result, list)
+
+
+def test_normalize_text_items_dict_no_useful_keys():
+    """Dict with only unknown keys returns empty."""
+    result = normalize_text_items({"foo": "bar", "baz": 42})
+    assert result == []
+
+
+# ── _is_weather_market with dict tags ────────────────────────────────────────
+
+def _weather_event(extra: dict) -> dict:
+    base = {
+        "slug": "some-event",
+        "title": "Some Event",
+        "question": "",
+        "markets": [],
+    }
+    base.update(extra)
+    return base
+
+
+def test_is_weather_market_tags_dict_label_weather():
+    """tags=[{"label":"Weather","slug":"weather"}] must classify as weather."""
+    m = _weather_event({"tags": [{"label": "Weather", "slug": "weather"}]})
+    assert _is_weather_market(m) is True
+
+
+def test_is_weather_market_tags_dict_name_weather():
+    """tags=[{"name":"Temperature"}] must classify as weather via WEATHER_TAGS."""
+    m = _weather_event({"tags": [{"name": "Temperature"}]})
+    assert _is_weather_market(m) is True
+
+
+def test_is_weather_market_tags_dict_crypto_no_title_match():
+    """tags=[{"name":"Crypto"}] with no weather in title/slug must return False."""
+    m = _weather_event({"tags": [{"name": "Crypto"}]})
+    assert _is_weather_market(m) is False
+
+
+def test_is_weather_market_category_dict():
+    """category={"name":"Weather"} must classify as weather."""
+    m = _weather_event({"category": {"name": "Weather"}})
+    assert _is_weather_market(m) is True
+
+
+def test_is_weather_market_mixed_tags_string_and_dict():
+    """Mixed tags ["Sports", {"slug":"temperature"}] triggers weather via dict slug."""
+    m = _weather_event({"tags": ["Sports", {"slug": "temperature"}]})
+    assert _is_weather_market(m) is True
+
+
+def test_is_weather_market_bad_tags_no_crash():
+    """tags=[123, None, {"x":"bad"}] must not raise — returns False (no match)."""
+    m = _weather_event({"tags": [123, None, {"x": "bad"}]})
+    result = _is_weather_market(m)
+    assert isinstance(result, bool)
+
+
+def test_is_weather_market_temperature_in_slug():
+    """Slug containing 'highest-temperature-in-' must always be weather regardless of tags."""
+    m = _weather_event({
+        "slug": "highest-temperature-in-tokyo-april-2026",
+        "tags": [{"name": "Crypto"}],
+    })
+    assert _is_weather_market(m) is True
+
+
+def test_parse_raw_market_dict_tags_normalised():
+    """_parse_raw_market with dict tags must produce normalised string list, not crash."""
+    m = {
+        "id": "mkt_tag_test",
+        "question": "Will the daily high in London be above 20°C?",
+        "active": True,
+        "tags": [{"label": "Weather", "slug": "weather"}, {"name": "Temperature"}],
+        "clobTokenIds": ["111111111111111", "222222222222222"],
+    }
+    raw = _parse_raw_market(m)
+    assert raw is not None
+    assert isinstance(raw.tags, list)
+    assert all(isinstance(t, str) for t in raw.tags)
+    assert "weather" in raw.tags or "temperature" in raw.tags

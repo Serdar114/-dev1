@@ -109,29 +109,89 @@ def _get(url: str, params: dict, timeout: int = 15, retries: int = 3, backoff: f
     return None
 
 
+_TAG_TEXT_KEYS = ("name", "label", "slug", "title", "id")
+
+
+def normalize_text_items(value: Any) -> list[str]:
+    """
+    Safely extract lowercase strings from a Gamma tag/category field.
+
+    Gamma may return these fields as strings, lists of strings, lists of dicts,
+    plain dicts, or even None/numbers.  This helper handles every shape and
+    never raises.
+
+    - None              → []
+    - str               → [str.lower()]
+    - dict              → text extracted from name/label/slug/title/id keys
+    - list (any mix)    → each element handled by the rules above
+    - int/float/bool    → []  (ignored silently)
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value.lower()] if value.strip() else []
+    if isinstance(value, dict):
+        return _text_from_dict(value)
+    if isinstance(value, list):
+        result: list[str] = []
+        for item in value:
+            if item is None:
+                continue
+            if isinstance(item, str):
+                if item.strip():
+                    result.append(item.lower())
+            elif isinstance(item, dict):
+                result.extend(_text_from_dict(item))
+            # int/float/bool/other → skip silently
+        return result
+    # int, float, bool, etc.
+    return []
+
+
+def _text_from_dict(d: dict) -> list[str]:
+    """Extract non-empty string values from known tag-dict text keys."""
+    result: list[str] = []
+    for key in _TAG_TEXT_KEYS:
+        v = d.get(key)
+        if isinstance(v, str) and v.strip():
+            result.append(v.lower())
+    return result
+
+
 def _is_weather_market(market: dict) -> bool:
-    """Return True if the market looks like a weather/temperature market."""
-    question = (market.get("question") or "").lower()
-    slug = (market.get("slug") or "").lower()
-    title = (market.get("title") or market.get("groupItemTitle") or "").lower()
-    group_slug = (market.get("groupItemTag") or "").lower()
-    tags = [t.lower() for t in (market.get("tags") or [])]
+    """Return True if the market looks like a weather/temperature market.
 
-    combined = f"{question} {slug} {title} {group_slug}"
+    Never raises — bad field shapes are silently ignored.
+    """
+    try:
+        question = (market.get("question") or "").lower()
+        slug = (market.get("slug") or "").lower()
+        title = (market.get("title") or market.get("groupItemTitle") or "").lower()
+        group_slug = (market.get("groupItemTag") or "").lower()
 
-    for pat in WEATHER_SLUG_PATTERNS:
-        if pat in combined:
-            return True
+        combined = f"{question} {slug} {title} {group_slug}"
 
-    for kw in WEATHER_KEYWORDS:
-        if kw in combined:
-            return True
+        for pat in WEATHER_SLUG_PATTERNS:
+            if pat in combined:
+                return True
 
-    for tag in tags:
-        if any(wt in tag for wt in WEATHER_TAGS):
-            return True
+        for kw in WEATHER_KEYWORDS:
+            if kw in combined:
+                return True
 
-    return False
+        # Check all tag/category fields with robust normalization
+        tag_texts: list[str] = []
+        for field_name in ("tags", "category", "categories", "topic", "topics"):
+            tag_texts.extend(normalize_text_items(market.get(field_name)))
+
+        for tag in tag_texts:
+            if any(wt in tag for wt in WEATHER_TAGS):
+                return True
+
+        return False
+    except Exception:
+        logger.debug("_is_weather_market: unexpected field shape, returning False", exc_info=True)
+        return False
 
 
 def is_weather_candidate(question: str, slug: str = "") -> bool:
@@ -301,11 +361,7 @@ def _parse_raw_market(m: dict) -> Optional[RawMarket]:
         bool(token_ids) and bool(outcomes) and len(token_ids) != len(outcomes)
     )
 
-    tags_raw = m.get("tags") or []
-    if isinstance(tags_raw, list):
-        tags = [str(t) for t in tags_raw]
-    else:
-        tags = []
+    tags = normalize_text_items(m.get("tags"))
 
     def _safe_float(val) -> Optional[float]:
         try:
