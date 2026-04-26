@@ -6,6 +6,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 from typing import Any, Optional
 
 import requests
@@ -48,6 +49,34 @@ PRECIP_KEYWORDS = [
 ]
 
 TEMP_MARKET_TYPES = {"daily_high_temperature", "daily_low_temperature"}
+
+# Strict daily city temperature event patterns
+DAILY_TEMP_SLUG_PATTERNS = [
+    "highest-temperature-in-",
+    "lowest-temperature-in-",
+]
+DAILY_TEMP_TITLE_PATTERNS = [
+    "highest temperature in",
+    "lowest temperature in",
+]
+
+# Date month patterns used by is_daily_temperature_event
+_DATE_MONTH_SLUG = [
+    "on-january-", "on-february-", "on-march-", "on-april-",
+    "on-may-", "on-june-", "on-july-", "on-august-",
+    "on-september-", "on-october-", "on-november-", "on-december-",
+]
+_DATE_MONTH_TEXT = [
+    "on january", "on february", "on march", "on april",
+    "on may", "on june", "on july", "on august",
+    "on september", "on october", "on november", "on december",
+]
+
+_MONTH_NUM: dict[str, int] = {
+    "january": 1, "february": 2, "march": 3, "april": 4,
+    "may": 5, "june": 6, "july": 7, "august": 8,
+    "september": 9, "october": 10, "november": 11, "december": 12,
+}
 
 
 @dataclass
@@ -94,6 +123,21 @@ class WeatherEventSummary:
     parsed_city: Optional[str]
     parsed_date: Optional[str]
     close_time: Optional[str]
+
+
+@dataclass
+class TemperatureDiscoveryResult:
+    """Result of discover_daily_temperature_only() with full counts and market list."""
+    raw_events_seen: int = 0
+    raw_markets_seen: int = 0
+    daily_temperature_events_found: int = 0
+    filtered_other_weather: int = 0
+    filtered_non_temperature: int = 0
+    summaries: list[WeatherEventSummary] = field(default_factory=list)
+    future_watchlist: list[WeatherEventSummary] = field(default_factory=list)
+    markets: list[RawMarket] = field(default_factory=list)
+    first30_raw_event_slugs: list[str] = field(default_factory=list)
+    first30_raw_market_slugs: list[str] = field(default_factory=list)
 
 
 def _get(url: str, params: dict, timeout: int = 15, retries: int = 3, backoff: float = 2.0) -> Optional[dict | list]:
@@ -213,6 +257,79 @@ def is_weather_candidate(question: str, slug: str = "") -> bool:
         if kw in text:
             return True
     return False
+
+
+def is_daily_temperature_event(title: str, slug: str, question: str = "") -> bool:
+    """
+    Return True ONLY for daily city temperature events with a specific calendar date.
+
+    Requirements:
+      1. slug contains 'highest-temperature-in-' or 'lowest-temperature-in-'
+         OR title/question contains 'highest temperature in' or 'lowest temperature in'
+      2. A specific calendar month appears (e.g. 'on-april-', 'on April')
+
+    Strictly excludes:
+      - "Where will 2026 rank among the hottest years on record?"
+      - "Min Arctic sea ice extent this summer?"
+      - "SpaceX Starship fully reusable before 2027?"
+      - "New COVID variant of concern before 2027?"
+    """
+    slug_l = (slug or "").lower()
+    title_l = (title or "").lower()
+    question_l = (question or "").lower()
+    text = f"{title_l} {question_l}"
+
+    # 1. Temperature pattern
+    has_temp = (
+        any(p in slug_l for p in DAILY_TEMP_SLUG_PATTERNS)
+        or any(p in text for p in DAILY_TEMP_TITLE_PATTERNS)
+    )
+    if not has_temp:
+        return False
+
+    # 2. Specific date (month) pattern
+    has_date = (
+        any(p in slug_l for p in _DATE_MONTH_SLUG)
+        or any(p in text for p in _DATE_MONTH_TEXT)
+    )
+    return has_date
+
+
+def _extract_event_date(slug: str, title: str, close_time: Optional[str] = None) -> Optional[date]:
+    """
+    Extract the specific target date from a daily temperature event.
+    Slug pattern: 'highest-temperature-in-seoul-on-april-27-2026'
+    Title pattern: 'Highest Temperature in Seoul on April 27, 2026'
+    """
+    # Slug: on-month-day-year
+    m = re.search(r"on-(\w+)-(\d{1,2})-(\d{4})", (slug or "").lower())
+    if m:
+        month = _MONTH_NUM.get(m.group(1))
+        if month:
+            try:
+                return date(int(m.group(3)), month, int(m.group(2)))
+            except ValueError:
+                pass
+
+    # Title/question: "on April 27, 2026" or "on April 27"
+    m = re.search(r"on\s+(\w+)\s+(\d{1,2})(?:[,\s]+(\d{4}))?", (title or "").lower())
+    if m:
+        month = _MONTH_NUM.get(m.group(1))
+        if month:
+            day = int(m.group(2))
+            year_str = m.group(3)
+            if not year_str and close_time:
+                # Infer year from close_time ISO string
+                try:
+                    year_str = close_time[:4]
+                except (TypeError, IndexError):
+                    pass
+            if year_str:
+                try:
+                    return date(int(year_str), month, day)
+                except ValueError:
+                    pass
+    return None
 
 
 def _is_precipitation_only(market: dict) -> bool:
@@ -803,3 +920,238 @@ def discover_weather_events_only(max_events: int = 100) -> list[WeatherEventSumm
 
     logger.info("discover_weather_events_only: %d event summaries", len(summaries))
     return summaries
+
+
+# ── Strict daily temperature discovery ───────────────────────────────────────
+
+def _paginate_raw_events(
+    max_pages: int,
+    extra_params: Optional[dict] = None,
+) -> list[dict]:
+    """
+    Paginate GET /events?active=true&closed=false up to max_pages pages.
+    extra_params (e.g. {"q": "highest temperature"}) are merged into params.
+    Returns deduplicated raw event dicts.
+    """
+    items: list[dict] = []
+    seen_ids: set[str] = set()
+    page_size = 100
+    offset = 0
+
+    for _ in range(max_pages):
+        params: dict = {
+            "active": "true",
+            "closed": "false",
+            "limit": page_size,
+            "offset": offset,
+        }
+        if extra_params:
+            params.update(extra_params)
+
+        data = _get(f"{GAMMA_BASE}/events", params=params)
+        if not data:
+            break
+
+        page = data if isinstance(data, list) else (data.get("data") or data.get("events") or [])
+        if not page:
+            break
+
+        for item in page:
+            eid = str(item.get("id") or "")
+            if eid and eid not in seen_ids:
+                seen_ids.add(eid)
+                items.append(item)
+
+        if len(page) < page_size:
+            break
+        offset += page_size
+
+    return items
+
+
+def _paginate_raw_markets(max_pages: int) -> list[dict]:
+    """
+    Paginate GET /markets?active=true&closed=false up to max_pages pages.
+    Returns deduplicated raw market dicts.
+    """
+    items: list[dict] = []
+    seen_ids: set[str] = set()
+    page_size = 100
+    offset = 0
+
+    for _ in range(max_pages):
+        params: dict = {
+            "active": "true",
+            "closed": "false",
+            "limit": page_size,
+            "offset": offset,
+        }
+
+        data = _get(f"{GAMMA_BASE}/markets", params=params)
+        if not data:
+            break
+
+        page = data if isinstance(data, list) else (data.get("data") or data.get("markets") or [])
+        if not page:
+            break
+
+        for item in page:
+            mid = str(item.get("id") or "")
+            if mid and mid not in seen_ids:
+                seen_ids.add(mid)
+                items.append(item)
+
+        if len(page) < page_size:
+            break
+        offset += page_size
+
+    return items
+
+
+def discover_daily_temperature_only(
+    max_events: int = 100,
+    max_pages: int = 20,
+    window_days: int = 2,
+    include_future: bool = False,
+) -> TemperatureDiscoveryResult:
+    """
+    Strictly discover daily city temperature events using three sources:
+      A) Paginated /events (no tag filter)
+      B) /events with search queries for 'highest temperature' / 'lowest temperature'
+      C) Paginated /markets grouped by event
+
+    Only events passing is_daily_temperature_event() are kept.
+    Events within window_days of today go to summaries; beyond → future_watchlist.
+    Used by --discover-temperature-only.
+    """
+    result = TemperatureDiscoveryResult()
+    seen_event_ids: set[str] = set()
+    seen_market_ids: set[str] = set()
+    passing_events: list[dict] = []
+
+    # ── Source A: Paginated /events ───────────────────────────────────────────
+    raw_events = _paginate_raw_events(max_pages=max_pages)
+    result.raw_events_seen += len(raw_events)
+    result.first30_raw_event_slugs = [
+        e.get("slug") or e.get("title") or str(e.get("id", ""))
+        for e in raw_events[:30]
+    ]
+
+    for event in raw_events:
+        slug = event.get("slug") or ""
+        title = event.get("title") or event.get("name") or ""
+        eid = str(event.get("id") or "")
+
+        if is_daily_temperature_event(title, slug):
+            if eid not in seen_event_ids:
+                seen_event_ids.add(eid)
+                passing_events.append(event)
+        elif _is_weather_market(event):
+            result.filtered_other_weather += 1
+        else:
+            result.filtered_non_temperature += 1
+
+    # ── Source B: Search queries (q= param, two terms only) ──────────────────
+    for query in ("highest temperature", "lowest temperature"):
+        search_events = _paginate_raw_events(max_pages=3, extra_params={"q": query})
+        for event in search_events:
+            result.raw_events_seen += 1
+            slug = event.get("slug") or ""
+            title = event.get("title") or event.get("name") or ""
+            eid = str(event.get("id") or "")
+            if is_daily_temperature_event(title, slug):
+                if eid not in seen_event_ids:
+                    seen_event_ids.add(eid)
+                    passing_events.append(event)
+
+    # ── Source C: Paginated /markets ──────────────────────────────────────────
+    raw_markets = _paginate_raw_markets(max_pages=max_pages)
+    result.raw_markets_seen = len(raw_markets)
+    result.first30_raw_market_slugs = [
+        m.get("slug") or (m.get("question") or "")[:60] or str(m.get("id", ""))
+        for m in raw_markets[:30]
+    ]
+
+    # Group temperature markets by event, building synthetic events for new ones
+    market_by_event: dict[str, list[dict]] = {}
+    for m in raw_markets:
+        slug = m.get("slug") or ""
+        question = m.get("question") or ""
+        title = m.get("title") or m.get("groupItemTitle") or ""
+        eid = str(m.get("eventId") or m.get("event_id") or "")
+
+        if is_daily_temperature_event(title, slug, question):
+            if eid and eid not in seen_event_ids:
+                market_by_event.setdefault(eid, []).append(m)
+
+    for eid, mlist in market_by_event.items():
+        rep = mlist[0]
+        synthetic = {
+            "id": eid,
+            "slug": rep.get("slug"),
+            "title": rep.get("title") or rep.get("groupItemTitle") or "",
+            "markets": mlist,
+            "endDate": rep.get("endDate") or rep.get("closeTime"),
+        }
+        seen_event_ids.add(eid)
+        passing_events.append(synthetic)
+
+    result.daily_temperature_events_found = len(passing_events)
+
+    # ── Split into window vs future ───────────────────────────────────────────
+    today = date.today()
+    cutoff = today + timedelta(days=window_days)
+
+    for event in passing_events:
+        slug = event.get("slug") or ""
+        title = event.get("title") or event.get("name") or ""
+        close_time = event.get("endDate") or event.get("closeTime") or event.get("end_date_iso")
+
+        markets = _extract_markets_from_event(event)
+        summary = _make_event_summary(event, markets)
+        event_date = _extract_event_date(slug, title, close_time)
+
+        if event_date is not None and event_date > cutoff:
+            result.future_watchlist.append(summary)
+            if not include_future:
+                continue
+
+        result.summaries.append(summary)
+        for rm in markets:
+            if rm.market_id not in seen_market_ids:
+                seen_market_ids.add(rm.market_id)
+                result.markets.append(rm)
+
+    logger.info(
+        "discover_daily_temperature_only: raw_events=%d raw_markets=%d "
+        "found=%d active=%d future=%d filtered_weather=%d filtered_other=%d",
+        result.raw_events_seen, result.raw_markets_seen,
+        result.daily_temperature_events_found,
+        len(result.summaries), len(result.future_watchlist),
+        result.filtered_other_weather, result.filtered_non_temperature,
+    )
+    return result
+
+
+def discover_daily_temperature_events(
+    max_events: int = 100,
+    max_pages: int = 20,
+    window_days: int = 2,
+    include_future: bool = False,
+) -> list[RawMarket]:
+    """
+    Discover daily temperature markets for the full processing pipeline.
+    Returns only RawMarket objects for events within the date window.
+    Used by --discover-temperature --max-events N --max-pages N.
+    """
+    disc = discover_daily_temperature_only(
+        max_events=max_events,
+        max_pages=max_pages,
+        window_days=window_days,
+        include_future=include_future,
+    )
+    logger.info(
+        "discover_daily_temperature_events: returning %d markets from %d events",
+        len(disc.markets), len(disc.summaries),
+    )
+    return disc.markets

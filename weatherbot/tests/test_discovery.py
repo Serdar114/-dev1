@@ -538,3 +538,104 @@ def test_parse_raw_market_dict_tags_normalised():
     assert isinstance(raw.tags, list)
     assert all(isinstance(t, str) for t in raw.tags)
     assert "weather" in raw.tags or "temperature" in raw.tags
+
+
+# ── is_daily_temperature_event ────────────────────────────────────────────────
+
+from weatherbot.discovery import (
+    is_daily_temperature_event,
+    _extract_event_date,
+    TemperatureDiscoveryResult,
+)
+from datetime import date as _date
+
+
+# Known positives — slug-based
+@pytest.mark.parametrize("slug", [
+    "highest-temperature-in-seoul-on-april-27-2026",
+    "highest-temperature-in-hong-kong-on-april-26-2026",
+    "lowest-temperature-in-new-york-city-on-april-27-2026",
+    "highest-temperature-in-tokyo-on-may-1-2026",
+    "lowest-temperature-in-london-on-december-15-2026",
+])
+def test_is_daily_temperature_event_slug_positives(slug):
+    assert is_daily_temperature_event("", slug) is True, f"slug={slug!r} should be True"
+
+
+# Known positives — title-based
+@pytest.mark.parametrize("title,slug", [
+    ("Highest Temperature in Seoul on April 27, 2026", ""),
+    ("Lowest Temperature in New York City on April 27", ""),
+    ("Will the highest temperature in London on June 1 be above 25°C?", ""),
+])
+def test_is_daily_temperature_event_title_positives(title, slug):
+    assert is_daily_temperature_event(title, slug) is True, f"title={title!r} should be True"
+
+
+# Known negatives
+@pytest.mark.parametrize("title,slug", [
+    ("Where will 2026 rank among the hottest years on record?", "hottest-year-2026"),
+    ("Min Arctic sea ice extent this summer?", "arctic-sea-ice-summer-2026"),
+    ("SpaceX Starship fully reusable before 2027?", "spacex-starship-reusable"),
+    ("New COVID variant of concern before 2027?", "covid-variant-2027"),
+    ("Will Bitcoin reach $100,000?", "bitcoin-100k-2026"),
+    ("Who wins the 2026 World Cup?", "world-cup-2026-winner"),
+    ("Will Ukraine sign a ceasefire?", "ukraine-ceasefire"),
+])
+def test_is_daily_temperature_event_negatives(title, slug):
+    assert is_daily_temperature_event(title, slug) is False, f"title={title!r} slug={slug!r} should be False"
+
+
+def test_is_daily_temperature_event_requires_date():
+    """Temperature slug without a date month must return False."""
+    assert is_daily_temperature_event("", "highest-temperature-in-seoul") is False
+
+
+def test_is_daily_temperature_event_with_question():
+    """Question text also accepted as input."""
+    assert is_daily_temperature_event(
+        title="", slug="",
+        question="Will the highest temperature in Seoul on April 27 be 18°C?",
+    ) is True
+
+
+# ── _extract_event_date ───────────────────────────────────────────────────────
+
+def test_extract_date_from_slug():
+    d = _extract_event_date("highest-temperature-in-seoul-on-april-27-2026", "")
+    assert d == _date(2026, 4, 27)
+
+
+def test_extract_date_from_hong_kong_slug():
+    d = _extract_event_date("highest-temperature-in-hong-kong-on-april-26-2026", "")
+    assert d == _date(2026, 4, 26)
+
+
+def test_extract_date_from_title():
+    d = _extract_event_date("", "Highest Temperature in Seoul on April 27, 2026")
+    assert d == _date(2026, 4, 27)
+
+
+def test_extract_date_returns_none_for_no_date():
+    assert _extract_event_date("highest-temperature-in-seoul", "Highest Temp Seoul") is None
+
+
+def test_extract_date_december():
+    d = _extract_event_date("lowest-temperature-in-london-on-december-15-2026", "")
+    assert d == _date(2026, 12, 15)
+
+
+# ── TemperatureDiscoveryResult dataclass ─────────────────────────────────────
+
+def test_temperature_discovery_result_defaults():
+    r = TemperatureDiscoveryResult()
+    assert r.raw_events_seen == 0
+    assert r.raw_markets_seen == 0
+    assert r.daily_temperature_events_found == 0
+    assert r.filtered_other_weather == 0
+    assert r.filtered_non_temperature == 0
+    assert r.summaries == []
+    assert r.future_watchlist == []
+    assert r.markets == []
+    assert r.first30_raw_event_slugs == []
+    assert r.first30_raw_market_slugs == []

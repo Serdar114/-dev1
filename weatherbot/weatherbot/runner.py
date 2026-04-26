@@ -27,9 +27,12 @@ import yaml
 from .book_collector import fetch_orderbook
 from .discovery import (
     RawMarket,
+    TemperatureDiscoveryResult,
     WeatherEventSummary,
     discover_all,
     discover_by_slug,
+    discover_daily_temperature_events,
+    discover_daily_temperature_only,
     discover_weather_events_broad,
     discover_weather_events_only,
     is_weather_candidate,
@@ -676,6 +679,31 @@ def run_discover_weather_only(max_events: int = 100) -> list[WeatherEventSummary
     return summaries
 
 
+def run_discover_temperature_only(
+    max_events: int = 100,
+    max_pages: int = 20,
+    window_days: int = 2,
+    include_future: bool = False,
+) -> TemperatureDiscoveryResult:
+    """
+    Strict daily temperature discovery — summary output only, no full pipeline.
+    Used by --discover-temperature-only.
+    """
+    result = discover_daily_temperature_only(
+        max_events=max_events,
+        max_pages=max_pages,
+        window_days=window_days,
+        include_future=include_future,
+    )
+    logger.info(
+        "run_discover_temperature_only: found=%d active=%d future=%d",
+        result.daily_temperature_events_found,
+        len(result.summaries),
+        len(result.future_watchlist),
+    )
+    return result
+
+
 def run_scan(
     max_markets: int = 200,
     include_unknown_cities: bool = True,
@@ -685,6 +713,9 @@ def run_scan(
     slug: Optional[str] = None,
     broad_weather: bool = False,
     max_events: int = 100,
+    temperature_mode: bool = False,
+    max_pages: int = 20,
+    include_future: bool = False,
 ) -> ScanStats:
     settings = _load_settings()
     ev_cfg = settings.get("ev", {})
@@ -696,8 +727,9 @@ def run_scan(
     stats = ScanStats()
 
     logger.info(
-        "Starting scan: max_markets=%d include_unknown=%s once=%s slug=%r broad_weather=%s",
-        max_markets, include_unknown_cities, once, slug, broad_weather,
+        "Starting scan: max_markets=%d include_unknown=%s once=%s slug=%r "
+        "broad_weather=%s temperature_mode=%s",
+        max_markets, include_unknown_cities, once, slug, broad_weather, temperature_mode,
     )
 
     while True:
@@ -711,6 +743,9 @@ def run_scan(
             slug=slug,
             broad_weather=broad_weather,
             max_events=max_events,
+            temperature_mode=temperature_mode,
+            max_pages=max_pages,
+            include_future=include_future,
         )
 
         stats.markets_discovered += cycle_stats.markets_discovered
@@ -756,10 +791,19 @@ def _run_cycle(
     slug: Optional[str] = None,
     broad_weather: bool = False,
     max_events: int = 100,
+    temperature_mode: bool = False,
+    max_pages: int = 20,
+    include_future: bool = False,
 ) -> ScanStats:
     stats = ScanStats()
     if slug:
         raw_markets = discover_by_slug(slug)
+    elif temperature_mode:
+        raw_markets = discover_daily_temperature_events(
+            max_events=max_events,
+            max_pages=max_pages,
+            include_future=include_future,
+        )
     elif broad_weather:
         raw_markets = discover_weather_events_broad(max_events=max_events)
     else:
