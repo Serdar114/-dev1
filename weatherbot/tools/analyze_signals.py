@@ -93,10 +93,16 @@ def analyze():
     print(f"  Paper eligible:         {paper_elig} ({_pct(paper_elig, total)})")
     print(f"  Live eligible:          {live_elig} ({_pct(live_elig, total)})")
 
+    # Q4b: Event coverage
+    event_ids = set(o.get("event_id") for o in observations if o.get("event_id"))
+    print(f"\n--- Event Coverage ---")
+    print(f"  Unique events tracked:  {len(event_ids)}")
+
     # Q5: Ensemble usability
     ensemble_usable = sum(1 for o in observations if (o.get("n_members") or 0) > 0 and not o.get("deterministic_fallback_used"))
     n_members_list = [o.get("n_members") for o in observations if o.get("n_members") is not None]
     blocked_reasons = Counter(o.get("forecast_blocked_reason") for o in observations if o.get("forecast_blocked_reason"))
+    outside_range = sum(1 for o in observations if o.get("model_distribution_outside_bucket_range"))
     print(f"\n--- Ensemble Validation ---")
     print(f"  Ensemble usable (n>0, no fallback): {ensemble_usable} / {total} ({_pct(ensemble_usable, total)})")
     if n_members_list:
@@ -104,6 +110,7 @@ def analyze():
         print(f"  Avg n_members (where set): {avg_members:.1f}")
         zero_members = sum(1 for n in n_members_list if n == 0)
         print(f"  n_members=0:               {zero_members}")
+    print(f"  Model dist outside bucket: {outside_range} ({_pct(outside_range, total)})")
     if blocked_reasons:
         print(f"  Blocked reasons:")
         for reason, c in blocked_reasons.most_common():
@@ -147,6 +154,21 @@ def analyze():
                   f"model={o.get('model_probability',0):.2f} "
                   f"ask={o.get('best_ask','?')} "
                   f"edge_net_maker={o.get('edge_net_maker',0):.4f}")
+
+    # Q8b: Top model bucket vs best ask (sorted by model_probability, descending)
+    top_model_obs = sorted(
+        [o for o in observations if o.get("model_probability") is not None and o.get("best_ask") is not None],
+        key=lambda x: x.get("model_probability", 0),
+        reverse=True,
+    )[:10]
+    if top_model_obs:
+        print(f"\n--- Top 10 by Model Probability (with orderbook) ---")
+        for o in top_model_obs:
+            outside = " [OUTSIDE_RANGE]" if o.get("model_distribution_outside_bucket_range") else ""
+            print(f"  {o.get('city','?')} | {o.get('bucket_label','?')} | "
+                  f"model={o.get('model_probability',0):.3f} "
+                  f"ask={o.get('best_ask','?'):.3f} "
+                  f"n={o.get('n_members',0)}{outside}")
 
     # Q9: Surviving signals
     print(f"\n--- Surviving Signals ---")

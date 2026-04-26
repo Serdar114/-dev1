@@ -3,6 +3,7 @@ Discover active Polymarket temperature/weather markets via Gamma and CLOB APIs.
 """
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -81,6 +82,18 @@ class RawMarket:
     yes_token_id: Optional[str] = None
     no_token_id: Optional[str] = None
     raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class WeatherEventSummary:
+    """Lightweight event summary returned by discover_weather_events_only()."""
+    event_id: str
+    slug: Optional[str]
+    title: str
+    n_markets: int
+    parsed_city: Optional[str]
+    parsed_date: Optional[str]
+    close_time: Optional[str]
 
 
 def _get(url: str, params: dict, timeout: int = 15, retries: int = 3, backoff: float = 2.0) -> Optional[dict | list]:
@@ -386,21 +399,30 @@ def fetch_event_by_slug(slug: str) -> list[RawMarket]:
     """
     Fetch all markets for a Polymarket event by its slug.
 
-    Tries three Gamma endpoints in order:
-      1. /events/{slug}          — single event object
-      2. /events?slug={slug}     — list query
-      3. /markets?slug={slug}    — direct market query (single-outcome markets)
+    Endpoint priority (per Polymarket docs):
+      1. GET /events/slug/{slug}   — canonical slug lookup (correct endpoint)
+      2. GET /events?slug={slug}   — list query fallback
+      3. GET /markets?slug={slug}  — direct market slug fallback
     """
     if not slug:
         return []
 
-    # 1. Direct event object
-    data = _get(f"{GAMMA_BASE}/events/{slug}", params={})
-    if data and isinstance(data, dict) and data.get("markets"):
-        results = _extract_markets_from_event(data)
-        if results:
-            logger.info("fetch_event_by_slug %r → %d markets via /events/{slug}", slug, len(results))
-            return results
+    # 1. Canonical slug endpoint
+    data = _get(f"{GAMMA_BASE}/events/slug/{slug}", params={})
+    if data:
+        if isinstance(data, dict) and data.get("markets"):
+            results = _extract_markets_from_event(data)
+            if results:
+                logger.info("fetch_event_by_slug %r → %d markets via /events/slug/", slug, len(results))
+                return results
+        elif isinstance(data, list):
+            results = []
+            for ev in data:
+                if isinstance(ev, dict):
+                    results.extend(_extract_markets_from_event(ev))
+            if results:
+                logger.info("fetch_event_by_slug %r → %d markets via /events/slug/ (list)", slug, len(results))
+                return results
 
     # 2. Events list query
     data = _get(f"{GAMMA_BASE}/events", params={"slug": slug})
@@ -579,3 +601,149 @@ def discover_all(max_markets: int = 200) -> list[RawMarket]:
     all_markets = deduplicate_markets(markets_a + markets_b)
     logger.info("Total deduplicated weather markets: %d", len(all_markets))
     return all_markets
+
+
+def _page_weather_events(
+    max_events: int,
+    tag: Optional[str] = None,
+) -> list[dict]:
+    """
+    Paginate Gamma /events?active=true&closed=false and return raw event dicts
+    that pass the weather filter.  No tag restriction by default — broader net.
+    """
+    results: list[dict] = []
+    page_size = 100
+    offset = 0
+
+    while len(results) < max_events:
+        params: dict = {
+            "active": "true",
+            "closed": "false",
+            "limit": min(page_size, max_events - len(results)),
+            "offset": offset,
+        }
+        if tag:
+            params["tag"] = tag
+
+        data = _get(f"{GAMMA_BASE}/events", params=params)
+        if not data:
+            break
+
+        if isinstance(data, dict):
+            items = data.get("data") or data.get("events") or []
+        elif isinstance(data, list):
+            items = data
+        else:
+            items = []
+
+        if not items:
+            break
+
+        for event in items:
+            if not isinstance(event, dict):
+                continue
+            slug = event.get("slug") or ""
+            title = event.get("title") or event.get("name") or ""
+            if is_weather_candidate(title, slug=slug) or _is_weather_market(event):
+                results.append(event)
+            if len(results) >= max_events:
+                break
+
+        if len(items) < page_size:
+            break
+        offset += page_size
+
+    logger.info("_page_weather_events tag=%r: found %d weather events", tag, len(results))
+    return results
+
+
+def _make_event_summary(event: dict, markets: list[RawMarket]) -> WeatherEventSummary:
+    """Build a WeatherEventSummary from an event dict and its extracted markets."""
+    from .parser import parse_market  # local import avoids circular at module level
+
+    event_id = str(event.get("id") or "")
+    slug = event.get("slug")
+    title = event.get("title") or event.get("name") or ""
+    close_time = event.get("endDate") or event.get("closeTime") or event.get("end_date_iso")
+
+    parsed_city: Optional[str] = None
+    parsed_date: Optional[str] = None
+    if markets:
+        rep = markets[0]
+        try:
+            pm = parse_market(
+                rep.market_id, rep.question,
+                title=rep.title, rules=rep.rules, close_time=rep.close_time,
+            )
+            parsed_city = pm.city
+            parsed_date = str(pm.parsed_target_date) if pm.parsed_target_date else None
+        except Exception:
+            pass
+
+    return WeatherEventSummary(
+        event_id=event_id,
+        slug=slug,
+        title=title,
+        n_markets=len(markets),
+        parsed_city=parsed_city,
+        parsed_date=parsed_date,
+        close_time=close_time,
+    )
+
+
+def discover_weather_events_broad(max_events: int = 100) -> list[RawMarket]:
+    """
+    Broad weather discovery: fetch active events without tag filter,
+    apply weather keyword filter, extract all child markets.
+    Used by --discover-weather --max-events N.
+    """
+    events = _page_weather_events(max_events=max_events)
+    tagged = _page_weather_events(max_events=max_events, tag="weather")
+
+    seen_event_ids: set[str] = set()
+    all_events: list[dict] = []
+    for ev in events + tagged:
+        eid = str(ev.get("id") or "")
+        if eid and eid not in seen_event_ids:
+            seen_event_ids.add(eid)
+            all_events.append(ev)
+
+    markets: list[RawMarket] = []
+    seen_market_ids: set[str] = set()
+    for event in all_events:
+        for rm in _extract_markets_from_event(event):
+            if rm.market_id not in seen_market_ids:
+                seen_market_ids.add(rm.market_id)
+                markets.append(rm)
+
+    logger.info(
+        "discover_weather_events_broad: %d events → %d markets",
+        len(all_events), len(markets),
+    )
+    return markets
+
+
+def discover_weather_events_only(max_events: int = 100) -> list[WeatherEventSummary]:
+    """
+    Broad weather discovery returning event-level summaries only.
+    No orderbook/model fetch. Used by --discover-weather-only.
+    """
+    events = _page_weather_events(max_events=max_events)
+    tagged = _page_weather_events(max_events=max_events, tag="weather")
+
+    seen_event_ids: set[str] = set()
+    all_events: list[dict] = []
+    for ev in events + tagged:
+        eid = str(ev.get("id") or "")
+        if eid and eid not in seen_event_ids:
+            seen_event_ids.add(eid)
+            all_events.append(ev)
+
+    summaries: list[WeatherEventSummary] = []
+    for event in all_events:
+        markets = _extract_markets_from_event(event)
+        if markets:
+            summaries.append(_make_event_summary(event, markets))
+
+    logger.info("discover_weather_events_only: %d event summaries", len(summaries))
+    return summaries

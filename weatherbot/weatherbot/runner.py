@@ -25,7 +25,15 @@ from typing import Any, Optional
 import yaml
 
 from .book_collector import fetch_orderbook
-from .discovery import RawMarket, discover_all, discover_by_slug, is_weather_candidate
+from .discovery import (
+    RawMarket,
+    WeatherEventSummary,
+    discover_all,
+    discover_by_slug,
+    discover_weather_events_broad,
+    discover_weather_events_only,
+    is_weather_candidate,
+)
 from .ev_calculator import (
     ACTION_PAPER_MAKER,
     ACTION_PAPER_TAKER,
@@ -116,6 +124,57 @@ def _hours_to_close(close_time_str: Optional[str]) -> Optional[float]:
         return None
     now = datetime.now(timezone.utc)
     return (dt - now).total_seconds() / 3600.0
+
+
+def _compute_model_sanity(
+    daily_extreme_values: list[float],
+    bucket_low: Optional[float],
+    bucket_high: Optional[float],
+    open_ended_low: bool,
+    open_ended_high: bool,
+) -> dict:
+    """Compute member distribution stats vs bucket and flag out-of-range distributions."""
+    if not daily_extreme_values:
+        return {
+            "member_min": None,
+            "member_p25": None,
+            "member_median": None,
+            "member_p75": None,
+            "member_max": None,
+            "members_inside_bucket": 0,
+            "model_distribution_outside_bucket_range": True,
+        }
+    vals = sorted(daily_extreme_values)
+    n = len(vals)
+
+    def _pct(p: float) -> float:
+        idx = p / 100.0 * (n - 1)
+        lo = int(idx)
+        hi = min(lo + 1, n - 1)
+        return vals[lo] + (idx - lo) * (vals[hi] - vals[lo])
+
+    def _in_bkt(v: float) -> bool:
+        if open_ended_low and open_ended_high:
+            return True
+        if open_ended_low:
+            return v <= bucket_high if bucket_high is not None else True
+        if open_ended_high:
+            return v >= bucket_low if bucket_low is not None else True
+        in_lo = (bucket_low is None) or (v >= bucket_low)
+        in_hi = (bucket_high is None) or (v <= bucket_high)
+        return in_lo and in_hi
+
+    members_inside = sum(1 for v in vals if _in_bkt(v))
+
+    return {
+        "member_min": round(vals[0], 2),
+        "member_p25": round(_pct(25), 2),
+        "member_median": round(_pct(50), 2),
+        "member_p75": round(_pct(75), 2),
+        "member_max": round(vals[-1], 2),
+        "members_inside_bucket": members_inside,
+        "model_distribution_outside_bucket_range": members_inside == 0,
+    }
 
 
 @dataclass
@@ -270,6 +329,26 @@ def process_market(
         det_fallback = forecast_result.deterministic_fallback_used if forecast_result else False
         ensemble_keys = forecast_result.ensemble_keys_detected if forecast_result else 0
         model_used = forecast_result.model_used if forecast_result else None
+        daily_extremes = forecast_result.daily_extreme_values if forecast_result else []
+
+        # Model sanity: distribution stats vs bucket range
+        model_sanity = _compute_model_sanity(
+            daily_extremes,
+            parsed.bucket_low,
+            parsed.bucket_high,
+            parsed.open_ended_low,
+            parsed.open_ended_high,
+        )
+        if model_sanity["model_distribution_outside_bucket_range"] and n_members > 0:
+            logger.warning(
+                "Model distribution outside bucket range: market=%s city=%s bucket=[%s,%s] "
+                "member_range=[%.1f,%.1f] n=%d",
+                raw.market_id, parsed.city,
+                parsed.bucket_low, parsed.bucket_high,
+                model_sanity["member_min"] or 0.0,
+                model_sanity["member_max"] or 0.0,
+                n_members,
+            )
 
         nowcast_prob = nowcast_result.nowcast_probability if nowcast_result else None
         nowcast_conf = nowcast_result.nowcast_confidence if nowcast_result else "none"
@@ -447,6 +526,14 @@ def process_market(
                 "no_token_id_preview": (raw.no_token_id[:12] + "…") if raw.no_token_id and len(raw.no_token_id) > 12 else raw.no_token_id,
                 "active_token_id_preview": (active_token_id[:12] + "…") if active_token_id and len(active_token_id) > 12 else active_token_id,
                 "active_token_id_valid": token_id_valid,
+                # Patch 6: model sanity distribution stats
+                "member_min": model_sanity["member_min"],
+                "member_p25": model_sanity["member_p25"],
+                "member_median": model_sanity["member_median"],
+                "member_p75": model_sanity["member_p75"],
+                "member_max": model_sanity["member_max"],
+                "members_inside_bucket": model_sanity["members_inside_bucket"],
+                "model_distribution_outside_bucket_range": model_sanity["model_distribution_outside_bucket_range"],
             },
         )
 
@@ -579,6 +666,16 @@ def _log_obs_failed(
         logger.error("Failed to log parse-failed observation for %s: %s", raw.market_id, exc)
 
 
+def run_discover_weather_only(max_events: int = 100) -> list[WeatherEventSummary]:
+    """
+    Discovery-only mode: return event summaries without full pipeline.
+    Used by --discover-weather-only.
+    """
+    summaries = discover_weather_events_only(max_events=max_events)
+    logger.info("discover_weather_only: %d events found", len(summaries))
+    return summaries
+
+
 def run_scan(
     max_markets: int = 200,
     include_unknown_cities: bool = True,
@@ -586,6 +683,8 @@ def run_scan(
     loop_interval_seconds: int = 60,
     paper_only: bool = True,
     slug: Optional[str] = None,
+    broad_weather: bool = False,
+    max_events: int = 100,
 ) -> ScanStats:
     settings = _load_settings()
     ev_cfg = settings.get("ev", {})
@@ -597,8 +696,8 @@ def run_scan(
     stats = ScanStats()
 
     logger.info(
-        "Starting scan: max_markets=%d include_unknown=%s once=%s slug=%r",
-        max_markets, include_unknown_cities, once, slug,
+        "Starting scan: max_markets=%d include_unknown=%s once=%s slug=%r broad_weather=%s",
+        max_markets, include_unknown_cities, once, slug, broad_weather,
     )
 
     while True:
@@ -610,6 +709,8 @@ def run_scan(
             hours_to_close_reject=hours_reject,
             max_open_ghost_trades=max_open,
             slug=slug,
+            broad_weather=broad_weather,
+            max_events=max_events,
         )
 
         stats.markets_discovered += cycle_stats.markets_discovered
@@ -653,10 +754,14 @@ def _run_cycle(
     hours_to_close_reject: float,
     max_open_ghost_trades: int,
     slug: Optional[str] = None,
+    broad_weather: bool = False,
+    max_events: int = 100,
 ) -> ScanStats:
     stats = ScanStats()
     if slug:
         raw_markets = discover_by_slug(slug)
+    elif broad_weather:
+        raw_markets = discover_weather_events_broad(max_events=max_events)
     else:
         raw_markets = discover_all(max_markets=max_markets)
     stats.markets_discovered = len(raw_markets)

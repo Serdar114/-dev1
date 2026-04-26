@@ -10,6 +10,8 @@ Usage:
   python tools/run_scan.py --max-markets 100
   python tools/run_scan.py --slug highest-temperature-in-seoul-on-april-27-2026
   python tools/run_scan.py --url https://polymarket.com/event/highest-temperature-in-seoul-on-april-27-2026
+  python tools/run_scan.py --discover-weather --max-events 100
+  python tools/run_scan.py --discover-weather-only --max-events 100
 """
 import argparse
 import logging
@@ -19,7 +21,7 @@ import sys
 # Allow importing from parent
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from weatherbot.runner import run_scan
+from weatherbot.runner import run_scan, run_discover_weather_only
 
 
 def setup_logging(log_level: str = "INFO"):
@@ -57,6 +59,12 @@ def main():
                         help="Polymarket event slug for targeted single-market scan")
     parser.add_argument("--url", default=None,
                         help="Polymarket event URL (slug extracted automatically)")
+    parser.add_argument("--discover-weather", action="store_true", default=False,
+                        help="Broad weather discovery (no tag filter) then full pipeline")
+    parser.add_argument("--discover-weather-only", action="store_true", default=False,
+                        help="Broad weather discovery — summary output only, no orderbook/model")
+    parser.add_argument("--max-events", type=int, default=100,
+                        help="Max events for broad discovery (default: 100)")
 
     args = parser.parse_args()
 
@@ -73,17 +81,36 @@ def main():
         else:
             slug = url.split("/")[-1]
 
+    # --discover-weather-only: summary table only, no full pipeline
+    if args.discover_weather_only:
+        logger.info("Mode: discover-weather-only (max_events=%d)", args.max_events)
+        summaries = run_discover_weather_only(max_events=args.max_events)
+        print(f"\n=== WEATHER EVENTS DISCOVERED ({len(summaries)}) ===")
+        print(f"{'#':<4} {'Title':<50} {'City':<18} {'Date':<12} {'Mkts':<5} {'Close'}")
+        print("-" * 110)
+        for i, s in enumerate(summaries, 1):
+            title = (s.title or "")[:48]
+            city = (s.parsed_city or "?")[:16]
+            date_str = (s.parsed_date or "?")[:10]
+            close = (s.close_time or "?")[:20]
+            print(f"{i:<4} {title:<50} {city:<18} {date_str:<12} {s.n_markets:<5} {close}")
+        print(f"\nTotal: {len(summaries)} weather events")
+        return
+
     if not args.once and not args.loop:
         # Default to --once
         args.once = True
 
     once = args.once and not args.loop
 
+    broad_weather = args.discover_weather
+
     logger.info("=" * 60)
     logger.info("Polymarket Weather Temperature Edge Scanner V1")
     logger.info("Mode: paper/ghost only — NO live orders")
-    logger.info("once=%s loop=%s interval=%ds max_markets=%d include_unknown=%s slug=%r",
-                args.once, args.loop, args.interval, args.max_markets, args.include_unknown_cities, slug)
+    logger.info("once=%s loop=%s interval=%ds max_markets=%d include_unknown=%s slug=%r broad_weather=%s",
+                args.once, args.loop, args.interval, args.max_markets, args.include_unknown_cities, slug,
+                broad_weather)
     logger.info("=" * 60)
 
     stats = run_scan(
@@ -93,6 +120,8 @@ def main():
         loop_interval_seconds=args.interval,
         paper_only=args.paper_only,
         slug=slug,
+        broad_weather=broad_weather,
+        max_events=args.max_events,
     )
 
     print("\n=== SCAN COMPLETE ===")

@@ -244,3 +244,172 @@ def test_flood_word_not_weather():
         "Will the 2025 Mississippi River flood exceed 1993 levels?",
         slug="mississippi-river-flood-1993",
     ) is False
+
+
+# ── Endpoint order for fetch_event_by_slug ───────────────────────────────────
+
+def test_fetch_event_by_slug_tries_slug_endpoint_first(monkeypatch):
+    """fetch_event_by_slug must try GET /events/slug/{slug} before any other endpoint."""
+    called_urls: list[str] = []
+
+    def mock_get(url, params, **kwargs):
+        called_urls.append(url)
+        return None  # all fail — we just want to observe call order
+
+    monkeypatch.setattr("weatherbot.discovery._get", mock_get)
+    from weatherbot.discovery import fetch_event_by_slug
+    fetch_event_by_slug("highest-temperature-in-seoul-on-april-27-2026")
+
+    assert len(called_urls) >= 1, "Expected at least one HTTP call"
+    assert called_urls[0].endswith("/events/slug/highest-temperature-in-seoul-on-april-27-2026"), (
+        f"First call must be /events/slug/{{slug}}, got: {called_urls[0]}"
+    )
+
+
+def test_fetch_event_by_slug_falls_back_to_events_query(monkeypatch):
+    """If /events/slug/ returns None, try GET /events?slug=."""
+    called_urls: list[str] = []
+
+    def mock_get(url, params, **kwargs):
+        called_urls.append(url)
+        return None
+
+    monkeypatch.setattr("weatherbot.discovery._get", mock_get)
+    from weatherbot.discovery import fetch_event_by_slug
+    fetch_event_by_slug("some-slug")
+
+    urls_str = " ".join(called_urls)
+    assert "/events/slug/" in urls_str, "Expected /events/slug/ call"
+    assert any("/events" in u and "slug" not in u.split("?")[0].split("/")[-1]
+               for u in called_urls), "Expected fallback /events call"
+
+
+# ── Broad discovery weather filter ───────────────────────────────────────────
+
+def test_temperature_slug_passes_weather_filter():
+    """Temperature event slugs must pass is_weather_candidate."""
+    assert is_weather_candidate(
+        "Will the highest temperature in Tokyo on July 4 be above 30°C?",
+        slug="highest-temperature-in-tokyo-july-4-2026",
+    ) is True
+
+
+def test_crypto_event_fails_weather_filter():
+    """Bitcoin/crypto slugs must not pass weather filter."""
+    assert is_weather_candidate(
+        "Will Bitcoin reach $100,000 by end of 2026?",
+        slug="bitcoin-100k-2026",
+    ) is False
+
+
+def test_election_event_fails_weather_filter():
+    """Election event slugs must not pass weather filter."""
+    assert is_weather_candidate(
+        "Will the Democratic candidate win the 2026 midterms?",
+        slug="democrats-midterms-2026",
+    ) is False
+
+
+# ── WeatherEventSummary and _make_event_summary ───────────────────────────────
+
+def test_make_event_summary_fields():
+    """_make_event_summary returns correct fields from a fake event+markets pair."""
+    from weatherbot.discovery import WeatherEventSummary, _make_event_summary, _parse_raw_market
+
+    fake_event = {
+        "id": "evt_seoul_test",
+        "slug": "highest-temperature-in-seoul-on-april-27-2026",
+        "title": "Highest Temperature in Seoul on April 27, 2026",
+        "endDate": "2026-04-28T00:00:00Z",
+        "markets": [],
+    }
+    fake_market_dict = {
+        "id": "mkt_test_001",
+        "question": "Will the highest temperature in Seoul on April 27 be 18°C?",
+        "active": True,
+        "clobTokenIds": ["111111111111111", "222222222222222"],
+        "endDate": "2026-04-28T00:00:00Z",
+    }
+    market = _parse_raw_market(fake_market_dict)
+    assert market is not None
+
+    summary = _make_event_summary(fake_event, [market])
+    assert isinstance(summary, WeatherEventSummary)
+    assert summary.event_id == "evt_seoul_test"
+    assert summary.slug == "highest-temperature-in-seoul-on-april-27-2026"
+    assert summary.n_markets == 1
+    assert summary.close_time == "2026-04-28T00:00:00Z"
+
+
+# ── Model sanity (_compute_model_sanity in runner) ────────────────────────────
+
+def test_model_sanity_outside_range():
+    """All members above bucket_high → model_distribution_outside_bucket_range=True."""
+    from weatherbot.runner import _compute_model_sanity
+    sanity = _compute_model_sanity(
+        daily_extreme_values=[30.0, 31.0, 32.0],
+        bucket_low=14.0, bucket_high=14.0,
+        open_ended_low=False, open_ended_high=False,
+    )
+    assert sanity["model_distribution_outside_bucket_range"] is True
+    assert sanity["members_inside_bucket"] == 0
+
+
+def test_model_sanity_inside_range():
+    """One member exactly in exact bucket → outside_range=False."""
+    from weatherbot.runner import _compute_model_sanity
+    sanity = _compute_model_sanity(
+        daily_extreme_values=[13.0, 14.0, 15.0],
+        bucket_low=14.0, bucket_high=14.0,
+        open_ended_low=False, open_ended_high=False,
+    )
+    assert sanity["model_distribution_outside_bucket_range"] is False
+    assert sanity["members_inside_bucket"] == 1
+
+
+def test_model_sanity_open_ended_high():
+    """Open-ended high: all members >= bucket_low count as inside."""
+    from weatherbot.runner import _compute_model_sanity
+    sanity = _compute_model_sanity(
+        daily_extreme_values=[22.0, 23.0, 25.0],
+        bucket_low=23.0, bucket_high=None,
+        open_ended_low=False, open_ended_high=True,
+    )
+    assert sanity["members_inside_bucket"] == 2
+    assert sanity["model_distribution_outside_bucket_range"] is False
+
+
+def test_model_sanity_empty_members():
+    """Empty members → all None stats, outside_range=True."""
+    from weatherbot.runner import _compute_model_sanity
+    sanity = _compute_model_sanity([], None, None, False, False)
+    assert sanity["model_distribution_outside_bucket_range"] is True
+    assert sanity["member_min"] is None
+    assert sanity["members_inside_bucket"] == 0
+
+
+def test_model_sanity_open_ended_low():
+    """Open-ended low: all members <= bucket_high count as inside."""
+    from weatherbot.runner import _compute_model_sanity
+    sanity = _compute_model_sanity(
+        daily_extreme_values=[10.0, 11.0, 13.0, 14.0],
+        bucket_low=None, bucket_high=13.0,
+        open_ended_low=True, open_ended_high=False,
+    )
+    assert sanity["members_inside_bucket"] == 3
+    assert sanity["model_distribution_outside_bucket_range"] is False
+
+
+def test_model_sanity_percentile_stats():
+    """Distribution stats are computed correctly for a known list."""
+    from weatherbot.runner import _compute_model_sanity
+    vals = [10.0, 20.0, 30.0, 40.0, 50.0]
+    sanity = _compute_model_sanity(
+        daily_extreme_values=vals,
+        bucket_low=25.0, bucket_high=35.0,
+        open_ended_low=False, open_ended_high=False,
+    )
+    assert sanity["member_min"] == 10.0
+    assert sanity["member_max"] == 50.0
+    assert sanity["members_inside_bucket"] == 1  # only 30.0
+    assert sanity["model_distribution_outside_bucket_range"] is False
