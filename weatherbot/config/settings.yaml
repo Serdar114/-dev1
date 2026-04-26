@@ -1,0 +1,109 @@
+mode: paper  # paper | live (live not implemented in V1)
+
+scan:
+  interval_seconds: 60
+  max_markets: 200
+  include_unknown_cities: true
+  include_precipitation_log: true  # log only, never trade
+  hours_to_close_reject: 4  # reject new entry within N hours of resolution
+  hours_to_close_watch: 12  # flag as near-resolution watch
+
+polymarket:
+  gamma_api_base: "https://gamma-api.polymarket.com"
+  clob_api_base: "https://clob.polymarket.com"
+  markets_endpoint: "/markets"
+  events_endpoint: "/events"
+  book_endpoint: "/book"
+  orderbook_depth: 10
+  request_timeout_seconds: 15
+  retry_attempts: 3
+  retry_backoff_seconds: 2.0
+
+weather:
+  open_meteo_base: "https://ensemble-api.open-meteo.com/v1/ensemble"
+  open_meteo_forecast_base: "https://api.open-meteo.com/v1/forecast"
+  aviationweather_metar_base: "https://aviationweather.gov/api/data/metar"
+  request_timeout_seconds: 20
+  retry_attempts: 3
+  retry_backoff_seconds: 2.0
+  ensemble_models:
+    - icon_seamless
+    - gfs_seamless
+    - ecmwf_ifs025
+  ensemble_fallback:
+    - icon_global
+    - gfs025
+
+ev:
+  # maker
+  maker_edge_threshold: 0.08
+  maker_strong_threshold: 0.15
+  # taker
+  taker_edge_threshold: 0.12
+  taker_strong_threshold: 0.18
+  taker_requires_stale_flag: true
+  # filters
+  max_spread_candidate: 0.10
+  min_book_depth_multiplier: 2.0  # depth must be >= stake * this
+  min_settlement_safety_candidate: 0.65
+  # buffers
+  fee_buffer: 0.02  # polymarket taker fee estimate
+  slippage_buffer: 0.01
+  confidence_buffer: 0.02
+  laplace_smoothing: 0.5  # pseudo-counts for probability
+  laplace_n_members: 50   # denominator pseudo-count
+
+sizing:
+  default_stake_usdc: 2.0
+  max_stake_usdc: 5.0
+  bankroll_usdc: 30.0
+  max_open_ghost_trades: 8
+  kelly_fraction: 0.25  # fractional kelly for sizing
+
+settlement:
+  # hard reject sources in live candidate mode
+  blacklist_sources:
+    - wunderground
+    - weather underground
+  blacklist_cities:
+    - paris
+    - cdg
+    - le bourget
+  blacklist_keywords:
+    - precipitation
+    - rainfall
+    - rain total
+  risk_keywords:
+    - wunderground
+    - weather underground
+    - provisional
+    - revised data
+    - credible source
+    - dispute
+    - metar
+    - noaa
+    - nws
+    - le bourget
+    - cdg
+    - precipitation
+    - rainfall
+  min_safety_score_candidate: 0.65
+  min_safety_score_watch: 0.50
+
+logging:
+  observations_file: "logs/observations.jsonl"
+  signals_file: "logs/signals.jsonl"
+  ghost_trades_file: "logs/ghost_trades.jsonl"
+  settlement_audit_file: "logs/settlement_audit.jsonl"
+  system_log_file: "logs/system.log"
+  log_level: "INFO"
+  rotate_size_mb: 50
+
+bias_correction:
+  # per-city temperature bias in degrees (positive = model runs cold)
+  KLGA:
+    daily_high_bias_F: 1.5
+    daily_low_bias_F: 0.5
+  KORD:
+    daily_high_bias_F: 0.5
+    daily_low_bias_F: 0.5

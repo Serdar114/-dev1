@@ -1,0 +1,9 @@
+weatherbot/**/__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+weatherbot/logs/*.jsonl
+weatherbot/logs/*.log
+logs/*.jsonl
+logs/*.log
